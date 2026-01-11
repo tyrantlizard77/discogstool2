@@ -8,6 +8,7 @@ import filecmp
 import re
 import imghdr
 from mutagen.id3 import ID3
+from mutagen.mp4 import MP4Cover
 import client_interface
 
 whitelist = frozenset([i for i in "1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[]()-_+.' "])
@@ -111,10 +112,14 @@ class AudioFile(object):
         while isinstance(i, list):
             i = i[0]
         if key == "track":
-            i = str(i).split("/")
-            if len(i) == 1:
-                i.append(0)
-            i = tuple([int(x) for x in i])
+            # MP4 stores track as tuple (track, total), ID3 as string "track/total"
+            if isinstance(i, tuple):
+                i = (int(i[0]), int(i[1]) if len(i) > 1 and i[1] else 0)
+            else:
+                i = str(i).split("/")
+                if len(i) == 1:
+                    i.append(0)
+                i = tuple([int(x) for x in i])
         elif key == "bpm":
             i = int(str(i))
         elif key == "image":
@@ -172,6 +177,13 @@ class AudioFile(object):
         elif self.tagstype == "MP4Tags":
             if mkey == "trkn":
                 value = [value]
+            elif mkey == "covr":
+                # Detect image format for MP4Cover
+                if value[:8] == b'\x89PNG\r\n\x1a\n':
+                    fmt = MP4Cover.FORMAT_PNG
+                else:
+                    fmt = MP4Cover.FORMAT_JPEG
+                value = [MP4Cover(value, imageformat=fmt)]
 
         self.obj.tags[mkey] = value
 
@@ -211,8 +223,9 @@ class AudioFile(object):
             newfn = sanitize("[%03d] %s - %s %d (%s).%s" % 
                     (bpm, af["artist"], af["title"], af["track"][0], af["year"], ext))
         else:
-            newfn = sanitize("%s - %s %d [%s].%s" %
-                    (af["artist"], af["title"], af["track"][0], af["label"], ext))
+            catno = self.track.release.getCatno()
+            newfn = sanitize("%s - %d - %s - %s [%s].%s" %
+                    (af["album"], af["track"][0], af["artist"], af["title"], catno, ext))
 
         newpath = os.path.abspath(os.path.join(newdir, newfn))
         if not os.path.exists(newpath) or not filecmp.cmp(self.filename, newpath):

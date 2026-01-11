@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 
+import warnings
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+
+# Patch resource_tracker to suppress semaphore warnings at shutdown
+# (warnings.filterwarnings doesn't work because these come from a subprocess)
+try:
+    from multiprocessing import resource_tracker
+    _original_warn = resource_tracker.warnings.warn
+    def _patched_warn(msg, *args, **kwargs):
+        if "semaphore" not in str(msg):
+            _original_warn(msg, *args, **kwargs)
+    resource_tracker.warnings.warn = _patched_warn
+except Exception:
+    pass
+
 import glob
 import argparse
 from posixpath import split
@@ -8,6 +23,7 @@ import re
 import sys
 import os
 import time
+import json
 import libtags
 import tempfile
 import shutil
@@ -18,15 +34,35 @@ import tqdm
 import platform
 from multiprocessing import Pool, TimeoutError
 
-release_regex = re.compile(r"[\[]r([0-9]+)[\]][.][a-zA-Z]+$")
+release_regex = re.compile(r"[\[]r ?([0-9]+)[\]][.][a-zA-Z]+$")
 fregex = re.compile(r"([0-9]+)(([a-zA-Z)+[0-9]*)|[.]([a-zA-Z0-9. ]+))[.]([a-zA-Z]+)$")
 pregex = re.compile(r"([a-zA-Z]+)([0-9]+)")
 
 class ConversionException(Exception):
     pass
 
+# Worker process configuration (set by pool initializer for spawn context)
+worker_config = {
+    'verbose': False,
+    'legacy_normalize': False,
+    'outdir': None,
+    'tmpdir': None,
+    'format': 'alac'
+}
+
+# Format configuration
+FORMAT_CONFIG = {
+    'aiff': {'ext': '.aiff', 'codec': 'pcm_s16be', 'sample_fmt': 's16'},
+    'alac': {'ext': '.m4a', 'codec': 'alac', 'sample_fmt': 's16p'},
+}
+
+def worker_init(config):
+    """Initialize worker process with shared configuration."""
+    global worker_config
+    worker_config = config
+
 def debug(*strs):
-    if not args.verbose:
+    if not worker_config['verbose']:
         return
     print(multiprocessing.current_process().name, strs)
 
@@ -34,7 +70,7 @@ def file_extension(path):
     return "." + path.rsplit(".", 1)[1]
 
 def new_tmp(ext):
-    fo, tmppath = tempfile.mkstemp(suffix=ext, dir=tmpdir)
+    fo, tmppath = tempfile.mkstemp(suffix=ext, dir=worker_config['tmpdir'])
     os.close(fo)
     debug("New temp %s file: %s" % (ext, tmppath))
     return tmppath
@@ -50,18 +86,67 @@ def copy_to_tmp(path):
 def process_file(path, outdir, track):
     af = libtags.AudioFile(path, track)
     af.commit()
-    dest = af.rename_file(outdir, args.verbose, False, True, False)
+    dest = af.rename_file(outdir, worker_config['verbose'], False, True, False)
     debug("Renamed %s -> %s:" % (path, dest))
 
-# if copy, don't do anything the modifies in place
-# if not copy, delete path when we are done
-def process_wav_file(path, outdir, track, copy):
-    tmpaiff = new_tmp(".aiff")
+# Two-pass EBU R128 loudness normalization using ffmpeg
+# Returns path to normalized file (tmpout)
+def normalize_loudnorm(path, tmpout):
+    debug("Analyzing loudness (pass 1)...")
 
-    if copy:
-        path = copy_to_tmp(path)
+    # Pass 1: Analyze the file
+    result = subprocess.run([
+        "ffmpeg", "-hide_banner", "-i", path,
+        "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json",
+        "-f", "null", "-"
+    ], capture_output=True, text=True)
 
-    debug("Normalizing...")
+    # Parse the JSON output from stderr (ffmpeg outputs to stderr)
+    # The JSON is at the end of the output after the loudnorm stats
+    output = result.stderr
+    json_start = output.rfind('{')
+    json_end = output.rfind('}') + 1
+    if json_start == -1 or json_end == 0:
+        raise ConversionException("Failed to parse loudnorm analysis output")
+
+    try:
+        stats = json.loads(output[json_start:json_end])
+    except json.JSONDecodeError as e:
+        debug("loudnorm output:", output)
+        raise ConversionException(f"Failed to parse loudnorm JSON: {e}")
+
+    debug("Loudness stats:", stats)
+
+    # Pass 2: Apply normalization with measured values and convert to output format
+    fmt = FORMAT_CONFIG[worker_config['format']]
+    debug(f"Normalizing and converting to 44.1/16 {worker_config['format'].upper()} (pass 2)...")
+
+    loudnorm_filter = (
+        f"loudnorm=I=-14:TP=-1:LRA=11:"
+        f"measured_I={stats['input_i']}:"
+        f"measured_TP={stats['input_tp']}:"
+        f"measured_LRA={stats['input_lra']}:"
+        f"measured_thresh={stats['input_thresh']}:"
+        f"offset={stats['target_offset']}:"
+        f"linear=true"
+    )
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "panic",
+        "-y", "-i", path,
+        "-af", loudnorm_filter,
+        "-acodec", fmt['codec'], "-sample_fmt", fmt['sample_fmt'], "-ar", "44100",
+        tmpout
+    ]
+
+    retval = subprocess.call(cmd)
+
+    if retval:
+        raise ConversionException("Loudnorm normalization failed")
+
+# Legacy peak normalization using normalize-audio
+def normalize_legacy(path):
+    debug("Normalizing (legacy peak mode)...")
     norm_exe = "normalize-audio"
     # Ubuntu calls it normalize-audio, but homebrew normalize. Same program.
     if shutil.which(norm_exe) is None:
@@ -69,18 +154,34 @@ def process_wav_file(path, outdir, track, copy):
         if shutil.which(norm_exe) is None:
             raise ConversionException("missing normalize utility")
 
-    retval = subprocess.call([norm_exe, "-q", "-T", "1.5", "--peak",
-	    path])
+    retval = subprocess.call([norm_exe, "-q", "-T", "1.5", "--peak", path])
     if retval:
         raise ConversionException("Normalization failed")
 
-    debug("Converting to 44.1/16 AIFF...")
-    retval = subprocess.call(["ffmpeg", "-hide_banner", "-loglevel", "panic",
-            "-y",  "-i", path, "-sample_fmt", "s16", "-ar", "44100",
-            tmpaiff])
-    if retval:
-        raise ConversionException("Encoding failed")
-    process_file(tmpaiff, outdir, track)
+# if copy, don't do anything the modifies in place
+# if not copy, delete path when we are done
+def process_wav_file(path, outdir, track, copy):
+    fmt = FORMAT_CONFIG[worker_config['format']]
+    tmpout = new_tmp(fmt['ext'])
+
+    if copy:
+        path = copy_to_tmp(path)
+
+    if worker_config['legacy_normalize']:
+        normalize_legacy(path)
+        debug(f"Converting to 44.1/16 {worker_config['format'].upper()}...")
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "panic",
+                "-y", "-i", path,
+                "-acodec", fmt['codec'], "-sample_fmt", fmt['sample_fmt'], "-ar", "44100",
+                tmpout]
+        retval = subprocess.call(cmd)
+        if retval:
+            raise ConversionException("Encoding failed")
+    else:
+        # EBU R128 loudnorm (default) - normalizes and converts in one step
+        normalize_loudnorm(path, tmpout)
+
+    process_file(tmpout, outdir, track)
 
 def process_flac_file(path, outdir, track):
     tmpwav = new_tmp(".wav")
@@ -95,7 +196,22 @@ def process_mp3_file(path, outdir, track, copy):
     tmpfil = copy_to_tmp(path)
     process_file(tmpfil, outdir, track)
 
+def get_wav_regions_from_markers(markerslist, file_length, rate, min_len):
+    """Build regions from markers that have explicit lengths (ltxt chunks)."""
+    regions = []
+    for m in markerslist:
+        start = m['position']
+        length = m.get('length', 0)
+        if length > 0:
+            end = start + length
+            duration = length / rate
+            if duration >= min_len:
+                debug("Region from ltxt: (%d, %d), %d seconds" % (start, end, duration))
+                regions.append((start, end))
+    return regions
+
 def get_wav_regions(markers, rate, min_len):
+    """Build regions from consecutive marker positions (fallback)."""
     regions = []
     for i in range(len(markers) - 1):
         start = markers[i]     # inclusive
@@ -113,25 +229,57 @@ def split_wav_file(path, outdir, releaseid):
     debug("SPLIT %s (%s)" % (path, rel))
 
     try:
-        rate, rdata, bits, markers = wavfile.read(path, readmarkers=True)
+        rate, rdata, bits, markers, markerslist, loops = wavfile.read(path, readmarkers=True, readmarkerslist=True, readloops=True)
     except Exception:
         print("Bad wav file %s?" % path)
         raise
 
     debug("%d samples" % len(rdata))
-    markers.extend([0, len(rdata)])
-    markers.sort()
+    file_length = len(rdata)
+    debug("Markerslist:", markerslist)
+    debug("Loops (smpl chunk):", loops)
 
-    debug("Markers:", markers)
-    regions = get_wav_regions(markers, rate, 30)
+    # First, try to use loops from smpl chunk (Reaper exports regions as loops)
+    regions = []
+    for start, end in loops:
+        duration = (end - start) / rate
+        if duration >= 30:
+            debug("Region from smpl loop: (%d, %d), %d seconds" % (start, end, int(duration)))
+            regions.append((start, end))
 
     if len(regions) != rel.getTotalTracks():
-        # Try again with smaller second gaps
-        # Thanks, Giegling 20 and STL
-        regions = get_wav_regions(markers, rate, 6)
+        # Try with smaller minimum duration
+        regions = []
+        for start, end in loops:
+            duration = (end - start) / rate
+            if duration >= 6:
+                debug("Region from smpl loop: (%d, %d), %d seconds" % (start, end, int(duration)))
+                regions.append((start, end))
+
+    # Next, try explicit region lengths from ltxt chunks
+    if len(regions) != rel.getTotalTracks():
+        regions = get_wav_regions_from_markers(markerslist, file_length, rate, 30)
         if len(regions) != rel.getTotalTracks():
-            raise ConversionException("Unexpected region count %d in %s (%s)" % 
-                    (len(regions), rel, path))
+            regions = get_wav_regions_from_markers(markerslist, file_length, rate, 6)
+
+    # Fall back to consecutive marker positions if no ltxt regions found
+    if len(regions) != rel.getTotalTracks():
+        debug("No ltxt regions, falling back to marker positions")
+        markers = list(markers)  # copy
+        markers.extend([0, file_length])
+        markers.sort()
+
+        debug("Markers:", markers)
+        regions = get_wav_regions(markers, rate, 30)
+
+        if len(regions) != rel.getTotalTracks():
+            # Try again with smaller second gaps
+            # Thanks, Giegling 20 and STL
+            regions = get_wav_regions(markers, rate, 6)
+
+    if len(regions) != rel.getTotalTracks():
+        raise ConversionException("Unexpected region count %d in %s (%s)" %
+                (len(regions), rel, path))
 
     created = []
     pos_seen = []
@@ -208,17 +356,17 @@ def get_release_and_track(releaseid, position):
     return None
 
 def process_track(trackinfo):
-    print(trackinfo)
     track, path, extension, copy = trackinfo
-    outdir = args.outdir
+    outdir = worker_config['outdir']
 
+    tqdm.tqdm.write(f"Processing: {track.getArtist()} - {track.getTitle()}")
     debug(path, "-->", track)
 
     if extension == "wav":
         process_wav_file(path, outdir, track, copy)
     elif extension == "flac":
         process_flac_file(path, outdir, track)
-    elif exten3sion == "mp3":
+    elif extension == "mp3":
         process_mp3_file(path, outdir, track, copy)
     else:
         print("Don't know how to handle", path)
@@ -239,76 +387,88 @@ parser.add_argument("-v", "--verbose", action="store_true",
                     help="Enable extra debug messages")
 parser.add_argument("-j", "--jobs", type=int,
                     default=multiprocessing.cpu_count(),
-                    help="Number of CPUs to use (only works on Linux)")
+                    help="Number of parallel jobs for normalization (default: CPU count)")
+parser.add_argument("--legacy-normalize", action="store_true",
+                    help="Use legacy peak normalization instead of EBU R128 loudnorm")
+parser.add_argument("-f", "--format", choices=["aiff", "alac"], default="alac",
+                    help="Output format (default: alac)")
 
-args = parser.parse_args(sys.argv[1:])
+def main():
+    args = parser.parse_args(sys.argv[1:])
 
-tracks = []
-files = args.files
-solo_tracks = []
-split_wavs = []
+    tracks = []
+    files = args.files
+    solo_tracks = []
+    split_wavs = []
 
-os.makedirs(args.outdir, exist_ok=True)
-tmpdir = tempfile.mkdtemp()
-is_linux = platform.system() == 'Linux'
+    os.makedirs(args.outdir, exist_ok=True)
+    tmpdir = tempfile.mkdtemp()
 
-try:
-    for path in files:
-        filename = os.path.basename(path)
-        m = release_regex.match(filename)
-        if not m:
-            continue
-        releaseid = int(m.group(1))
-        split_wavs.append((path, tmpdir, releaseid))
+    # Initialize worker config for main process and workers
+    worker_config.update({
+        'verbose': args.verbose,
+        'legacy_normalize': args.legacy_normalize,
+        'outdir': args.outdir,
+        'tmpdir': tmpdir,
+        'format': args.format
+    })
 
-    if split_wavs:
-        print("Split multi-track .wav files...")
+    try:
+        for path in files:
+            filename = os.path.basename(path)
+            m = release_regex.match(filename)
+            if not m:
+                continue
+            releaseid = int(m.group(1))
+            split_wavs.append((path, tmpdir, releaseid))
 
-        if is_linux:
-            # multiprocessing "spawn" semantics not supported yet. "fork" isn't
-            # implemented in Windows and crashes macOS. Major changes to this
-            # code needed to get "spwan" up and running
-            with multiprocessing.get_context("fork").Pool(args.jobs) as p:
-                result = list(tqdm.tqdm(p.imap_unordered(poolsplit, split_wavs),
-                                        total=len(split_wavs)))
-        else:
+        if split_wavs:
+            print("Split multi-track .wav files...")
+            # Splitting is I/O bound and uses numpy, run sequentially
             result = []
-            for path, tmpdir, releaseid in split_wavs:
-                result.append(split_wav_file(path, tmpdir, releaseid))
+            for path, td, releaseid in split_wavs:
+                result.append(split_wav_file(path, td, releaseid))
 
-        for res in result:
-            tracks.extend(res)
+            for res in result:
+                tracks.extend(res)
 
-    for path in files:
-        filename = os.path.basename(path)
-        m = fregex.match(filename)
-        if not m:
-            debug('Skipping', filename)
-            continue
-        releaseid = m.group(1)
-        extension = m.group(5)
-        position = m.group(3).upper() if m.group(3) else m.group(4)
-        extension = extension.lower()
-        releaseid = int(releaseid)
+        for path in files:
+            filename = os.path.basename(path)
+            m = fregex.match(filename)
+            if not m:
+                debug('Skipping', filename)
+                continue
+            releaseid = m.group(1)
+            extension = m.group(5)
+            position = m.group(3).upper() if m.group(3) else m.group(4)
+            extension = extension.lower()
+            releaseid = int(releaseid)
 
-        track = get_release_and_track(releaseid, position)
-        if not track:
-            print("Couldn't look up", filename)
-            sys.exit(1)
-        tracks.append((track, path, extension, True))
+            track = get_release_and_track(releaseid, position)
+            if not track:
+                print("Couldn't look up", filename)
+                sys.exit(1)
+            tracks.append((track, path, extension, True))
 
-    print("Tag/normalize/convert audio files...")
+        print("Tag/normalize/convert audio files...")
 
-    if is_linux:
-        with Pool(args.jobs) as p:
-            result = list(tqdm.tqdm(p.imap_unordered(process_track, tracks),
-                                    total=len(tracks)))
-    else:
-        print(repr(tracks))
-        for trackinfo in tracks:
-            process_track(trackinfo)
+        if len(tracks) > 1:
+            # Parallel processing using spawn context (works on all platforms)
+            with multiprocessing.get_context("spawn").Pool(
+                    args.jobs,
+                    initializer=worker_init,
+                    initargs=(worker_config,)) as p:
+                result = list(tqdm.tqdm(p.imap_unordered(process_track, tracks),
+                                        total=len(tracks)))
+        else:
+            # Single track, no need for pool overhead
+            for trackinfo in tracks:
+                process_track(trackinfo)
 
-except:
-    raise
-finally:
-    shutil.rmtree(tmpdir, ignore_errors=True)
+    except:
+        raise
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+if __name__ == '__main__':
+    main()

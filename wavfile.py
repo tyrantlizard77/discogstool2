@@ -153,7 +153,7 @@ def read(file, readmarkers=False, readmarkerlabels=False, readmarkerslist=False,
     bits = 8
     #_cue = []
     #_cuelabels = []
-    _markersdict = collections.defaultdict(lambda: {'position': -1, 'label': ''})
+    _markersdict = collections.defaultdict(lambda: {'position': -1, 'label': '', 'length': 0})
     loops = []
     pitch = 0.0
     while (fid.tell() < fsize):
@@ -185,6 +185,19 @@ def read(file, readmarkers=False, readmarkerlabels=False, readmarkerslist=False,
             #_cuelabels.append(label)
             _markersdict[id]['label'] = label                           # needed to match labels and markers
 
+        elif chunk_id == b'ltxt':
+            str1 = fid.read(4)
+            size = struct.unpack('<I', str1)[0]
+            if size >= 4:
+                id = struct.unpack('<I', fid.read(4))[0]
+            if size >= 8:
+                sample_length = struct.unpack('<I', fid.read(4))[0]
+                _markersdict[id]['length'] = sample_length          # region length in samples
+            remaining = size - 8
+            if remaining > 0:
+                remaining = remaining + (remaining % 2)             # word-aligned
+                fid.read(remaining)                                 # skip purpose, country, language, etc.
+
         elif chunk_id == b'smpl':
             str1 = fid.read(40)
             size, manuf, prod, sampleperiod, midiunitynote, midipitchfraction, smptefmt, smpteoffs, numsampleloops, samplerdata = struct.unpack('<iiiiiIiiii', str1)
@@ -195,7 +208,6 @@ def read(file, readmarkers=False, readmarkerlabels=False, readmarkerslist=False,
                 cuepointid, type, start, end, fraction, playcount = struct.unpack('<iiiiii', str1) 
                 loops.append([start, end])
         else:
-            #warnings.warn("Chunk " + str(chunk_id) + " skipped", WavFileWarning)
             _skip_unknown_chunk(fid)
     fid.close()
 
