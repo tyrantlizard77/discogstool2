@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""dt_label — Print Discogs release stat-block labels for vinyl record sleeves.
+
+Usage:
+    ./dt_label [OPTIONS] RELEASE_ID
+
+Options:
+    -p, --preview           Save label(s) as PNG instead of printing
+    -s, --split             One full stat block per disc (for boxed sets)
+    -o, --output DIR        Output dir for preview PNGs (default: current dir)
+    --printer URL           Printer URL e.g. tcp://192.168.1.50:9100 (saved)
+    --model MODEL           Printer model (default: QL-1110NWB, saved)
+    --label-profile NAME    Label size profile name (default: dk1247, saved)
+    --list-profiles         List available label size profiles and exit
+"""
+
+import sys
+import os
+import re
+import argparse
+
+# Allow importing sibling modules from this project directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import util
+import client_interface
+from PIL import Image, ImageDraw, ImageFont
+
+
+# ── Label size profiles ───────────────────────────────────────────────────────
+
+LABEL_PROFILES = {
+    "dk1247": {
+        "description": 'Brother DK-1247 die-cut 103mm x 164mm (4.07" x 6.46")',
+        "brother_ql_id": "103x164",
+        "width_px":  1221,   # 103mm at 300 DPI
+        "height_px": 1937,   # 164mm at 300 DPI
+        "margin_px": 50,
+        "max_tracks": 14,    # leaves ~1" notes area
+    },
+}
+
+DEFAULT_PROFILE = "dk1247"
+DEFAULT_MODEL   = "QL-1110NWB"
+CONFIG_FILE     = "label_config"
+
+
+# ── Printer config (dotfile) ──────────────────────────────────────────────────
+
+def load_config():
+    """Load saved printer/profile settings from ~/.discogstool/label_config."""
+    path = util.userfile(CONFIG_FILE)
+    config = {}
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    config[k.strip()] = v.strip()
+    return config
+
+
+def save_config(config):
+    """Persist printer/profile settings to ~/.discogstool/label_config."""
+    path = util.userfile(CONFIG_FILE)
+    with open(path, "w") as f:
+        f.write("# dt_label configuration — auto-updated by --printer / --model / --label-profile\n")
+        for k, v in config.items():
+            f.write(f"{k}={v}\n")
+
+
+# ── Font loading ──────────────────────────────────────────────────────────────
+
+# Search order is macOS-first since that's the primary platform.
+_FONT_CANDIDATES = {
+    "regular": [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ],
+    "bold": [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ],
+    "condensed": [
+        "/System/Library/Fonts/Supplemental/Arial Narrow.ttf",
+        "/Library/Fonts/Arial Narrow.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ],
+}
+
+_font_path_cache = {}
+
+
+def _find_font_path(style):
+    if style in _font_path_cache:
+        return _font_path_cache[style]
+    for path in _FONT_CANDIDATES.get(style, _FONT_CANDIDATES["regular"]):
+        if os.path.exists(path):
+            _font_path_cache[style] = path
+            return path
+    _font_path_cache[style] = None
+    return None
+
+
+def make_font(style, size):
+    """Return an ImageFont, falling back to Pillow's built-in if needed."""
+    path = _find_font_path(style)
+    if path:
+        return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+# ── Track grouping ────────────────────────────────────────────────────────────
+
+def get_side(position):
+    """Extract the side letter(s) from a position string like 'A1', 'B2', 'AA1'.
+    Returns '' for purely numeric positions."""
+    if not position:
+        return ""
+    m = re.match(r"^([A-Za-z]+)", position.strip())
+    return m.group(1).upper() if m else ""
+
+
+def side_to_disc(side):
+    """Map a side letter to a disc number.  A/B → 1, C/D → 2, E/F → 3 …
+    Multi-letter sides (AA, BB …) map the same way using the first character."""
+    if not side:
+        return 1
+    idx = ord(side[0].upper()) - ord("A")
+    return (idx // 2) + 1
+
+
+def group_tracks_by_disc(release):
+    """Return {disc_num: {side_letter: [DiscogsTrack, …]}} preserving order."""
+    discs = {}
+    for i in range(release.getTotalTracks()):
+        track = release.getTrack(i)
+        side  = get_side(track["position"])
+        disc  = side_to_disc(side) if side else 1
+        discs.setdefault(disc, {}).setdefault(side, []).append(track)
+    return discs
+
+
+def flatten_discs(discs):
+    """Flatten disc/side groups into [(side_letter, DiscogsTrack), …] in order."""
+    result = []
+    for disc_num in sorted(discs):
+        for side in sorted(discs[disc_num]):
+            for track in discs[disc_num][side]:
+                result.append((side, track))
+    return result
+
+
+# ── Drawing helpers ───────────────────────────────────────────────────────────
+
+def truncate_text(draw, text, font, max_width):
+    """Shorten text with a trailing ellipsis so it fits within max_width pixels."""
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    while text:
+        text = text[:-1]
+        candidate = text.rstrip() + "\u2026"
+        if draw.textlength(candidate, font=font) <= max_width:
+            return candidate
+    return "\u2026"
+
+
+def hline(draw, y, x0, x1, color="black", weight=2):
+    draw.line([(x0, y), (x1, y)], fill=color, width=weight)
+
+
+# ── Label rendering ───────────────────────────────────────────────────────────
+
+def render_label(release, tracks_with_sides, profile,
+                 is_compilation, continuation=False, disc_info=None):
+    """Render and return a single PIL Image for one label.
+
+    Args:
+        release:           DiscogsRelease instance
+        tracks_with_sides: [(side_letter, DiscogsTrack), …]
+        profile:           label size profile dict
+        is_compilation:    show per-track artists when True
+        continuation:      compact header for overflow continuation labels
+        disc_info:         (disc_num, total_discs) for --split mode, else None
+    """
+    W  = profile["width_px"]
+    H  = profile["height_px"]
+    M  = profile["margin_px"]
+    CW = W - 2 * M   # usable content width
+
+    img  = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+
+    # Fonts (sizes in points; 1pt ≈ 4.17px at 300 DPI)
+    f_artist    = make_font("bold",      54)   # ~225px cap height
+    f_title     = make_font("regular",   42)
+    f_meta      = make_font("regular",   32)
+    f_side_hdr  = make_font("bold",      28)
+    f_pos       = make_font("bold",      30)
+    f_track     = make_font("regular",   30)
+    f_notes_hdr = make_font("bold",      28)
+
+    TRACK_ROW_H = 75    # px per track row — comfortable for circling + BPM
+    SIDE_HDR_H  = 44    # px for a side header row
+    BPM_ZONE_W  = 110   # right-side blank area for handwritten BPM
+    POS_W       = 90    # position column width
+    TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
+
+    x0 = M
+    x1 = W - M
+    y  = M
+
+    def hl(y_pos, color="black", weight=2):
+        hline(draw, y_pos, x0, x1, color=color, weight=weight)
+
+    # ── Header ───────────────────────────────────────────────────────────────
+
+    if continuation:
+        # Minimal header: artist — title  (continued)
+        hdr = f"{release.getArtist().upper()} \u2014 {release.getTitle()}  (continued)"
+        draw.text((M, y), truncate_text(draw, hdr, f_meta, CW), font=f_meta, fill="black")
+        y += 46
+    else:
+        # Artist (large bold caps)
+        artist_str = truncate_text(draw, release.getArtist().upper(), f_artist, CW)
+        draw.text((M, y), artist_str, font=f_artist, fill="black")
+        y += 70
+
+        # Release title
+        title_str = truncate_text(draw, release.getTitle(), f_title, CW)
+        draw.text((M, y), title_str, font=f_title, fill="black")
+        y += 58
+
+        y += 10
+        hl(y); y += 18
+
+        # Label [catno]                          Year  Country
+        label_meta = f"{release.getLabel()}  [{release.getCatno()}]"
+        year_cc    = f"{release.getYear()}  {release.getCountry()}"
+        ycc_w = draw.textlength(year_cc, font=f_meta)
+        label_meta = truncate_text(draw, label_meta, f_meta, CW - ycc_w - 24)
+        draw.text((M, y), label_meta, font=f_meta, fill="black")
+        draw.text((W - M - ycc_w, y), year_cc, font=f_meta, fill="black")
+        y += 46
+
+        # Genre / styles
+        genre_str = truncate_text(draw, release.getGenre(), f_meta, CW)
+        draw.text((M, y), genre_str, font=f_meta, fill="black")
+        y += 46
+
+    # Disc indicator for --split labels
+    if disc_info:
+        disc_num, total_discs = disc_info
+        draw.text((M, y), f"Disc {disc_num} of {total_discs}", font=f_meta, fill="#555555")
+        y += 40
+
+    y += 8
+    hl(y); y += 18
+
+    # ── Track listing ─────────────────────────────────────────────────────────
+
+    current_side = object()   # sentinel — guaranteed != any real side string
+
+    for side, track in tracks_with_sides:
+
+        # Side header when the side changes
+        if side != current_side:
+            current_side = side
+            side_label = f"Side {side}" if side else "Tracks"
+            draw.text((M, y), side_label, font=f_side_hdr, fill="black")
+            y += SIDE_HDR_H - 10
+            hl(y, color="#AAAAAA", weight=1)
+            y += 10
+
+        pos = track["position"]
+        draw.text((M, y), pos, font=f_pos, fill="black")
+
+        # Title: "Artist \u2013 Title" on compilations, plain title otherwise
+        if is_compilation:
+            track_str = f"{track.getArtist()} \u2013 {track.getTitle()}"
+        else:
+            track_str = track.getTitle()
+
+        track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W)
+        draw.text((M + POS_W, y), track_str, font=f_track, fill="black")
+
+        # Subtle BPM underline in the right margin
+        bpm_line_y = y + TRACK_ROW_H - 18
+        hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#BBBBBB", weight=1)
+
+        y += TRACK_ROW_H
+
+    # ── Notes section ─────────────────────────────────────────────────────────
+
+    y += 10
+    hl(y); y += 18
+
+    draw.text((M, y), "NOTES:", font=f_notes_hdr, fill="black")
+    y += 44
+
+    line_spacing = 55
+    while y + line_spacing < H - M:
+        y += line_spacing
+        hl(y, color="#DDDDDD", weight=1)
+
+    return img
+
+
+def render_labels_for_release(release, args, profile):
+    """Return [(filename_suffix, PIL.Image), …] for all labels to produce."""
+    is_compilation = release.isCompilation()
+    discs          = group_tracks_by_disc(release)
+    max_tracks     = profile["max_tracks"]
+    labels         = []
+
+    if args.split:
+        total_discs = len(discs)
+        for disc_num in sorted(discs):
+            disc_tracks = []
+            for side in sorted(discs[disc_num]):
+                for track in discs[disc_num][side]:
+                    disc_tracks.append((side, track))
+            img = render_label(release, disc_tracks, profile,
+                               is_compilation, disc_info=(disc_num, total_discs))
+            labels.append((f"disc{disc_num}", img))
+
+    else:
+        # Chunk all tracks into primary + continuation labels
+        all_tracks = flatten_discs(discs)
+        chunks = [all_tracks[i:i + max_tracks]
+                  for i in range(0, len(all_tracks), max_tracks)]
+        for idx, chunk in enumerate(chunks):
+            suffix = "label" if idx == 0 else f"cont{idx}"
+            img = render_label(release, chunk, profile,
+                               is_compilation, continuation=(idx > 0))
+            labels.append((suffix, img))
+
+    return labels
+
+
+# ── Printing ──────────────────────────────────────────────────────────────────
+
+def print_label(img, printer_url, model, profile):
+    """Send a rendered label image to the Brother printer over TCP/WiFi."""
+    from brother_ql.conversion import convert
+    from brother_ql.backends.helpers import send
+    from brother_ql.raster import BrotherQLRaster
+
+    qlr = BrotherQLRaster(model)
+    instructions = convert(
+        qlr,
+        images=[img],
+        label=profile["brother_ql_id"],
+        rotate="0",
+        threshold=70,
+        dither=False,
+        compress=False,
+        red=False,
+        dpi_600=False,
+        cut_now=True,
+    )
+    send(
+        instructions=instructions,
+        printer_identifier=printer_url,
+        backend_identifier="network",
+        blocking=True,
+    )
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_release_id(value):
+    """Accept a plain integer or the bracketed [r<id>] format used by dt_process."""
+    m = re.fullmatch(r'\[r(\d+)\]', value.strip())
+    if m:
+        return int(m.group(1))
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid release ID {value!r} — expected an integer or [r<id>]"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Print a Discogs release stat-block label for a vinyl sleeve.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("release_id", type=parse_release_id,
+                        help="Discogs release ID — plain integer (12345678) or bracketed form ([r12345678])")
+    parser.add_argument("-p", "--preview", action="store_true",
+                        help="Save label(s) as PNG instead of sending to printer")
+    parser.add_argument("-s", "--split", action="store_true",
+                        help="One full stat block per disc (for boxed sets stored separately)")
+    parser.add_argument("-o", "--output", default=".",
+                        help="Output directory for preview PNGs (default: current dir)")
+    parser.add_argument("--printer", metavar="URL",
+                        help="Printer URL e.g. tcp://192.168.1.50:9100  (saved for reuse)")
+    parser.add_argument("--model", metavar="MODEL",
+                        help=f"Printer model identifier (default: {DEFAULT_MODEL}, saved)")
+    parser.add_argument("--label-profile", metavar="PROFILE",
+                        choices=list(LABEL_PROFILES.keys()),
+                        help=f"Label size profile (default: {DEFAULT_PROFILE}, saved)")
+    parser.add_argument("--list-profiles", action="store_true",
+                        help="List available label profiles and exit")
+    args = parser.parse_args()
+
+    if args.list_profiles:
+        print("Available label profiles:")
+        for name, p in LABEL_PROFILES.items():
+            print(f"  {name:12s}  {p['description']}")
+            print(f"              {p['width_px']}×{p['height_px']}px, "
+                  f"max {p['max_tracks']} tracks, "
+                  f"brother_ql id: {p['brother_ql_id']}")
+        sys.exit(0)
+
+    # Load saved config, apply any CLI overrides, persist if changed
+    config  = load_config()
+    changed = False
+    if args.printer:
+        config["printer"] = args.printer;      changed = True
+    if args.model:
+        config["model"]   = args.model;        changed = True
+    if args.label_profile:
+        config["profile"] = args.label_profile; changed = True
+    if changed:
+        save_config(config)
+
+    printer_url  = config.get("printer")
+    model        = config.get("model",   DEFAULT_MODEL)
+    profile_name = config.get("profile", DEFAULT_PROFILE)
+    profile      = LABEL_PROFILES[profile_name]
+
+    if not args.preview and not printer_url:
+        print("Error: no printer configured.", file=sys.stderr)
+        print("  Use --printer tcp://IP:9100 to set your printer, or", file=sys.stderr)
+        print("  Use --preview to render PNGs without printing.", file=sys.stderr)
+        sys.exit(1)
+
+    # Fetch release metadata
+    print(f"Fetching Discogs release {args.release_id}\u2026")
+    release = client_interface.DiscogsRelease(args.release_id)
+    print(f"  {release}")
+
+    # Render
+    labels = render_labels_for_release(release, args, profile)
+    print(f"  {len(labels)} label(s) to produce")
+
+    # Output
+    for suffix, img in labels:
+        if args.preview:
+            os.makedirs(args.output, exist_ok=True)
+            fname = os.path.join(args.output, f"{args.release_id}_{suffix}.png")
+            img.save(fname, dpi=(300, 300))
+            print(f"  Saved: {fname}")
+        else:
+            print(f"  Printing {suffix}\u2026", end=" ", flush=True)
+            print_label(img, printer_url, model, profile)
+            print("done.")
+
+
+if __name__ == "__main__":
+    main()

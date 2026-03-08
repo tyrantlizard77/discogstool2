@@ -177,8 +177,14 @@ class DiscogsRelease:
     def getCatno(self):
         return self.compileListData("labels", ["catno"])
 
+    def getCountry(self):
+        return self.data.get("country", "")
+
     def getGenre(self):
-        return ", ".join(self.data["styles"])
+        genres = self.data.get("styles", [])
+        if not genres:
+            genres = self.data.get("genres", [])
+        return ", ".join(genres)
 
     def getTitle(self):
         rt = self.data["title"]

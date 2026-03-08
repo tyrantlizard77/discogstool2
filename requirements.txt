@@ -3,3 +3,6 @@ tqdm
 python3-discogs-client
 numpy
 urllib3
+standard-imghdr
+Pillow
+brother_ql
