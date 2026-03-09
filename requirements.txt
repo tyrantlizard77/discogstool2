@@ -5,4 +5,4 @@ numpy
 urllib3
 standard-imghdr
 Pillow
-brother_ql
+brother-ql-inventree

@@ -33,9 +33,11 @@ LABEL_PROFILES = {
     "dk1247": {
         "description": 'Brother DK-1247 die-cut 103mm x 164mm (4.07" x 6.46")',
         "brother_ql_id": "103x164",
-        "width_px":  1221,   # 103mm at 300 DPI
-        "height_px": 1937,   # 164mm at 300 DPI
-        "margin_px": 50,
+        # Canvas must match dots_printable exactly for brother_ql die-cut mode.
+        # Values from brother-ql-inventree v1.3 label_type_specs["103x164"].
+        "width_px":  1200,   # dots_printable width
+        "height_px": 1822,   # dots_printable height
+        "margin_px": 46,
         "max_tracks": 14,    # leaves ~1" notes area
     },
 }
@@ -363,7 +365,7 @@ def print_label(img, printer_url, model, profile):
         compress=False,
         red=False,
         dpi_600=False,
-        cut_now=True,
+        cut=True,
     )
     send(
         instructions=instructions,
