@@ -38,7 +38,7 @@ LABEL_PROFILES = {
         "width_px":  1200,   # dots_printable width
         "height_px": 1822,   # dots_printable height
         "margin_px": 46,
-        "max_tracks": 14,    # leaves ~1" notes area
+        "max_tracks": 12,    # leaves ~1" notes area (sized for 38pt track font)
     },
 }
 
@@ -204,11 +204,11 @@ def render_label(release, tracks_with_sides, profile,
     f_title     = make_font("regular",   42)
     f_meta      = make_font("regular",   32)
     f_side_hdr  = make_font("bold",      28)
-    f_pos       = make_font("bold",      30)
-    f_track     = make_font("regular",   30)
+    f_pos       = make_font("bold",      38)
+    f_track     = make_font("regular",   38)
     f_notes_hdr = make_font("bold",      28)
 
-    TRACK_ROW_H = 75    # px per track row — comfortable for circling + BPM
+    TRACK_ROW_H = 88    # px per track row — comfortable for circling + BPM
     SIDE_HDR_H  = 44    # px for a side header row
     BPM_ZONE_W  = 110   # right-side blank area for handwritten BPM
     POS_W       = 90    # position column width
@@ -251,9 +251,12 @@ def render_label(release, tracks_with_sides, profile,
         draw.text((W - M - ycc_w, y), year_cc, font=f_meta, fill="black")
         y += 46
 
-        # Genre / styles
-        genre_str = truncate_text(draw, release.getGenre(), f_meta, CW)
+        # Genre / styles                                        [rXXXXXXXX]
+        rid_str = f"[r{release.getId()}]"
+        rid_w   = draw.textlength(rid_str, font=f_meta)
+        genre_str = truncate_text(draw, release.getGenre(), f_meta, CW - rid_w - 16)
         draw.text((M, y), genre_str, font=f_meta, fill="black")
+        draw.text((W - M - rid_w, y), rid_str, font=f_meta, fill="#777777")
         y += 46
 
     # Disc indicator for --split labels
