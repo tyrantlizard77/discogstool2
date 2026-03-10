@@ -307,6 +307,9 @@ class DiscogsTrack:
 
         return "%s %s" % (self.release.getTitle(), self.tdata["position"])
 
+    def getDuration(self):
+        return self.tdata.get("duration", "").strip()
+
     def getRelease(self):
         return self.release
 

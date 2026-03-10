@@ -352,8 +352,12 @@ def render_label(release, tracks_with_sides, profile,
         else:
             track_str = track.getTitle()
 
-        track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W)
-        draw.text((M + POS_W, y), track_str, font=f_track, fill="black")
+        # Duration suffix — reserve space before truncating the title
+        dur = track.getDuration()
+        dur_suffix = f" ({dur})" if dur else ""
+        dur_w = draw.textlength(dur_suffix, font=f_track) if dur_suffix else 0
+        track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W - dur_w)
+        draw.text((M + POS_W, y), track_str + dur_suffix, font=f_track, fill="black")
 
         # Subtle BPM underline in the right margin
         bpm_line_y = y + _TRACK_ROW_H - 18
@@ -472,13 +476,69 @@ def parse_release_id(value):
         )
 
 
+def read_id_file(path):
+    """Parse a text file of release IDs, one per line.
+
+    Accepts plain integers and [rXXXXXXXX] bracketed form.
+    Blank lines and lines beginning with # are ignored.
+    Returns a list of (line_number, raw_value, parsed_id) tuples so
+    the caller can report errors with useful context.
+    """
+    ids = []
+    with open(path) as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                ids.append((lineno, line, parse_release_id(line)))
+            except argparse.ArgumentTypeError as e:
+                print(f"  {path}:{lineno}: skipping {line!r} — {e}", file=sys.stderr)
+    return ids
+
+
+def process_release(rid, args, profile, printer_url, model):
+    """Fetch, render, and output labels for one release ID.
+
+    Returns True on success, False on error.
+    """
+    print(f"Fetching Discogs release {rid}\u2026")
+    try:
+        release = client_interface.DiscogsRelease(rid)
+    except Exception as e:
+        print(f"  Error fetching release {rid}: {e}", file=sys.stderr)
+        return False
+    print(f"  {release}")
+
+    try:
+        labels = render_labels_for_release(release, args, profile)
+    except ValueError as e:
+        print(f"  Error rendering release {rid}: {e}", file=sys.stderr)
+        return False
+    print(f"  {len(labels)} label(s) to produce")
+
+    for suffix, img in labels:
+        if args.preview:
+            os.makedirs(args.output, exist_ok=True)
+            fname = os.path.join(args.output, f"{rid}_{suffix}.png")
+            img.save(fname, dpi=(300, 300))
+            print(f"  Saved: {fname}")
+        else:
+            print(f"  Printing {suffix}\u2026", end=" ", flush=True)
+            print_label(img, printer_url, model, profile)
+            print("done.")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Print a Discogs release stat-block label for a vinyl sleeve.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("release_id", type=parse_release_id,
-                        help="Discogs release ID — plain integer (12345678) or bracketed form ([r12345678])")
+    parser.add_argument("release_id", type=parse_release_id, nargs="?",
+                        help="Discogs release ID — plain integer or [r12345678] form")
+    parser.add_argument("-f", "--file", metavar="FILE",
+                        help="Text file with one release ID per line (batch mode)")
     parser.add_argument("-p", "--preview", action="store_true",
                         help="Save label(s) as PNG instead of sending to printer")
     parser.add_argument("-s", "--split", action="store_true",
@@ -508,6 +568,12 @@ def main():
                   f"brother_ql id: {p['brother_ql_id']}")
         sys.exit(0)
 
+    # Validate: need exactly one of release_id or --file
+    if args.release_id is None and not args.file:
+        parser.error("provide a release ID or use -f/--file for batch input")
+    if args.release_id is not None and args.file:
+        parser.error("release_id and -f/--file are mutually exclusive")
+
     # Load saved config, apply any CLI overrides, persist if changed
     config  = load_config()
     changed = False
@@ -531,26 +597,26 @@ def main():
         print("  Use --preview to render PNGs without printing.", file=sys.stderr)
         sys.exit(1)
 
-    # Fetch release metadata
-    print(f"Fetching Discogs release {args.release_id}\u2026")
-    release = client_interface.DiscogsRelease(args.release_id)
-    print(f"  {release}")
+    # Build list of release IDs to process
+    if args.file:
+        entries = read_id_file(args.file)
+        if not entries:
+            print("No valid release IDs found in file.", file=sys.stderr)
+            sys.exit(1)
+        release_ids = [rid for _, _, rid in entries]
+        print(f"Batch: {len(release_ids)} release(s) from {args.file}")
+    else:
+        release_ids = [args.release_id]
 
-    # Render
-    labels = render_labels_for_release(release, args, profile)
-    print(f"  {len(labels)} label(s) to produce")
+    # Process each release
+    errors = 0
+    for rid in release_ids:
+        if not process_release(rid, args, profile, printer_url, model):
+            errors += 1
 
-    # Output
-    for suffix, img in labels:
-        if args.preview:
-            os.makedirs(args.output, exist_ok=True)
-            fname = os.path.join(args.output, f"{args.release_id}_{suffix}.png")
-            img.save(fname, dpi=(300, 300))
-            print(f"  Saved: {fname}")
-        else:
-            print(f"  Printing {suffix}\u2026", end=" ", flush=True)
-            print_label(img, printer_url, model, profile)
-            print("done.")
+    if errors:
+        print(f"\n{errors} release(s) failed.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
