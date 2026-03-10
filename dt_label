@@ -476,24 +476,40 @@ def parse_release_id(value):
         )
 
 
-def read_id_file(path):
-    """Parse a text file of release IDs, one per line.
+_DISCOGS_URL_RE = re.compile(r'discogs\.com/release/(\d+)')
 
-    Accepts plain integers and [rXXXXXXXX] bracketed form.
-    Blank lines and lines beginning with # are ignored.
-    Returns a list of (line_number, raw_value, parsed_id) tuples so
-    the caller can report errors with useful context.
+def read_id_file(path):
+    """Parse a text file and extract Discogs release IDs.
+
+    Strategy: if the file contains any Discogs URLs, extract IDs only from
+    those URLs and ignore everything else (handles mixed-content files with
+    annotations, sequence numbers, etc.).  If the file contains no URLs at
+    all, every non-blank non-comment line is parsed as a release ID (plain
+    integer or [rXXXXXXXX] form), with a warning on unrecognised lines.
+
+    Blank lines and lines beginning with # are always ignored.
+    Returns a list of (line_number, raw_value, parsed_id) tuples.
     """
-    ids = []
     with open(path) as f:
-        for lineno, raw in enumerate(f, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                ids.append((lineno, line, parse_release_id(line)))
-            except argparse.ArgumentTypeError as e:
-                print(f"  {path}:{lineno}: skipping {line!r} — {e}", file=sys.stderr)
+        lines = [(lineno, raw.strip())
+                 for lineno, raw in enumerate(f, 1)
+                 if raw.strip() and not raw.strip().startswith("#")]
+
+    # First pass: collect any URL matches
+    url_matches = [(lineno, line, int(m.group(1)))
+                   for lineno, line in lines
+                   for m in [_DISCOGS_URL_RE.search(line)] if m]
+
+    if url_matches:
+        return url_matches  # URL mode: ignore everything that isn't a URL
+
+    # Plain-ID mode: parse every line as a release ID
+    ids = []
+    for lineno, line in lines:
+        try:
+            ids.append((lineno, line, parse_release_id(line)))
+        except argparse.ArgumentTypeError as e:
+            print(f"  {path}:{lineno}: skipping {line!r} — {e}", file=sys.stderr)
     return ids
 
 
