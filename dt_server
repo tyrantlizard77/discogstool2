@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""dt_server — Local HTTP bridge for the Discogs Label Printer Firefox extension.
+
+Listens on localhost only. Accepts print/preview requests from the extension
+and delegates to dt_label.
+
+Usage:
+    ./dt_server [--port PORT]
+
+Default port: 5679 (configurable; must match the extension setting).
+"""
+
+import sys
+import os
+import json
+import base64
+import argparse
+import tempfile
+import subprocess
+import glob
+
+from flask import Flask, request, jsonify
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+DT_LABEL     = os.path.join(SCRIPT_DIR, "dt_label")
+DEFAULT_PORT = 5679
+
+app = Flask(__name__)
+
+
+# ── CORS (allow requests from any moz-extension:// origin) ───────────────────
+
+@app.after_request
+def add_cors(response):
+    origin = request.headers.get("Origin", "")
+    if origin.startswith("moz-extension://") or origin == "":
+        response.headers["Access-Control-Allow-Origin"]  = origin or "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+@app.route("/print", methods=["OPTIONS"])
+@app.route("/status", methods=["OPTIONS"])
+def preflight():
+    return "", 204
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify({"ok": True, "version": "1.0"})
+
+
+@app.route("/print", methods=["POST"])
+def print_label():
+    data = request.get_json(force=True)
+
+    release_id = str(data.get("release_id", "")).strip()
+    profile    = str(data.get("profile", "dk1247")).strip()
+    preview    = bool(data.get("preview", False))
+
+    if not release_id.isdigit():
+        return jsonify({"ok": False, "message": f"Invalid release ID: {release_id!r}"}), 400
+
+    if preview:
+        return _run_preview(release_id, profile)
+    else:
+        return _run_print(release_id, profile)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _run_dt_label(args, *, capture=False):
+    """Run dt_label with the given argument list.
+    Returns (returncode, stdout+stderr combined).
+    """
+    cmd = [sys.executable, DT_LABEL] + args
+    result = subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+        cwd=SCRIPT_DIR,
+    )
+    output = ""
+    if capture:
+        output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode, output
+
+
+def _run_print(release_id, profile):
+    rc, output = _run_dt_label([
+        "--label-profile", profile,
+        release_id,
+    ])
+    if rc != 0:
+        return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
+    return jsonify({"ok": True})
+
+
+def _run_preview(release_id, profile):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rc, output = _run_dt_label([
+            "--preview",
+            "--label-profile", profile,
+            "--output", tmpdir,
+            release_id,
+        ], capture=True)
+
+        if rc != 0:
+            return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
+
+        # dt_label writes one or more PNGs; grab the first one
+        pngs = sorted(glob.glob(os.path.join(tmpdir, "*.png")))
+        if not pngs:
+            return jsonify({"ok": False, "message": "dt_label produced no PNG"}), 500
+
+        with open(pngs[0], "rb") as f:
+            png_b64 = base64.b64encode(f.read()).decode()
+
+    return jsonify({"ok": True, "png": png_b64})
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help=f"Port to listen on (default: {DEFAULT_PORT})")
+    args = parser.parse_args()
+
+    print(f"dt_server listening on http://localhost:{args.port}")
+    print("Press Ctrl-C to stop.")
+
+    app.run(host="127.0.0.1", port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()

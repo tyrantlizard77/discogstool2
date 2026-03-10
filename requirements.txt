@@ -6,3 +6,4 @@ urllib3
 standard-imghdr
 Pillow
 brother-ql-inventree
+flask

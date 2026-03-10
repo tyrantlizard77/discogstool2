@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      background: #1a1a1a;
+      color: #e0e0e0;
+      width: 240px;
+    }
+
+    header {
+      padding: 10px 12px 8px;
+      border-bottom: 1px solid #333;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+
+    header h1 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #fff;
+      flex: 1;
+    }
+
+    #release-id {
+      font-size: 11px;
+      color: #888;
+      font-family: monospace;
+    }
+
+    main {
+      padding: 10px 12px;
+    }
+
+    .field {
+      margin-bottom: 8px;
+    }
+
+    label {
+      display: block;
+      font-size: 11px;
+      color: #888;
+      margin-bottom: 3px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    select {
+      width: 100%;
+      padding: 5px 6px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      border-radius: 4px;
+      color: #e0e0e0;
+      font-size: 13px;
+    }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 10px;
+    }
+
+    .checkbox-row input[type=checkbox] {
+      accent-color: #d6844a;
+      width: 14px;
+      height: 14px;
+    }
+
+    .checkbox-row span {
+      font-size: 13px;
+    }
+
+    button {
+      width: 100%;
+      padding: 7px;
+      background: #d6844a;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button:hover { background: #e8965c; }
+    button:disabled { background: #555; cursor: default; }
+
+    #status {
+      margin-top: 8px;
+      font-size: 11px;
+      min-height: 16px;
+      color: #888;
+    }
+
+    #status.ok    { color: #6dbf67; }
+    #status.error { color: #e06060; }
+
+    footer {
+      padding: 8px 12px 10px;
+      border-top: 1px solid #2a2a2a;
+    }
+
+    footer label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: #666;
+      font-size: 11px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    footer input[type=number] {
+      width: 60px;
+      padding: 3px 5px;
+      background: #222;
+      border: 1px solid #383838;
+      border-radius: 3px;
+      color: #888;
+      font-size: 11px;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Print Label</h1>
+    <span id="release-id">—</span>
+  </header>
+
+  <main>
+    <div class="field">
+      <label for="profile">Label profile</label>
+      <select id="profile">
+        <option value="dk1247">DK-1247 die-cut 103×164mm</option>
+        <option value="dk22243">DK-22243 continuous 102mm</option>
+      </select>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="preview-only">
+      <span>Preview only (open PNG)</span>
+    </div>
+
+    <button id="print-btn" disabled>Print Label</button>
+
+    <div id="status"></div>
+  </main>
+
+  <footer>
+    <label>
+      Server port
+      <input type="number" id="port" min="1024" max="65535" value="5679">
+    </label>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

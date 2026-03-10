@@ -15,6 +15,7 @@ discogstool2 helps you process audio recordings from vinyl records and automatic
 - **Cover Art**: Automatically downloads and embeds album artwork
 - **Format Support**: Handles WAV, FLAC, MP3, M4A, AAC, and AIFF files
 - **Local Caching**: SQLite database caches Discogs API responses to minimize API calls
+- **Firefox Extension**: One-click label printing from any Discogs release page
 
 ## Prerequisites
 
@@ -328,6 +329,70 @@ The tool handles various track position formats:
 **Rate limiting errors**
 - The tool includes automatic retry logic and delays
 - If persistent, wait a few minutes and try again
+
+## Firefox Extension
+
+A browser extension lets you print a `dt_label` sleeve label directly from any Discogs release page — no terminal required.
+
+### Setup
+
+**1. Create and activate the virtual environment**
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+**2. Start dt_server**
+
+Run manually to monitor output:
+
+```bash
+.venv/bin/python3 dt_server
+```
+
+Or install as a login item so it starts automatically:
+
+```bash
+./install_server.sh
+```
+
+This generates a launchd plist with the correct paths for your machine,
+installs it to `~/Library/LaunchAgents/`, and starts the server immediately.
+Logs are written to `~/Library/Logs/discogstool/server.log`.
+
+To stop and remove:
+
+```bash
+./install_server.sh --unload
+```
+
+**3. Load the extension in Firefox**
+
+1. Navigate to `about:debugging`
+2. Click **This Firefox** → **Load Temporary Add-on**
+3. Select `firefox-ext/manifest.json`
+
+For a permanent installation, submit the extension as **unlisted** at `addons.mozilla.org` — Mozilla signs it for free and you install the resulting `.xpi`.
+
+### Usage
+
+1. Browse to any Discogs release page (e.g. `discogs.com/release/12345678-...`)
+2. The label icon activates in the Firefox toolbar
+3. Click it to open the print popup
+4. Choose a label profile, optionally toggle **Preview only**, and click **Print Label**
+
+Preview mode renders the label as a PNG and opens it in a new tab. Print mode sends directly to the configured thermal printer.
+
+The server port (default `5679`) is configurable in the popup footer and is saved between sessions.
+
+### Regenerating icons
+
+If you modify `firefox-ext/make_icons.py`:
+
+```bash
+.venv/bin/python3 firefox-ext/make_icons.py
+```
 
 ## License
 
