@@ -29,16 +29,43 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ── Label size profiles ───────────────────────────────────────────────────────
 
+# ── Shared layout constants (used by render_label AND _continuous_height) ─────
+# If you change these, update both places.
+
+_TRACK_ROW_H  = 88   # px per track row
+_SIDE_HDR_H   = 44   # px for a side header row
+_LINE_SPACING = 55   # px between note ruling lines
+
+# Header heights measured by tracing render_label y increments:
+#   normal:       artist(70)+title(58)+gap+div(28)+label(46)+genre(46)+gap+div(26) = 274
+#   continuation: compact-hdr(46)+gap+div(26)                                      =  72
+#   +disc_info:   +40 in either case
+_HDR_H = {"normal": 274, "continuation": 72, "disc_extra": 40}
+
+# Maximum label height for continuous stock — must fit on a 12" record sleeve.
+MAX_CONTINUOUS_PX = 12 * 300   # 3600 px at 300 DPI
+
+
 LABEL_PROFILES = {
     "dk1247": {
         "description": 'Brother DK-1247 die-cut 103mm x 164mm (4.07" x 6.46")',
         "brother_ql_id": "103x164",
         # Canvas must match dots_printable exactly for brother_ql die-cut mode.
         # Values from brother-ql-inventree v1.3 label_type_specs["103x164"].
+        "feed":      "die-cut",
         "width_px":  1200,   # dots_printable width
         "height_px": 1822,   # dots_printable height
         "margin_px": 46,
         "max_tracks": 12,    # leaves ~1" notes area (sized for 38pt track font)
+    },
+    "dk22243": {
+        "description": 'Brother DK-22243 continuous 102mm (4") roll',
+        "brother_ql_id": "102",
+        "feed":      "continuous",
+        "width_px":  1164,   # dots_printable width for 102mm endless
+        "margin_px": 46,
+        "max_tracks": 18,    # safety cap; label auto-sizes to content
+        "notes_lines": 3,    # fixed ruled lines in notes area
     },
 }
 
@@ -179,8 +206,41 @@ def hline(draw, y, x0, x1, color="black", weight=2):
 
 # ── Label rendering ───────────────────────────────────────────────────────────
 
+def _continuous_height(tracks_with_sides, profile, continuation=False,
+                       disc_info=None):
+    """Calculate canvas height for a continuous-feed label.
+
+    Uses the same layout constants as render_label so the two stay in sync.
+    Raises ValueError if the result would exceed MAX_CONTINUOUS_PX (12").
+    """
+    M           = profile["margin_px"]
+    notes_lines = profile.get("notes_lines", 3)
+
+    header_h = _HDR_H["continuation" if continuation else "normal"]
+    if disc_info:
+        header_h += _HDR_H["disc_extra"]
+
+    sides_seen = []
+    for side, _ in tracks_with_sides:
+        if not sides_seen or sides_seen[-1] != side:
+            sides_seen.append(side)
+    tracks_h = len(sides_seen) * _SIDE_HDR_H + len(tracks_with_sides) * _TRACK_ROW_H
+
+    # notes divider(28) + "NOTES:" text(44) + N ruled lines + bottom margin(M)
+    notes_h = 28 + 44 + notes_lines * _LINE_SPACING
+
+    height = 2 * M + header_h + tracks_h + notes_h
+    if height > MAX_CONTINUOUS_PX:
+        raise ValueError(
+            f"Label would be {height/300:.2f}\" tall — exceeds the 12\" sleeve limit.\n"
+            f"Use --split to print one label per disc."
+        )
+    return height
+
+
 def render_label(release, tracks_with_sides, profile,
-                 is_compilation, continuation=False, disc_info=None):
+                 is_compilation, continuation=False, disc_info=None,
+                 height_px=None, notes_lines=None):
     """Render and return a single PIL Image for one label.
 
     Args:
@@ -190,9 +250,11 @@ def render_label(release, tracks_with_sides, profile,
         is_compilation:    show per-track artists when True
         continuation:      compact header for overflow continuation labels
         disc_info:         (disc_num, total_discs) for --split mode, else None
+        height_px:         override canvas height (continuous labels only)
+        notes_lines:       fixed note line count; None = fill remaining space
     """
     W  = profile["width_px"]
-    H  = profile["height_px"]
+    H  = height_px if height_px is not None else profile["height_px"]
     M  = profile["margin_px"]
     CW = W - 2 * M   # usable content width
 
@@ -208,10 +270,8 @@ def render_label(release, tracks_with_sides, profile,
     f_track     = make_font("regular",   38)
     f_notes_hdr = make_font("bold",      28)
 
-    TRACK_ROW_H = 88    # px per track row — comfortable for circling + BPM
-    SIDE_HDR_H  = 44    # px for a side header row
-    BPM_ZONE_W  = 110   # right-side blank area for handwritten BPM
-    POS_W       = 90    # position column width
+    BPM_ZONE_W  = 110                         # right-side blank area for handwritten BPM
+    POS_W       = 90                          # position column width
     TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
 
     x0 = M
@@ -279,7 +339,7 @@ def render_label(release, tracks_with_sides, profile,
             current_side = side
             side_label = f"Side {side}" if side else "Tracks"
             draw.text((M, y), side_label, font=f_side_hdr, fill="black")
-            y += SIDE_HDR_H - 10
+            y += _SIDE_HDR_H - 10
             hl(y, color="#AAAAAA", weight=1)
             y += 10
 
@@ -296,10 +356,10 @@ def render_label(release, tracks_with_sides, profile,
         draw.text((M + POS_W, y), track_str, font=f_track, fill="black")
 
         # Subtle BPM underline in the right margin
-        bpm_line_y = y + TRACK_ROW_H - 18
+        bpm_line_y = y + _TRACK_ROW_H - 18
         hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#BBBBBB", weight=1)
 
-        y += TRACK_ROW_H
+        y += _TRACK_ROW_H
 
     # ── Notes section ─────────────────────────────────────────────────────────
 
@@ -309,12 +369,27 @@ def render_label(release, tracks_with_sides, profile,
     draw.text((M, y), "NOTES:", font=f_notes_hdr, fill="black")
     y += 44
 
-    line_spacing = 55
-    while y + line_spacing < H - M:
-        y += line_spacing
-        hl(y, color="#DDDDDD", weight=1)
+    if notes_lines is not None:
+        # Continuous labels: fixed number of ruled lines
+        for _ in range(notes_lines):
+            y += _LINE_SPACING
+            hl(y, color="#DDDDDD", weight=1)
+    else:
+        # Die-cut labels: fill remaining space
+        while y + _LINE_SPACING < H - M:
+            y += _LINE_SPACING
+            hl(y, color="#DDDDDD", weight=1)
 
     return img
+
+
+def _render_kwargs(tracks, profile, continuation=False, disc_info=None):
+    """Return extra kwargs for render_label based on feed type."""
+    if profile.get("feed") == "continuous":
+        h = _continuous_height(tracks, profile,
+                               continuation=continuation, disc_info=disc_info)
+        return {"height_px": h, "notes_lines": profile.get("notes_lines", 3)}
+    return {}
 
 
 def render_labels_for_release(release, args, profile):
@@ -331,8 +406,11 @@ def render_labels_for_release(release, args, profile):
             for side in sorted(discs[disc_num]):
                 for track in discs[disc_num][side]:
                     disc_tracks.append((side, track))
+            kw = _render_kwargs(disc_tracks, profile,
+                                disc_info=(disc_num, total_discs))
             img = render_label(release, disc_tracks, profile,
-                               is_compilation, disc_info=(disc_num, total_discs))
+                               is_compilation,
+                               disc_info=(disc_num, total_discs), **kw)
             labels.append((f"disc{disc_num}", img))
 
     else:
@@ -342,8 +420,9 @@ def render_labels_for_release(release, args, profile):
                   for i in range(0, len(all_tracks), max_tracks)]
         for idx, chunk in enumerate(chunks):
             suffix = "label" if idx == 0 else f"cont{idx}"
+            kw = _render_kwargs(chunk, profile, continuation=(idx > 0))
             img = render_label(release, chunk, profile,
-                               is_compilation, continuation=(idx > 0))
+                               is_compilation, continuation=(idx > 0), **kw)
             labels.append((suffix, img))
 
     return labels
@@ -421,8 +500,11 @@ def main():
         print("Available label profiles:")
         for name, p in LABEL_PROFILES.items():
             print(f"  {name:12s}  {p['description']}")
-            print(f"              {p['width_px']}×{p['height_px']}px, "
-                  f"max {p['max_tracks']} tracks, "
+            if p.get("feed") == "continuous":
+                size_str = f"{p['width_px']}px wide, continuous (auto-height)"
+            else:
+                size_str = f"{p['width_px']}×{p['height_px']}px"
+            print(f"              {size_str}, max {p['max_tracks']} tracks, "
                   f"brother_ql id: {p['brother_ql_id']}")
         sys.exit(0)
 
