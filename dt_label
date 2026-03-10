@@ -359,9 +359,9 @@ def render_label(release, tracks_with_sides, profile,
         track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W - dur_w)
         draw.text((M + POS_W, y), track_str + dur_suffix, font=f_track, fill="black")
 
-        # Subtle BPM underline in the right margin
+        # BPM write zone underline in the right margin
         bpm_line_y = y + _TRACK_ROW_H - 18
-        hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#BBBBBB", weight=1)
+        hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#888888", weight=3)
 
         y += _TRACK_ROW_H
 
