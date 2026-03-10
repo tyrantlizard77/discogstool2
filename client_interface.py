@@ -12,6 +12,8 @@ import sys
 import multiprocessing
 import threading
 import ctypes
+import io
+from PIL import Image
 
 discogs_auth = util.userfile("discogs_auth")
 useragent = "discogstool/2.0"
@@ -79,6 +81,26 @@ def scrub_data(data):
     return data
 
 threadlocal = threading.local()
+
+
+def _normalize_artwork(imgdata):
+    """Return artwork as a CDJ-compatible JPEG, resized to fit within 800×800.
+
+    Pioneer CDJs require embedded artwork to be JPEG format and no larger than
+    800×800 pixels.  This normalises whatever Discogs serves (PNG, large JPEG,
+    etc.) into a spec-compliant image so tagging always works correctly.
+
+    The on-disk cache retains the original bytes; only the in-memory copy
+    returned by getArtwork() is normalised.
+    """
+    img = Image.open(io.BytesIO(imgdata))
+    if img.width > 800 or img.height > 800:
+        img.thumbnail((800, 800), Image.LANCZOS)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
 
 class DiscogsRelease:
 
@@ -231,8 +253,8 @@ class DiscogsRelease:
                 with open(util.userfile(hashuri), "wb") as fo:
                     fo.write(imgdata)
 
-        self.imgdata = imgdata
-        return imgdata
+        self.imgdata = _normalize_artwork(imgdata)
+        return self.imgdata
 
     def __repr__(self):
         return "<DiscogsRelease %d>" % self.rid
