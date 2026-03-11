@@ -57,7 +57,26 @@ def preflight():
 
 @app.route("/status", methods=["GET"])
 def status():
-    return jsonify({"ok": True, "version": "1.0"})
+    return jsonify({"ok": True, "version": "1.0", "beatport": _check_beatport()})
+
+
+def _check_beatport():
+    """Check Beatport credential health without making a full API call.
+
+    Calls get_client(), which auto-refreshes the OAuth token if the stored
+    username/password are still valid.  Returns a status dict.
+    """
+    try:
+        import beatport
+    except ImportError:
+        return {"status": "unavailable"}
+    try:
+        beatport.get_client()
+        return {"status": "ok"}
+    except beatport.BeatportError as e:
+        return {"status": "error", "message": str(e)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.route("/preview/<path:filename>", methods=["GET"])

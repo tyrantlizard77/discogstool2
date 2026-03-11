@@ -22,6 +22,7 @@ browser.storage.local.get(STORAGE_KEYS).then(saved => {
   if (saved.split)   splitEl.checked   = saved.split;
   if (saved.preview) previewEl.checked = saved.preview;
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
+  checkBeatportStatus();
 });
 
 // Persist settings on change
@@ -49,8 +50,8 @@ browser.tabs.query({ active: true, currentWindow: true }).then(tabs => {
     releaseIdEl.textContent = "r" + releaseId;
     printBtn.disabled = false;
   } else {
-    releaseIdEl.textContent = "no release";
-    setStatus("Not on a Discogs release page.", "error");
+    releaseIdEl.textContent = "—";
+    setStatus("Browse to a release page to print.");
   }
 });
 
@@ -111,4 +112,23 @@ function parseDiscs(raw) {
 function setStatus(msg, cls = "") {
   statusEl.textContent = msg;
   statusEl.className = cls;
+}
+
+function checkBeatportStatus() {
+  const port = portEl.value || DEFAULT_PORT;
+  const el   = document.getElementById("beatport-status");
+  fetch(`http://localhost:${port}/status`)
+    .then(r => r.json())
+    .then(data => {
+      const bp = data.beatport;
+      if (!bp || bp.status === "unavailable") { el.textContent = ""; el.className = ""; return; }
+      if (bp.status === "ok") {
+        el.textContent = "● Beatport OK";
+        el.className   = "ok";
+      } else {
+        el.textContent = "● Beatport: " + (bp.message || bp.status);
+        el.className   = "error";
+      }
+    })
+    .catch(() => { el.textContent = ""; el.className = ""; });
 }

@@ -2,11 +2,12 @@
 // URL pattern: discogs.com/release/DIGITS or discogs.com/*/release/DIGITS
 
 const RELEASE_URL = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
+const DISCOGS_URL  = /discogs\.com/;
 const DEFAULT_PORT = 5679;
 const STORAGE_KEYS = ["port", "profile", "split", "preview"];
 
 function updateAction(tabId, url) {
-  if (url && RELEASE_URL.test(url)) {
+  if (url && DISCOGS_URL.test(url)) {
     browser.browserAction.enable(tabId);
   } else {
     browser.browserAction.disable(tabId);
