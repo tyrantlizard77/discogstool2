@@ -12,14 +12,14 @@ Default port: 5679 (configurable; must match the extension setting).
 
 import sys
 import os
-import json
-import base64
+import atexit
+import shutil
 import argparse
 import tempfile
 import subprocess
 import glob
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -28,6 +28,11 @@ DT_LABEL     = os.path.join(SCRIPT_DIR, "dt_label")
 DEFAULT_PORT = 5679
 
 app = Flask(__name__)
+
+# Persistent directory for preview PNGs, served over HTTP.
+# Cleared on each new preview request and on server exit.
+PREVIEW_DIR = tempfile.mkdtemp(prefix="dt_label_previews_")
+atexit.register(shutil.rmtree, PREVIEW_DIR, ignore_errors=True)
 
 
 # ── CORS (allow requests from any moz-extension:// origin) ───────────────────
@@ -41,8 +46,9 @@ def add_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
-@app.route("/print", methods=["OPTIONS"])
-@app.route("/status", methods=["OPTIONS"])
+@app.route("/print",   methods=["OPTIONS"])
+@app.route("/status",  methods=["OPTIONS"])
+@app.route("/preview", methods=["OPTIONS"])
 def preflight():
     return "", 204
 
@@ -52,6 +58,12 @@ def preflight():
 @app.route("/status", methods=["GET"])
 def status():
     return jsonify({"ok": True, "version": "1.0"})
+
+
+@app.route("/preview/<path:filename>", methods=["GET"])
+def serve_preview(filename):
+    """Serve a previously generated preview PNG."""
+    return send_from_directory(PREVIEW_DIR, filename)
 
 
 @app.route("/print", methods=["POST"])
@@ -112,26 +124,28 @@ def _run_print(release_id, profile, split=False, discs=None):
 
 
 def _run_preview(release_id, profile, split=False, discs=None):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        rc, output = _run_dt_label([
-            "--preview",
-            "--label-profile", profile,
-            "--output", tmpdir,
-        ] + _split_args(split, discs) + [release_id], capture=True)
+    # Clear any previous previews
+    for old in glob.glob(os.path.join(PREVIEW_DIR, "*.png")):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
 
-        if rc != 0:
-            return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
+    rc, output = _run_dt_label([
+        "--preview",
+        "--label-profile", profile,
+        "--output", PREVIEW_DIR,
+    ] + _split_args(split, discs) + [release_id], capture=True)
 
-        pngs = sorted(glob.glob(os.path.join(tmpdir, "*.png")))
-        if not pngs:
-            return jsonify({"ok": False, "message": "dt_label produced no PNG"}), 500
+    if rc != 0:
+        return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
 
-        encoded = []
-        for path in pngs:
-            with open(path, "rb") as f:
-                encoded.append(base64.b64encode(f.read()).decode())
+    pngs = sorted(glob.glob(os.path.join(PREVIEW_DIR, "*.png")))
+    if not pngs:
+        return jsonify({"ok": False, "message": "dt_label produced no PNG"}), 500
 
-    return jsonify({"ok": True, "pngs": encoded})
+    urls = [f"/preview/{os.path.basename(p)}" for p in pngs]
+    return jsonify({"ok": True, "preview_urls": urls})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

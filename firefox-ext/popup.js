@@ -76,11 +76,11 @@ printBtn.addEventListener("click", async () => {
       throw new Error(data.message || `Server error ${resp.status}`);
     }
 
-    if (preview && data.pngs?.length) {
-      for (const png of data.pngs) {
-        await browser.tabs.create({ url: "data:image/png;base64," + png });
+    if (preview && data.preview_urls?.length) {
+      for (const url of data.preview_urls) {
+        await browser.tabs.create({ url: `http://localhost:${port}${url}` });
       }
-      const count = data.pngs.length;
+      const count = data.preview_urls.length;
       setStatus(`${count} preview${count > 1 ? "s" : ""} opened in new tab${count > 1 ? "s" : ""}.`, "ok");
     } else {
       setStatus("Label sent to printer.", "ok");
