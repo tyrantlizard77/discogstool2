@@ -433,6 +433,43 @@ If you modify `firefox-ext/make_icons.py`:
 .venv/bin/python3 firefox-ext/make_icons.py
 ```
 
+## Development
+
+### Running Tests
+
+The test suite uses [pytest](https://pytest.org). Install it alongside the project dependencies if you haven't already:
+
+```bash
+pip install pytest
+pip install -r requirements.txt
+```
+
+Then run the full suite from the project root:
+
+```bash
+python3 -m pytest tests/
+```
+
+Run a single test file:
+
+```bash
+python3 -m pytest tests/test_wavfile.py
+```
+
+Run with verbose output to see individual test names:
+
+```bash
+python3 -m pytest tests/ -v
+```
+
+Stop on the first failure:
+
+```bash
+python3 -m pytest tests/ -x
+```
+
+The suite covers all modules (`util`, `database`, `libtags`, `client_interface`, `wavfile`, `beatport`) and all top-level scripts (`dt_find`, `dt_label`, `dt_process`, `dt_server`). Scripts without a `.py` extension are loaded as modules using `importlib.machinery.SourceFileLoader`. Network calls and filesystem side-effects are isolated with `unittest.mock` so no Discogs credentials or local files are needed to run the tests.
+
 ## License
 
 See LICENSE file for details.

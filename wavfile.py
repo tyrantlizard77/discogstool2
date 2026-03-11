@@ -256,9 +256,9 @@ def write(filename, rate, data, bitrate=None, markers=None, loops=None, pitch=No
             data[data < -1.0] = -1.0
             a32 = numpy.asarray(data * (2 ** 23 - 1), dtype=numpy.int32)
         else:
-            a32 = numpy.asarray(data, dtype=numpy.int32)
-        if a32.ndim == 1:               
-            a32.shape = a32.shape + (1,)  # Convert to a 2D array with a single column.
+            a32 = numpy.array(data, dtype=numpy.int32)  # copy, not view — avoids mutating caller's array
+        if a32.ndim == 1:
+            a32 = a32.reshape(a32.shape + (1,))  # Convert to a 2D array with a single column.
         a8 = (a32.reshape(a32.shape + (1,)) >> numpy.array([0, 8, 16])) & 255  # By shifting first 0 bits, then 8, then 16, the resulting output is 24 bit little-endian.
         data = a8.astype(numpy.uint8)
     else:
@@ -289,7 +289,7 @@ def write(filename, rate, data, bitrate=None, markers=None, loops=None, pitch=No
             labels = [m['label'] for m in markers]
             markers = [m['position'] for m in markers]
         else:
-            labels = ['' for m in markers]
+            labels = [b'' for m in markers]
 
         fid.write(b'cue ')
         size = 4 + len(markers) * 24
@@ -298,10 +298,10 @@ def write(filename, rate, data, bitrate=None, markers=None, loops=None, pitch=No
             s = struct.pack('<iiiiii', i + 1, c, 1635017060, 0, 0, c)           # 1635017060 is struct.unpack('<i',b'data')
             fid.write(s)
 
-        lbls = ''
+        lbls = b''
         for i, lbl in enumerate(labels):
             lbls += b'labl'
-            label = lbl + ('\x00' if len(lbl) % 2 == 1 else '\x00\x00')
+            label = lbl + (b'\x00' if len(lbl) % 2 == 1 else b'\x00\x00')
             size = len(lbl) + 1 + 4          # because \x00
             lbls += struct.pack('<II', size, i + 1)
             lbls += label
@@ -342,7 +342,7 @@ def write(filename, rate, data, bitrate=None, markers=None, loops=None, pitch=No
     data.tofile(fid)
 
     if data.nbytes % 2 == 1: # add an extra padding byte if data.nbytes is odd: https://web.archive.org/web/20141226210234/http://www.sonicspot.com/guide/wavefiles.html#data
-        fid.write('\x00')
+        fid.write(b'\x00')
 
     # Determine file size and place it in correct
     #  position at start of the file.
