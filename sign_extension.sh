@@ -85,4 +85,26 @@ fi
 echo ""
 echo "Signed: $(basename "$XPI")"
 echo "Opening in Firefox — click 'Add' when prompted."
-open "$XPI"
+
+# macOS doesn't register .xpi with any app by default; open explicitly with Firefox.
+FIREFOX_CANDIDATES=(
+    "/Applications/Firefox.app"
+    "/Applications/Firefox Developer Edition.app"
+    "${HOME}/Applications/Firefox.app"
+)
+FIREFOX_APP=""
+for candidate in "${FIREFOX_CANDIDATES[@]}"; do
+    if [[ -d "$candidate" ]]; then
+        FIREFOX_APP="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$FIREFOX_APP" ]]; then
+    open -a "$FIREFOX_APP" "$XPI"
+else
+    echo ""
+    echo "Could not find Firefox.app.  Install the extension manually:"
+    echo "  Drag this file into Firefox, or open it via File → Open File:"
+    echo "  $XPI"
+fi
