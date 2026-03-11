@@ -34,7 +34,7 @@ import time
 import unicodedata
 from abc import ABC, abstractmethod
 from difflib import SequenceMatcher
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -45,6 +45,52 @@ if TYPE_CHECKING:
     from client_interface import DiscogsRelease
 
 log = logging.getLogger(__name__)
+
+
+# ── Typed structures ───────────────────────────────────────────────────────────
+
+class BeatportAuth(TypedDict, total=False):
+    """Stored auth config in ~/.discogstool/beatport_auth.json."""
+    username: str
+    password: str
+    access_token: str
+    refresh_token: str
+    expires_at: float
+    llm_url: str
+    llm_model: str
+
+
+class _BeatportSearchResultRequired(TypedDict):
+    id: int
+
+
+class BeatportSearchResult(_BeatportSearchResultRequired, total=False):
+    """One entry from a Beatport catalog search."""
+    name: str
+    catalog_number: str
+    publish_date: str   # e.g. "2010-03-15"
+
+
+class BeatportTrack(TypedDict, total=False):
+    """Track object returned by Beatport track/release-tracks endpoints."""
+    id: int
+    name: str
+    mix_name: str
+    bpm: int
+    length_ms: int
+
+
+class _BeatportReleaseRequired(TypedDict):
+    id: int
+    name: str
+
+
+class BeatportRelease(_BeatportReleaseRequired, total=False):
+    """Release object returned by Beatport release endpoint."""
+    catalog_number: str
+    publish_date: str
+    tracks: list[BeatportTrack]
+
 
 # ── API endpoints ──────────────────────────────────────────────────────────────
 
@@ -243,7 +289,7 @@ class BeatportCache:
 
     # ── release cache ──────────────────────────────────────────────────────────
 
-    def get_release(self, beatport_id: str) -> dict | None:
+    def get_release(self, beatport_id: str) -> BeatportRelease | None:
         """Return cached release data or None if absent/expired."""
         c = self._conn.cursor()
         c.execute(
@@ -260,9 +306,9 @@ class BeatportCache:
             )
             self._conn.commit()
             return None
-        return json.loads(row["data"])
+        return cast(BeatportRelease, json.loads(row["data"]))
 
-    def put_release(self, beatport_id: str, data: dict) -> None:
+    def put_release(self, beatport_id: str, data: BeatportRelease) -> None:
         c = self._conn.cursor()
         c.execute(
             """INSERT OR REPLACE INTO release_cache
@@ -365,7 +411,7 @@ class _BeatportClient:
             url += "?" + urlencode(params)
         return url
 
-    def get(self, endpoint: str, **params: object) -> dict | list:
+    def _get_raw(self, endpoint: str, **params: object) -> BeatportRelease | BeatportSearchResult | list[BeatportSearchResult] | list[BeatportTrack]:
         url = self._make_url(endpoint, **params)
         try:
             r = requests.get(url, headers=self._headers(), timeout=_HTTP_TIMEOUT)
@@ -380,29 +426,40 @@ class _BeatportClient:
             data = r.json()
         except ValueError as e:
             raise BeatportError(f"Invalid JSON from {endpoint}: {e}") from e
-        # Paginated endpoints wrap results
+        # Paginated endpoints wrap results under "results"
         if isinstance(data, dict) and "results" in data:
-            return data["results"]
-        return data
+            return cast(list[BeatportSearchResult], data["results"])
+        if isinstance(data, list):
+            return cast(list[BeatportSearchResult], data)
+        return cast(BeatportRelease, data)
 
-    def search_releases(self, query: str, per_page: int = 5) -> list[dict]:
-        result = self.get("catalog/search", q=query, type="releases", per_page=per_page)
+    def search_releases(self, query: str, per_page: int = 5) -> list[BeatportSearchResult]:
+        result = self._get_raw("catalog/search", q=query, type="releases", per_page=per_page)
         if isinstance(result, dict):
-            return result.get("releases", [])
-        return []
+            releases = result.get("tracks", [])  # fallback
+            return cast(list[BeatportSearchResult], releases)
+        return cast(list[BeatportSearchResult], result)
 
-    def get_release(self, beatport_id: int | str) -> dict:
-        return self.get(f"/catalog/releases/{beatport_id}/")
+    def get_release(self, beatport_id: int | str) -> BeatportRelease:
+        result = self._get_raw(f"/catalog/releases/{beatport_id}/")
+        if isinstance(result, list):
+            raise BeatportError(f"Unexpected list response from releases/{beatport_id}/")
+        return cast(BeatportRelease, result)
 
-    def get_release_tracks(self, beatport_id: int | str) -> list[dict]:
-        result = self.get(
+    def get_release_tracks(self, beatport_id: int | str) -> list[BeatportTrack]:
+        result = self._get_raw(
             f"/catalog/releases/{beatport_id}/tracks/",
             per_page=100,
         )
-        return result if isinstance(result, list) else []
+        if isinstance(result, list):
+            return cast(list[BeatportTrack], result)
+        return []
 
-    def get_track(self, beatport_id: int | str) -> dict:
-        return self.get(f"/catalog/tracks/{beatport_id}/")
+    def get_track(self, beatport_id: int | str) -> BeatportTrack:
+        result = self._get_raw(f"/catalog/tracks/{beatport_id}/")
+        if isinstance(result, list):
+            raise BeatportError(f"Unexpected list response from tracks/{beatport_id}/")
+        return cast(BeatportTrack, result)
 
 
 class BeatportError(Exception):
@@ -438,7 +495,7 @@ def _fetch_client_id() -> str:
     raise BeatportError("Could not scrape API_CLIENT_ID from Beatport docs page")
 
 
-def _authorize(username: str, password: str, client_id: str) -> dict:
+def _authorize(username: str, password: str, client_id: str) -> BeatportAuth:
     """Run the Beatport OAuth2 authorization_code flow.
 
     Returns a dict with keys: access_token, refresh_token, expires_at.
@@ -502,11 +559,12 @@ def _authorize(username: str, password: str, client_id: str) -> dict:
             r.raise_for_status()
             token_data = r.json()
             expires_at = time.time() + int(token_data.get("expires_in", 3600))
-            return {
+            result: BeatportAuth = {
                 "access_token": token_data["access_token"],
                 "refresh_token": token_data.get("refresh_token", ""),
                 "expires_at": expires_at,
             }
+            return result
     except requests.HTTPError as e:
         raise BeatportError(
             f"HTTP {e.response.status_code} during authorization"
@@ -515,18 +573,18 @@ def _authorize(username: str, password: str, client_id: str) -> dict:
         raise BeatportError(f"Network error during authorization: {e}") from e
 
 
-def _load_auth() -> dict | None:
+def _load_auth() -> BeatportAuth | None:
     """Load auth config from disk. Returns None if file missing or malformed."""
     if not os.path.exists(AUTH_FILE):
         return None
     try:
         with open(AUTH_FILE) as f:
-            return json.load(f)
+            return cast(BeatportAuth, json.load(f))
     except (json.JSONDecodeError, OSError):
         return None
 
 
-def _save_auth(data: dict) -> None:
+def _save_auth(data: BeatportAuth) -> None:
     with open(AUTH_FILE, "w") as f:
         json.dump(data, f, indent=2)
     os.chmod(AUTH_FILE, 0o600)
@@ -546,9 +604,10 @@ def get_client() -> _BeatportClient:
         )
 
     # Token still valid?
-    expires_at = auth.get("expires_at", 0)
-    if time.time() + 30 < expires_at and auth.get("access_token"):
-        return _BeatportClient(auth["access_token"])
+    expires_at: float = auth.get("expires_at", 0.0)
+    access_token = auth.get("access_token")
+    if time.time() + 30 < expires_at and access_token:
+        return _BeatportClient(access_token)
 
     # Token expired or missing — re-authorize
     username = auth.get("username")
@@ -565,7 +624,8 @@ def get_client() -> _BeatportClient:
     auth.update(token)
     _save_auth(auth)
     log.debug("Beatport re-authorized successfully")
-    return _BeatportClient(auth["access_token"])
+    new_token = auth.get("access_token", "")
+    return _BeatportClient(new_token)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -656,7 +716,7 @@ class CatnoMatcher(ReleaseMatcher):
                 bp_year = None
                 if r.get("publish_date"):
                     try:
-                        bp_year = int(str(r["publish_date"])[:4])
+                        bp_year = int(str(r.get("publish_date", ""))[:4])
                     except (ValueError, TypeError):
                         pass
 
@@ -753,7 +813,7 @@ class TitleMatcher(ReleaseMatcher):
                 bp_year  = None
                 if r.get("publish_date"):
                     try:
-                        bp_year = int(str(r["publish_date"])[:4])
+                        bp_year = int(str(r.get("publish_date", ""))[:4])
                     except (ValueError, TypeError):
                         pass
 
@@ -831,9 +891,9 @@ class LLMMatcher(ReleaseMatcher):
     MIN_LLM_CONFIDENCE: float = 0.85
 
     def __init__(self) -> None:
-        auth = _load_auth() or {}
-        self._llm_url: str | None = auth.get("llm_url")
-        self._llm_model: str = auth.get("llm_model", "llama3")
+        auth = _load_auth()
+        self._llm_url: str | None = auth.get("llm_url") if auth else None
+        self._llm_model: str = auth.get("llm_model", "llama3") if auth else "llama3"
 
     def is_available(self) -> bool:
         return bool(self._llm_url)
@@ -886,7 +946,7 @@ class LLMMatcher(ReleaseMatcher):
             try:
                 t = discogs_release.getTrack(i)
                 tracks.append(f"  {t.getPosition()} {t.getTitle()}")
-            except (IndexError, AttributeError):
+            except Exception:
                 break
 
         track_list = "\n".join(tracks[:20]) if tracks else "  (none)"
@@ -937,7 +997,7 @@ def _fetch_full_release(
     beatport_id: str,
     client: _BeatportClient,
     cache: BeatportCache,
-) -> dict | None:
+) -> BeatportRelease | None:
     """Fetch a Beatport release with its full tracklist, using cache."""
     cached = cache.get_release(beatport_id)
     if cached is not None:
@@ -986,8 +1046,8 @@ def _fetch_full_release(
 
 def _match_tracks(
     discogs_release: "DiscogsRelease",
-    beatport_tracks: list[dict],
-) -> dict[int, dict]:
+    beatport_tracks: list[BeatportTrack],
+) -> dict[int, dict[str, int | None]]:
     """Fuzzy-match Discogs tracks to Beatport tracks by title.
 
     Returns a dict: {discogs_track_index (0-based): {"bpm": int|None, "duration_ms": int|None}}.
@@ -998,7 +1058,7 @@ def _match_tracks(
     exclusive tracks compared to the vinyl release on Discogs.
     We match by title similarity rather than position.
     """
-    result: dict[int, dict] = {}
+    result: dict[int, dict[str, int | None]] = {}
 
     # Build normalized Beatport track list once
     bp_normalized = []
@@ -1131,7 +1191,7 @@ class BeatportMatcher:
         self,
         discogs_release: "DiscogsRelease",
         force: bool = False,
-    ) -> dict[int, dict]:
+    ) -> dict[int, dict[str, int | None]]:
         """Find BPMs and durations for all tracks in a Discogs release.
 
         Parameters
@@ -1230,7 +1290,7 @@ class BeatportMatcher:
         discogs_release: "DiscogsRelease",
         beatport_id: str,
         client: _BeatportClient | None = None,
-    ) -> dict[int, dict]:
+    ) -> dict[int, dict[str, int | None]]:
         """Fetch Beatport tracks and fuzzy-match to Discogs tracks."""
         if client is None:
             try:
@@ -1261,7 +1321,7 @@ def _setup_credentials() -> None:
     print("Credentials are stored in:", AUTH_FILE)
     print()
 
-    auth = _load_auth() or {}
+    auth: BeatportAuth = _load_auth() or cast(BeatportAuth, {})
     username = input(f"Beatport username [{auth.get('username', '')}]: ").strip()
     if username:
         auth["username"] = username
@@ -1343,10 +1403,9 @@ if __name__ == "__main__":
         # Import here to avoid circular dependency during module load
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from client_interface import DiscogsRelease, DiscogsClient
+        from client_interface import DiscogsRelease
 
-        dc = DiscogsClient()
-        dr = dc.getRelease(int(args.release))
+        dr = DiscogsRelease(int(args.release))
         matcher = BeatportMatcher()
         bpms = matcher.find_bpms(dr, force=args.force)
         if bpms:

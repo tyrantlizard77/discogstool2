@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import discogs_client
 import util
 import os
@@ -13,24 +15,75 @@ import multiprocessing
 import threading
 import ctypes
 import io
+from typing import TypeAlias, TypedDict, cast
 from PIL import Image
 
 discogs_auth = util.userfile("discogs_auth")
 useragent = "discogstool/2.0"
 consumer_key = "mWCofNBrngwtGCSBOTDe"
 consumer_secret = "nBgWYPSMtAonLobnAuZiowpJyUzhbcgW"
-cached_instance = None
+cached_instance: discogs_client.Client | None = None
 
-url_headers = {
+url_headers: dict[str, str] = {
     'User-Agent' : useragent
 }
 
 discogs_lock = multiprocessing.Lock()
 
+
+# ── TypedDicts for Discogs API response structures ─────────────────────────────
+
+class DiscogsArtistRef(TypedDict, total=False):
+    name: str
+    anv: str
+
+
+class DiscogsLabelRef(TypedDict, total=False):
+    name: str
+    catno: str
+
+
+class _DiscogsImageRefRequired(TypedDict):
+    uri: str
+
+
+class DiscogsImageRef(_DiscogsImageRefRequired, total=False):
+    type: str
+    width: int
+    height: int
+
+
+class _DiscogsTrackDataRequired(TypedDict):
+    position: str
+    title: str
+    type_: str
+
+
+class DiscogsTrackData(_DiscogsTrackDataRequired, total=False):
+    artists: list[DiscogsArtistRef]
+    duration: str
+
+
+class _DiscogsReleaseDataRequired(TypedDict):
+    tracklist: list[DiscogsTrackData]
+    title: str
+    artists: list[DiscogsArtistRef]
+    labels: list[DiscogsLabelRef]
+
+
+class DiscogsReleaseData(_DiscogsReleaseDataRequired, total=False):
+    year: int
+    images: list[DiscogsImageRef]
+    country: str
+    styles: list[str]
+    genres: list[str]
+
+
 class ClientException(Exception):
     pass
 
-def get_user_auth_tokens():
+
+def get_user_auth_tokens() -> tuple[str, str] | tuple[None, None]:
     if os.path.exists(discogs_auth):
         try:
             with open(discogs_auth, "r") as fp:
@@ -42,11 +95,13 @@ def get_user_auth_tokens():
     else:
         return None, None
 
-def set_user_auth_tokens(token, secret):
+
+def set_user_auth_tokens(token: str, secret: str) -> None:
     with open(discogs_auth, "w") as fp:
         fp.write("%s|%s" % (token, secret))
 
-def get_client_instance():
+
+def get_client_instance() -> discogs_client.Client:
     global cached_instance
     if cached_instance:
         return cached_instance
@@ -69,21 +124,26 @@ def get_client_instance():
     cached_instance = c
     return c
 
-def scrub_data(data):
+
+# Recursive type alias for arbitrary JSON-like values (Python 3.10+)
+JsonValue: TypeAlias = "str | int | float | bool | None | dict[str, JsonValue] | list[JsonValue]"
+
+
+def scrub_data(data: JsonValue) -> JsonValue:
+    """Recursively strip whitespace from all string values in a JSON-like structure."""
     if isinstance(data, dict):
-        for key, item in list(data.items()):
-            data[key] = scrub_data(item)
-        return data
+        return {k: scrub_data(v) for k, v in data.items()}
     if isinstance(data, list):
         return [scrub_data(i) for i in data]
-    if isinstance(data, str) or isinstance(data, str):
+    if isinstance(data, str):
         return data.strip()
     return data
+
 
 threadlocal = threading.local()
 
 
-def _normalize_artwork(imgdata):
+def _normalize_artwork(imgdata: bytes) -> bytes:
     """Return artwork as a CDJ-compatible JPEG, resized to fit within 800×800.
 
     Pioneer CDJs require embedded artwork to be JPEG format and no larger than
@@ -102,20 +162,26 @@ def _normalize_artwork(imgdata):
     img.save(out, format="JPEG", quality=90)
     return out.getvalue()
 
+
 class DiscogsRelease:
+    data: DiscogsReleaseData
+    rid: int
+    totaltracks: int
+    imgdata: bytes | None
 
-    def __getitem__(self, key):
-        return self.data[key]
+    def __getitem__(self, key: str) -> DiscogsTrackData | DiscogsArtistRef | DiscogsLabelRef | DiscogsImageRef | list[DiscogsTrackData] | list[DiscogsArtistRef] | list[DiscogsLabelRef] | list[DiscogsImageRef] | list[str] | str | int:
+        return self.data[key]  # type: ignore[literal-required]
 
-    def getData(self, rid):
+    def getData(self, rid: int) -> DiscogsReleaseData:
         db = getattr(threadlocal, "db", None)
         if db is None:
             db = database.DiscogsDatabase()
             threadlocal.db = db
 
         key = "release-%d" % rid
-        data = db.get(key)
-        if data:
+        raw = db.get(key)
+        if raw is not None:
+            data = cast(DiscogsReleaseData, raw)
             if "tracklist" in data:
                 return data
             else:
@@ -126,36 +192,37 @@ class DiscogsRelease:
 
             # Even though rate limiting properly, still see transient
             # "Connection Reset By Peer" and "Bad Status Line" errors
-            success = False
+            release = None
             for i in range(3):
                 try:
                     time.sleep(1.1 + (5 * i))
                     release = client.release(rid)
                     release.refresh()
-                except Exception as e:
+                    break
+                except Exception:
                     continue
-                success = True
-                break
 
-            if not success:
+            if release is None:
                 raise ClientException("release %d couldn't be fetched" % rid)
 
-        data = scrub_data(release.data)
+        data = cast(DiscogsReleaseData, scrub_data(cast(DiscogsReleaseData, release.data)))  # type: ignore[union-attr]
         db.put(key, data)
 
         return data
 
-    def __init__(self, rid):
+    def __init__(self, rid: int) -> None:
         self.rid = rid
-        self.data = scrub_data(self.getData(rid))
+        self.data = self.getData(rid)
 
         # Filter out non-track items in the tracklist like headings
-        self.data["tracklist"] = [i for i in self.data["tracklist"]
-                if i["type_"] == "track" and i["title"] != ""]
+        self.data["tracklist"] = [
+            i for i in self.data["tracklist"]
+            if i["type_"] == "track" and i["title"] != ""
+        ]
         self.totaltracks = len(self.data["tracklist"])
         self.imgdata = None
 
-    def isCompilation(self):
+    def isCompilation(self) -> bool:
         art = self.getTrack(0).getArtist()
 
         for i in range(1, self.getTotalTracks()):
@@ -164,65 +231,69 @@ class DiscogsRelease:
 
         return False
 
-    def getId(self):
+    def getId(self) -> int:
         return self.rid
 
-    def getTotalTracks(self):
+    def getTotalTracks(self) -> int:
         return self.totaltracks
 
-    def getTrack(self, index):
+    def getTrack(self, index: int) -> DiscogsTrack:
         return DiscogsTrack(self, index)
 
-    def getYear(self):
-        return str(self.data["year"])
+    def getYear(self) -> str:
+        return str(self.data.get("year", ""))
 
-    def compileListData(self, listname, keys):
+    def compileListData(self, listname: str, keys: list[str]) -> str:
+        items = cast(list[dict[str, str]], self.data[listname])  # type: ignore[literal-required]
+        s: str = ""
         for key in keys:
-            s = self.data[listname][0][key]
+            s = items[0].get(key, "")
             if s:
                 break
 
-        for i in self.data[listname][1:]:
+        for i in items[1:]:
+            x: str = ""
             for key in keys:
-                x = i[key]
+                x = i.get(key, "")
                 if x:
                     break
             s = "%s / %s" % (s, x)
         return s.strip()
 
-    def getArtist(self):
+    def getArtist(self) -> str:
         return self.compileListData("artists", ["anv", "name"])
 
-    def getLabel(self):
+    def getLabel(self) -> str:
         return self.compileListData("labels", ["name"])
 
-    def getCatno(self):
+    def getCatno(self) -> str:
         return self.compileListData("labels", ["catno"])
 
-    def getCountry(self):
+    def getCountry(self) -> str:
         return self.data.get("country", "")
 
-    def getGenre(self):
-        genres = self.data.get("styles", [])
+    def getGenre(self) -> str:
+        genres: list[str] = self.data.get("styles", [])
         if not genres:
             genres = self.data.get("genres", [])
         return ", ".join(genres)
 
-    def getTitle(self):
+    def getTitle(self) -> str:
         rt = self.data["title"]
         if not rt.startswith("Untitled"):
             return rt
 
         return self.getCatno()
 
-    def getArtwork(self):
+    def getArtwork(self) -> bytes | None:
         if self.imgdata:
             return self.imgdata
 
-        if "images" not in self.data:
+        images = self.data.get("images", [])
+        if not images:
             return None
 
-        uri = self.data["images"][0]["uri"]
+        uri = images[0]["uri"]
         hashuri = hex(ctypes.c_uint64(hash(uri)).value)
 
         with discogs_lock:
@@ -231,6 +302,7 @@ class DiscogsRelease:
                     imgdata = fo.read()
             else:
                 count = 0
+                imgdata = b""
                 while (True):
                     time.sleep(1.05)
                     count = count + 1
@@ -238,17 +310,17 @@ class DiscogsRelease:
                         req = urllib.request.Request(uri, data=None, headers=url_headers)
                         imgdata = urllib.request.urlopen(req).read()
                         break
-                    except urllib.error.URLError as err:
-                        if (count < 5):
-                            continue
-                        else:
-                            raise
                     except urllib.error.HTTPError as err:
                         print("Error fetching cover art")
                         print("URL: ", uri)
                         print(err.code, err.reason)
                         print(err.headers)
                         raise
+                    except urllib.error.URLError:
+                        if (count < 5):
+                            continue
+                        else:
+                            raise
 
                 with open(util.userfile(hashuri), "wb") as fo:
                     fo.write(imgdata)
@@ -256,61 +328,69 @@ class DiscogsRelease:
         self.imgdata = _normalize_artwork(imgdata)
         return self.imgdata
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "<DiscogsRelease %d>" % self.rid
 
-    def __str__(self):
+    def __str__(self) -> str:
         return "%s - %s (%s: %s)" % (self.getArtist(), self.getTitle(),
                 self.getLabel(), self.getCatno())
 
+
 class DiscogsTrack:
-    def __getitem__(self, key):
-        return self.tdata[key]
+    tdata: DiscogsTrackData
+    release: DiscogsRelease
+    index: int
+
+    def __getitem__(self, key: str) -> str | list[DiscogsArtistRef]:
+        return self.tdata[key]  # type: ignore[literal-required]
 
     # Index is from 0
-    def __init__(self, release, index):
+    def __init__(self, release: DiscogsRelease | int, index: int) -> None:
         if isinstance(release, int):
             self.release = DiscogsRelease(release)
         else:
             self.release = release
         self.index = index
         try:
-            self.tdata = self.release["tracklist"][index]
-        except IndexError as ie:
+            self.tdata = self.release.data["tracklist"][index]
+        except IndexError:
             raise ClientException("Release %s has no track %d" % (release, index))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "<DiscogsTrack %d:%d>" % (self.release.rid, self.index)
 
-    def __str__(self):
-        relstr = str(self.release)
+    def __str__(self) -> str:
         return "%s - %s [%s] - %s: %s" % (self.getArtist(), self.release.getTitle(),
                 self.release.getLabel(),
                 self.tdata["position"], self.getTitle())
 
-    def getTrackNumber(self):
+    def getTrackNumber(self) -> int:
         return self.index + 1
 
-    def getArtist(self):
-        if "artists" not in self.tdata:
+    def getArtist(self) -> str:
+        artists = self.tdata.get("artists")
+        if not artists:
             return self.release.getArtist()
 
-        artiststr = self.tdata["artists"][0]["name"]
-        for artist in self.tdata["artists"][1:]:
-            artiststr = "%s / %s" % (artiststr, artist["name"])
+        artiststr = artists[0].get("name", "")
+        for artist in artists[1:]:
+            artiststr = "%s / %s" % (artiststr, artist.get("name", ""))
         return artiststr.strip()
 
-    def getTitle(self):
+    def getTitle(self) -> str:
         t = self.tdata["title"]
         if not t.startswith("Untitled"):
             return t
 
         return "%s %s" % (self.release.getTitle(), self.tdata["position"])
 
-    def getDuration(self):
+    def getPosition(self) -> str:
+        return self.tdata["position"]
+
+    def getDuration(self) -> str:
         return self.tdata.get("duration", "").strip()
 
-    def getRelease(self):
+    def getRelease(self) -> DiscogsRelease:
         return self.release
 
 
@@ -322,6 +402,3 @@ if __name__ == "__main__":
     pp.pprint(t.release.data)
     print((repr(t)))
     print(t)
-
-
-

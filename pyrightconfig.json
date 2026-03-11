@@ -1,0 +1,7 @@
+{
+  "typeCheckingMode": "standard",
+  "pythonVersion": "3.10",
+  "include": ["."],
+  "exclude": [".venv", "firefox-ext", "tests"],
+  "reportMissingModuleSource": "none"
+}
