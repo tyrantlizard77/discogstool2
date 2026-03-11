@@ -82,8 +82,13 @@ if [[ -z "$XPI" ]]; then
     exit 0
 fi
 
+# Copy to a stable, git-tracked path so the signed extension can be committed.
+STABLE_XPI="${SCRIPT_DIR}/discogs-label-printer.xpi"
+cp "$XPI" "$STABLE_XPI"
+
 echo ""
 echo "Signed: $(basename "$XPI")"
+echo "Copied to: discogs-label-printer.xpi  ← commit this file"
 echo "Opening in Firefox — click 'Add' when prompted."
 
 # macOS doesn't register .xpi with any app by default; open explicitly with Firefox.
@@ -101,10 +106,10 @@ for candidate in "${FIREFOX_CANDIDATES[@]}"; do
 done
 
 if [[ -n "$FIREFOX_APP" ]]; then
-    open -a "$FIREFOX_APP" "$XPI"
+    open -a "$FIREFOX_APP" "$STABLE_XPI"
 else
     echo ""
     echo "Could not find Firefox.app.  Install the extension manually:"
     echo "  Drag this file into Firefox, or open it via File → Open File:"
-    echo "  $XPI"
+    echo "  $STABLE_XPI"
 fi

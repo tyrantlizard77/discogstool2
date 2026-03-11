@@ -3,4 +3,7 @@ __pycache__
 .vscode
 .venv
 .claude
+.DS_Store
+firefox-ext/.amo-upload-uuid
+web-ext-artifacts/
 test_out/

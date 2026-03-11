@@ -398,6 +398,16 @@ Requires npm (for `web-ext`). On the first run the script prompts for AMO API cr
 
 3. Click **Add** when Firefox prompts.
 
+4. Commit the stable copy so others can install without re-signing:
+   ```bash
+   git add discogs-label-printer.xpi
+   git commit -m "Update signed extension"
+   ```
+   On another machine: drag `discogs-label-printer.xpi` into Firefox, or run:
+   ```bash
+   open -a Firefox.app discogs-label-printer.xpi
+   ```
+
 **Updating the extension after code changes**
 
 1. Bump `"version"` in `firefox-ext/manifest.json`
