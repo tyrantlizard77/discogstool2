@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import util
 import client_interface
 from PIL import Image, ImageDraw, ImageFont
+import qrcode
 
 log = logging.getLogger(__name__)
 
@@ -412,16 +413,38 @@ def render_label(release, tracks_with_sides, profile,
     draw.text((M, y), "NOTES:", font=f_notes_hdr, fill="black")
     y += 44
 
+    # QR code sits flush in the bottom-right corner of the notes area.
+    # Ruled lines that enter the QR zone are shortened so it sits cleanly.
+    QR_SIZE = 160                      # px — ~13 mm at 300 DPI
+    qr_top  = H - M - QR_SIZE         # y where the QR block starts
+    qr_left = W - M - QR_SIZE         # x where the QR block starts
+
+    def _hl_notes(line_y):
+        x_right = qr_left - 8 if line_y >= qr_top else W - M
+        hline(draw, line_y, M, x_right, color="#DDDDDD", weight=1)
+
     if notes_lines is not None:
         # Continuous labels: fixed number of ruled lines
         for _ in range(notes_lines):
             y += _LINE_SPACING
-            hl(y, color="#DDDDDD", weight=1)
+            _hl_notes(y)
     else:
         # Die-cut labels: fill remaining space
         while y + _LINE_SPACING < H - M:
             y += _LINE_SPACING
-            hl(y, color="#DDDDDD", weight=1)
+            _hl_notes(y)
+
+    # Generate QR code linking to the Discogs release page
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=6,
+        border=1,
+    )
+    qr.add_data(f"https://www.discogs.com/release/{release.getId()}")
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    qr_img = qr_img.resize((QR_SIZE, QR_SIZE), Image.NEAREST)
+    img.paste(qr_img, (qr_left, qr_top))
 
     return img
 

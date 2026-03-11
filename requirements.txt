@@ -8,3 +8,4 @@ Pillow
 brother-ql-inventree
 flask
 requests
+qrcode
