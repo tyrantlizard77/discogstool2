@@ -144,7 +144,7 @@ def read(
     readpitch: bool = False,
     normalized: bool = False,
     forcestereo: bool = False,
-) -> tuple[int, WavData, int] | tuple[int, WavData, int, list[int]] | tuple[int, WavData, int, list[WavMarker]] | tuple[int, WavData, int, list[list[int]]]:
+) -> tuple[int, WavData, int] | tuple[int, WavData, int, list[int]] | tuple[int, WavData, int, list[WavMarker]] | tuple[int, WavData, int, list[list[int]]] | tuple[int, WavData, int, list[int], list[WavMarker], list[list[int]]]:
     """
     Return the sample rate (in samples/sec) and data from a WAV file
 
@@ -268,6 +268,8 @@ def read(
     _cue = [m["position"] for m in _markerslist]
     _cuelabels = [m["label"] for m in _markerslist]
 
+    if readmarkers and readmarkerslist and readloops:
+        return (rate, data, bits, _cue, _markerslist, loops)
     if readmarkers:
         return (rate, data, bits, _cue)
     if readmarkerslist:
