@@ -7,3 +7,4 @@ standard-imghdr
 Pillow
 brother-ql-inventree
 flask
+requests

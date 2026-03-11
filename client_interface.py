@@ -277,7 +277,7 @@ class DiscogsTrack:
         try:
             self.tdata = self.release["tracklist"][index]
         except IndexError as ie:
-            raise ClientException("Release %d has no track %d" % (release, index))
+            raise ClientException("Release %s has no track %d" % (release, index))
 
     def __repr__(self):
         return "<DiscogsTrack %d:%d>" % (self.release.rid, self.index)
