@@ -387,9 +387,8 @@ def render_label(release, tracks_with_sides, profile,
             bpm_str = str(known_bpm)
             bpm_w = draw.textlength(bpm_str, font=f_bpm)
             bpm_x = W - M - (BPM_ZONE_W + bpm_w) // 2  # centre in zone
-            # Baseline-align with the underline position
-            bpm_y = bpm_line_y - 36   # text sits just above the line
-            draw.text((bpm_x, bpm_y), bpm_str, font=f_bpm, fill="#333333")
+            # Align vertically with the track name text
+            draw.text((bpm_x, y), bpm_str, font=f_bpm, fill="#333333")
             # Faint underline to show the write zone even with a printed value
             hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#BBBBBB", weight=1)
         else:
