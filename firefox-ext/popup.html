@@ -78,6 +78,25 @@
       font-size: 13px;
     }
 
+    .sub-field {
+      margin-left: 21px;
+      margin-top: 5px;
+      margin-bottom: 4px;
+    }
+
+    .sub-field input[type=text] {
+      width: 100%;
+      padding: 4px 6px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      border-radius: 4px;
+      color: #e0e0e0;
+      font-size: 12px;
+      font-family: monospace;
+    }
+
+    .hidden { display: none; }
+
     button {
       width: 100%;
       padding: 7px;
@@ -143,6 +162,16 @@
         <option value="dk1247">DK-1247 die-cut 103×164mm</option>
         <option value="dk22243">DK-22243 continuous 102mm</option>
       </select>
+    </div>
+
+    <div class="checkbox-row" style="margin-bottom:4px">
+      <input type="checkbox" id="split">
+      <span>Split by disc</span>
+    </div>
+
+    <div class="sub-field hidden" id="discs-row">
+      <label for="discs">Discs to print (blank = all)</label>
+      <input type="text" id="discs" placeholder="e.g. 1 3">
     </div>
 
     <div class="checkbox-row">

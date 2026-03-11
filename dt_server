@@ -61,14 +61,16 @@ def print_label():
     release_id = str(data.get("release_id", "")).strip()
     profile    = str(data.get("profile", "dk1247")).strip()
     preview    = bool(data.get("preview", False))
+    split      = bool(data.get("split", False))
+    discs      = data.get("discs")   # list of ints or None
 
     if not release_id.isdigit():
         return jsonify({"ok": False, "message": f"Invalid release ID: {release_id!r}"}), 400
 
     if preview:
-        return _run_preview(release_id, profile)
+        return _run_preview(release_id, profile, split=split, discs=discs)
     else:
-        return _run_print(release_id, profile)
+        return _run_print(release_id, profile, split=split, discs=discs)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -90,37 +92,46 @@ def _run_dt_label(args, *, capture=False):
     return result.returncode, output
 
 
-def _run_print(release_id, profile):
-    rc, output = _run_dt_label([
-        "--label-profile", profile,
-        release_id,
-    ])
+def _split_args(split, discs):
+    """Build --split / --discs argument fragments."""
+    args = []
+    if split:
+        args.append("--split")
+    if split and discs:
+        args += ["--discs"] + [str(d) for d in discs]
+    return args
+
+
+def _run_print(release_id, profile, split=False, discs=None):
+    rc, output = _run_dt_label(
+        ["--label-profile", profile] + _split_args(split, discs) + [release_id]
+    )
     if rc != 0:
         return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
     return jsonify({"ok": True})
 
 
-def _run_preview(release_id, profile):
+def _run_preview(release_id, profile, split=False, discs=None):
     with tempfile.TemporaryDirectory() as tmpdir:
         rc, output = _run_dt_label([
             "--preview",
             "--label-profile", profile,
             "--output", tmpdir,
-            release_id,
-        ], capture=True)
+        ] + _split_args(split, discs) + [release_id], capture=True)
 
         if rc != 0:
             return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
 
-        # dt_label writes one or more PNGs; grab the first one
         pngs = sorted(glob.glob(os.path.join(tmpdir, "*.png")))
         if not pngs:
             return jsonify({"ok": False, "message": "dt_label produced no PNG"}), 500
 
-        with open(pngs[0], "rb") as f:
-            png_b64 = base64.b64encode(f.read()).decode()
+        encoded = []
+        for path in pngs:
+            with open(path, "rb") as f:
+                encoded.append(base64.b64encode(f.read()).decode())
 
-    return jsonify({"ok": True, "png": png_b64})
+    return jsonify({"ok": True, "pngs": encoded})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
