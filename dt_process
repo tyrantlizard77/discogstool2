@@ -101,11 +101,19 @@ def normalize_loudnorm(path, tmpout):
         "-f", "null", "-"
     ], capture_output=True, text=True)
 
-    # Parse the JSON output from stderr (ffmpeg outputs to stderr)
-    # The JSON is at the end of the output after the loudnorm stats
+    if result.returncode != 0:
+        raise ConversionException(f"ffmpeg loudnorm pass 1 failed (exit {result.returncode})")
+
+    # Parse the JSON output from stderr.  ffmpeg loudnorm prints a block that
+    # starts with "[Parsed_loudnorm" and then a { ... } JSON object on the
+    # following lines.  Anchor on that marker so we don't accidentally grab an
+    # earlier { } in the output (e.g. from other filters or future ffmpeg output).
     output = result.stderr
-    json_start = output.rfind('{')
-    json_end = output.rfind('}') + 1
+    marker = output.find('[Parsed_loudnorm')
+    if marker == -1:
+        raise ConversionException("loudnorm stats not found in ffmpeg output")
+    json_start = output.find('{', marker)
+    json_end   = output.find('}', json_start) + 1
     if json_start == -1 or json_end == 0:
         raise ConversionException("Failed to parse loudnorm analysis output")
 
@@ -114,6 +122,13 @@ def normalize_loudnorm(path, tmpout):
     except json.JSONDecodeError as e:
         debug("loudnorm output:", output)
         raise ConversionException(f"Failed to parse loudnorm JSON: {e}")
+
+    if stats.get('normalization_type') == 'dynamic':
+        # Linear mode wasn't achievable (gain would have caused true-peak
+        # clipping), so loudnorm fell back to dynamic compression.  Warn so
+        # this doesn't go unnoticed — dynamic mode alters the audio character.
+        print(f"WARNING: loudnorm fell back to dynamic mode for {path} "
+              "(linear normalization would clip; dynamic compression applied)")
 
     debug("Loudness stats:", stats)
 
