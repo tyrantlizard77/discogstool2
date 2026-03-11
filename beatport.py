@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 import os
 import re
 import sqlite3
@@ -80,8 +81,43 @@ NOMATCH_TTL_DAYS: int = 30
 
 # ── Auth config path ───────────────────────────────────────────────────────────
 
-AUTH_FILE = util.userfile("beatport_auth.json")
-CACHE_FILE = util.userfile("beatport.db")
+AUTH_FILE    = util.userfile("beatport_auth.json")
+CACHE_FILE   = util.userfile("beatport.db")
+_LOG_FILE    = util.userfile("beatport.log")
+
+
+# ── File logger ───────────────────────────────────────────────────────────────
+
+_file_handler_attached = False
+
+
+def _attach_file_logger() -> None:
+    """Attach a rotating file handler to the beatport module logger.
+
+    Called on first BeatportMatcher instantiation.  All search queries,
+    candidate scores, match decisions, and track-level BPM matches are
+    written to ~/.discogstool/beatport.log at DEBUG level.
+
+    The log rotates at 2 MB and keeps two backups (≤ 6 MB total).
+    """
+    global _file_handler_attached
+    if _file_handler_attached:
+        return
+    _file_handler_attached = True
+
+    handler = logging.handlers.RotatingFileHandler(
+        _LOG_FILE,
+        maxBytes=2 * 1024 * 1024,  # 2 MB per file
+        backupCount=2,              # → .log  .log.1  .log.2  (max 6 MB)
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1071,6 +1107,7 @@ class BeatportMatcher:
             matchers = [CatnoMatcher(), TitleMatcher(), LLMMatcher()]
         self._matchers = matchers
         self._cache = cache or BeatportCache()
+        _attach_file_logger()
 
     def find_bpms(
         self,
@@ -1092,6 +1129,15 @@ class BeatportMatcher:
         An empty dict means no match was found or no BPMs are available.
         """
         discogs_id = str(discogs_release.getId())
+
+        log.debug(
+            "=== lookup r%s  %s — %s  [%s]  %s ===",
+            discogs_id,
+            discogs_release.getArtist(),
+            discogs_release.getTitle(),
+            discogs_release.getCatno(),
+            discogs_release.getYear(),
+        )
 
         # Check cached nomatch
         if not force and self._cache.is_known_nomatch(discogs_id):
