@@ -27,5 +27,12 @@
   "icons": {
     "48": "icons/icon-48.png",
     "96": "icons/icon-96.png"
+  },
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "discogs-label-printer@discogstool2",
+      "strict_min_version": "109.0"
+    }
   }
 }
