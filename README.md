@@ -367,13 +367,42 @@ To stop and remove:
 ./install_server.sh --unload
 ```
 
+To restart the server without reinstalling (e.g. after a code change):
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.discogstool.server
+```
+
+The `-k` flag kills any running instance first, so this doubles as a restart command.
+
 **3. Load the extension in Firefox**
 
 1. Navigate to `about:debugging`
 2. Click **This Firefox** → **Load Temporary Add-on**
 3. Select `firefox-ext/manifest.json`
 
-For a permanent installation, submit the extension as **unlisted** at `addons.mozilla.org` — Mozilla signs it for free and you install the resulting `.xpi`.
+**Temporary vs. permanent**: the `about:debugging` method is temporary — the extension disappears when Firefox restarts. For a permanent installation, sign it as **unlisted** on AMO using the provided script.
+
+**4. Permanent Installation (signed .xpi)**
+
+Requires npm (for `web-ext`). On the first run the script prompts for AMO API credentials and saves them to `~/.discogstool/amo_auth`; subsequent runs reuse them automatically.
+
+1. Create free AMO API credentials at:
+   `https://addons.mozilla.org/en-US/developers/addon/api/key/`
+
+2. Run the signing script:
+   ```bash
+   ./sign_extension.sh
+   ```
+   The script signs the extension, saves the `.xpi` to `web-ext-artifacts/`, and opens it in Firefox.
+
+3. Click **Add** when Firefox prompts.
+
+**Updating the extension after code changes**
+
+1. Bump `"version"` in `firefox-ext/manifest.json`
+2. Re-run `./sign_extension.sh`
+3. Click **Add** in Firefox — the updated version replaces the old one
 
 ### Usage
 
