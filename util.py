@@ -1,20 +1,25 @@
+from __future__ import annotations
+
 import os
 import csv
 
-datapath = os.path.expanduser(os.path.join("~",".discogstool"))
+datapath = os.path.expanduser(os.path.join("~", ".discogstool"))
 
 if not os.path.exists(datapath):
     os.mkdir(datapath)
 
-def userfile(fname):
+
+def userfile(fname: str) -> str:
     return os.path.join(datapath, fname)
 
-def file_extension(path):
+
+def file_extension(path: str) -> str:
     _, ext = os.path.splitext(path)
     return ext[1:].lower()
 
-def get_audio_files(basedir):
-    filelist = []
+
+def get_audio_files(basedir: str) -> list[str]:
+    filelist: list[str] = []
 
     for root, dirs, files in os.walk(basedir):
         for fname in files:
@@ -30,8 +35,24 @@ def get_audio_files(basedir):
 
     return filelist
 
+
 class CollectionInfo:
-    def __init__(self, releaseid, collection, date, mcond, scond, notes):
+    releaseid: int
+    collection: str
+    date: str
+    mcond: str
+    scond: str
+    notes: str
+
+    def __init__(
+        self,
+        releaseid: int,
+        collection: str,
+        date: str,
+        mcond: str,
+        scond: str,
+        notes: str,
+    ) -> None:
         self.releaseid = releaseid
         self.collection = collection
         self.date = date
@@ -42,12 +63,12 @@ class CollectionInfo:
 # CSV format:
 # catno, artist, title, label, format, rating, released, id, collection, date added
 # media condition, sleeve condition, notes
-def parse_collection_xml(path):
-    collection = []
+def parse_collection_xml(path: str) -> list[CollectionInfo]:
+    collection: list[CollectionInfo] = []
 
     with open(path, "r") as csvfile:
         reader = csv.reader(csvfile)
-        next(reader) # skip header row
+        next(reader)  # skip header row
         for line in reader:
             releaseid = int(line[7])
 
