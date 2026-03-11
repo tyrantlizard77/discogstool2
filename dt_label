@@ -317,6 +317,12 @@ def render_label(release, tracks_with_sides, profile,
         draw.text((M, y), title_str, font=f_title, fill="black")
         y += 70
 
+        # Disc indicator for --split labels (immediately below title)
+        if disc_info:
+            disc_num, total_discs = disc_info
+            draw.text((M, y), f"Disc {disc_num} of {total_discs}", font=f_meta, fill="#555555")
+            y += 40
+
         y += 10
         hl(y); y += 18
 
@@ -336,12 +342,6 @@ def render_label(release, tracks_with_sides, profile,
         draw.text((M, y), genre_str, font=f_meta, fill="black")
         draw.text((W - M - rid_w, y), rid_str, font=f_meta, fill="#777777")
         y += 46
-
-    # Disc indicator for --split labels
-    if disc_info:
-        disc_num, total_discs = disc_info
-        draw.text((M, y), f"Disc {disc_num} of {total_discs}", font=f_meta, fill="#555555")
-        y += 40
 
     y += 8
     hl(y); y += 18
