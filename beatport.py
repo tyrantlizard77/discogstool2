@@ -156,6 +156,17 @@ def _normalize_catno(catno: str) -> str:
     return re.sub(r"[\s\-]", "", (catno or "").upper())
 
 
+def _strip_discogs_artist(artist: str) -> str:
+    """Strip Discogs disambiguation suffixes before using artist in searches.
+
+    Discogs appends (2), (3), … to artist names when multiple artists share
+    the same name.  Beatport has no such convention, so searching for
+    "Artist (2)" would yield no results.  Handles multiple artists in one
+    string, e.g. "Artist A (2) & Artist B (3)" → "Artist A & Artist B".
+    """
+    return re.sub(r"\s*\(\d+\)", "", artist).strip()
+
+
 def _similarity(a: str, b: str) -> float:
     """Return SequenceMatcher ratio between two strings."""
     return SequenceMatcher(None, a, b).ratio()
@@ -616,7 +627,7 @@ class CatnoMatcher(ReleaseMatcher):
         client: _BeatportClient,
     ) -> tuple[str | None, float]:
         catno = discogs_release.getCatno() or ""
-        artist = discogs_release.getArtist() or ""
+        artist = _strip_discogs_artist(discogs_release.getArtist() or "")
         title = discogs_release.getTitle() or ""
         year = discogs_release.getYear()
 
@@ -714,7 +725,7 @@ class TitleMatcher(ReleaseMatcher):
         client: _BeatportClient,
     ) -> tuple[str | None, float]:
         title  = discogs_release.getTitle()  or ""
-        artist = discogs_release.getArtist() or ""
+        artist = _strip_discogs_artist(discogs_release.getArtist() or "")
         catno  = discogs_release.getCatno()  or ""
         year   = discogs_release.getYear()
 
@@ -976,18 +987,18 @@ def _fetch_full_release(
 def _match_tracks(
     discogs_release: "DiscogsRelease",
     beatport_tracks: list[dict],
-) -> dict[int, int]:
+) -> dict[int, dict]:
     """Fuzzy-match Discogs tracks to Beatport tracks by title.
 
-    Returns a dict: {discogs_track_index (0-based): bpm (int)}.
-    Only includes pairs where the similarity exceeds TRACK_MIN_SCORE
-    and the Beatport track has a BPM.
+    Returns a dict: {discogs_track_index (0-based): {"bpm": int|None, "duration_ms": int|None}}.
+    Includes an entry whenever title similarity >= TRACK_MIN_SCORE and at least
+    one of bpm or duration_ms is available.
 
     Digital releases on Beatport may have different track orders and
     exclusive tracks compared to the vinyl release on Discogs.
     We match by title similarity rather than position.
     """
-    result: dict[int, int] = {}
+    result: dict[int, dict] = {}
 
     # Build normalized Beatport track list once
     bp_normalized = []
@@ -1001,8 +1012,9 @@ def _match_tracks(
             combined = f"{name} ({mix})"
         else:
             combined = name
-        bpm = bt.get("bpm")
-        bp_normalized.append((_normalize_title(combined), bpm))
+        bpm       = bt.get("bpm")
+        length_ms = bt.get("length_ms")
+        bp_normalized.append((_normalize_title(combined), bpm, length_ms))
 
     # Collect Discogs tracks
     discogs_tracks = []
@@ -1016,8 +1028,8 @@ def _match_tracks(
             break
 
     # title_matched counts ALL discogs tracks whose title matched a Beatport track
-    # (regardless of whether BPM was available).  This is what we use for the
-    # coverage gate — we want to detect a wrong release, not punish releases
+    # (regardless of whether BPM/duration was available).  This is what we use for
+    # the coverage gate — we want to detect a wrong release, not punish releases
     # where Beatport simply hasn't filled in BPM values.
     title_matched_count = 0
 
@@ -1026,29 +1038,35 @@ def _match_tracks(
         if not dt_title:
             continue
 
-        best_score = 0.0
-        best_bpm: int | None = None
+        best_score:     float    = 0.0
+        best_bpm:       int | None = None
+        best_length_ms: int | None = None
 
-        for bp_title, bp_bpm in bp_normalized:
+        for bp_title, bp_bpm, bp_length_ms in bp_normalized:
             score = _similarity(dt_title, bp_title)
             if score > best_score:
-                best_score = score
-                best_bpm = bp_bpm
+                best_score     = score
+                best_bpm       = bp_bpm
+                best_length_ms = bp_length_ms
 
         if best_score >= TRACK_MIN_SCORE:
             title_matched_count += 1
-            if best_bpm is not None:
-                result[idx] = int(best_bpm)
+            if best_bpm is not None or best_length_ms is not None:
+                result[idx] = {
+                    "bpm":         int(best_bpm) if best_bpm is not None else None,
+                    "duration_ms": int(best_length_ms) if best_length_ms is not None else None,
+                }
                 log.debug(
-                    "Track match: [%d] %r → bpm=%d (score=%.2f)",
+                    "Track match: [%d] %r → bpm=%s dur_ms=%s (score=%.2f)",
                     idx,
                     dt.getTitle(),
-                    int(best_bpm),
+                    result[idx]["bpm"],
+                    result[idx]["duration_ms"],
                     best_score,
                 )
             else:
                 log.debug(
-                    "Track match: [%d] %r → no BPM on Beatport (score=%.2f)",
+                    "Track match: [%d] %r → no BPM/duration on Beatport (score=%.2f)",
                     idx,
                     dt.getTitle(),
                     best_score,
@@ -1113,8 +1131,8 @@ class BeatportMatcher:
         self,
         discogs_release: "DiscogsRelease",
         force: bool = False,
-    ) -> dict[int, int]:
-        """Find BPMs for all tracks in a Discogs release.
+    ) -> dict[int, dict]:
+        """Find BPMs and durations for all tracks in a Discogs release.
 
         Parameters
         ----------
@@ -1125,8 +1143,9 @@ class BeatportMatcher:
 
         Returns
         -------
-        dict mapping 0-based Discogs track index → BPM (int).
-        An empty dict means no match was found or no BPMs are available.
+        dict mapping 0-based Discogs track index →
+            {"bpm": int|None, "duration_ms": int|None}.
+        An empty dict means no match was found or no data is available.
         """
         discogs_id = str(discogs_release.getId())
 
@@ -1211,7 +1230,7 @@ class BeatportMatcher:
         discogs_release: "DiscogsRelease",
         beatport_id: str,
         client: _BeatportClient | None = None,
-    ) -> dict[int, int]:
+    ) -> dict[int, dict]:
         """Fetch Beatport tracks and fuzzy-match to Discogs tracks."""
         if client is None:
             try:
@@ -1331,15 +1350,17 @@ if __name__ == "__main__":
         matcher = BeatportMatcher()
         bpms = matcher.find_bpms(dr, force=args.force)
         if bpms:
-            print(f"\nBPMs for Discogs release {args.release}:")
+            print(f"\nBeatport data for Discogs release {args.release}:")
             for i in range(200):
                 try:
                     t = dr.getTrack(i)
                     if t is None:
                         break
-                    bpm = bpms.get(i)
-                    bpm_str = str(bpm) if bpm else "-"
-                    print(f"  [{i:3d}] {t.getPosition():4s} {t.getTitle():<50s} {bpm_str}")
+                    info    = bpms.get(i) or {}
+                    bpm_str = str(info["bpm"]) if info.get("bpm") else "-"
+                    ms      = info.get("duration_ms")
+                    dur_str = f"{ms//1000//60}:{ms//1000%60:02d}" if ms else "-"
+                    print(f"  [{i:3d}] {t.getPosition():4s} {t.getTitle():<50s}  bpm={bpm_str}  dur={dur_str}")
                 except (IndexError, AttributeError):
                     break
         else:

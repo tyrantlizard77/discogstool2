@@ -1,6 +1,6 @@
 const RELEASE_RE = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
 const DEFAULT_PORT = 5679;
-const STORAGE_KEYS = ["port", "profile", "split"];
+const STORAGE_KEYS = ["port", "profile", "split", "preview"];
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const releaseIdEl  = document.getElementById("release-id");
@@ -17,9 +17,10 @@ let releaseId = null;
 
 // ── Restore saved settings ────────────────────────────────────────────────────
 browser.storage.local.get(STORAGE_KEYS).then(saved => {
-  if (saved.port)    portEl.value    = saved.port;
-  if (saved.profile) profileEl.value = saved.profile;
-  if (saved.split)   splitEl.checked = saved.split;
+  if (saved.port)    portEl.value      = saved.port;
+  if (saved.profile) profileEl.value   = saved.profile;
+  if (saved.split)   splitEl.checked   = saved.split;
+  if (saved.preview) previewEl.checked = saved.preview;
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
 });
 
@@ -34,6 +35,9 @@ splitEl.addEventListener("change", () => {
   browser.storage.local.set({ split: splitEl.checked });
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
   if (!splitEl.checked) discsEl.value = "";
+});
+previewEl.addEventListener("change", () => {
+  browser.storage.local.set({ preview: previewEl.checked });
 });
 
 // ── Detect release ID from active tab ─────────────────────────────────────────

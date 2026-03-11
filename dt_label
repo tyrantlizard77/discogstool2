@@ -373,16 +373,24 @@ def render_label(release, tracks_with_sides, profile,
         else:
             track_str = track.getTitle()
 
-        # Duration suffix — reserve space before truncating the title
+        # Duration suffix — reserve space before truncating the title.
+        # Prefer Discogs duration; fall back to Beatport length_ms if absent.
         dur = track.getDuration()
+        if not dur:
+            _ti = bpms.get(track_idx) or {}
+            _ms = _ti.get("duration_ms")
+            if _ms:
+                _s  = _ms // 1000
+                dur = f"{_s // 60}:{_s % 60:02d}"
         dur_suffix = f" ({dur})" if dur else ""
         dur_w = draw.textlength(dur_suffix, font=f_track) if dur_suffix else 0
         track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W - dur_w)
         draw.text((M + POS_W, y), track_str + dur_suffix, font=f_track, fill="black")
 
         # BPM zone: print value if known, otherwise leave a blank write zone
-        bpm_line_y = y + _TRACK_ROW_H - 18
-        known_bpm = bpms.get(track_idx)
+        bpm_line_y  = y + _TRACK_ROW_H - 18
+        _track_info = bpms.get(track_idx) or {}
+        known_bpm   = _track_info.get("bpm")
         if known_bpm:
             bpm_str = str(known_bpm)
             bpm_w = draw.textlength(bpm_str, font=f_bpm)
@@ -640,7 +648,7 @@ def _lookup_bpms(release, no_bpm=False):
         matcher = beatport.BeatportMatcher()
         bpms = matcher.find_bpms(release)
         if bpms:
-            print(f"  Beatport: found BPMs for {len(bpms)} track(s)")
+            print(f"  Beatport: matched {len(bpms)} track(s) (BPM/duration)")
         else:
             print("  Beatport: no BPMs found")
         return bpms
