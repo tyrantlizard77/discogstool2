@@ -44,13 +44,17 @@ _SIDE_HDR_H   = 44   # px for a side header row
 _LINE_SPACING = 55   # px between note ruling lines
 
 # Header heights measured by tracing render_label y increments:
-#   normal:       artist(70)+title(58)+gap+div(28)+label(46)+genre(46)+gap+div(26) = 274
+#   normal:       artist(70)+title(70)+gap+div(28)+label(46)+genre(46)+gap+div(26) = 286
 #   continuation: compact-hdr(46)+gap+div(26)                                      =  72
 #   +disc_info:   +40 in either case
-_HDR_H = {"normal": 274, "continuation": 72, "disc_extra": 40}
+_HDR_H = {"normal": 286, "continuation": 72, "disc_extra": 40}
 
 # Maximum label height for continuous stock — must fit on a 12" record sleeve.
 MAX_CONTINUOUS_PX = 12 * 300   # 3600 px at 300 DPI
+
+# Height at which a continuous label is considered full and a continuation
+# label should be started.  Slightly under the physical sleeve limit.
+MAX_LABEL_HEIGHT_PX = int(11.5 * 300)  # 3450 px
 
 
 LABEL_PROFILES = {
@@ -277,7 +281,7 @@ def render_label(release, tracks_with_sides, profile,
 
     # Fonts (sizes in points; 1pt ≈ 4.17px at 300 DPI)
     f_artist    = make_font("bold",      54)   # ~225px cap height
-    f_title     = make_font("regular",   42)
+    f_title     = make_font("regular",   54)
     f_meta      = make_font("regular",   32)
     f_side_hdr  = make_font("bold",      28)
     f_pos       = make_font("bold",      38)
@@ -311,7 +315,7 @@ def render_label(release, tracks_with_sides, profile,
         # Release title
         title_str = truncate_text(draw, release.getTitle(), f_title, CW)
         draw.text((M, y), title_str, font=f_title, fill="black")
-        y += 58
+        y += 70
 
         y += 10
         hl(y); y += 18
@@ -415,6 +419,51 @@ def render_label(release, tracks_with_sides, profile,
     return img
 
 
+def _chunk_continuous(all_tracks, profile):
+    """Pack tracks greedily onto continuous labels up to MAX_LABEL_HEIGHT_PX.
+
+    Returns a list of track-chunks.  The first chunk uses the normal (tall)
+    header; subsequent chunks use the compact continuation header — so their
+    heights are calculated accordingly.
+    """
+    chunks    = []
+    remaining = list(all_tracks)
+
+    while remaining:
+        continuation = bool(chunks)
+
+        # Check whether all remaining tracks fit on this label.
+        try:
+            h = _continuous_height(remaining, profile, continuation=continuation)
+            fits_all = h <= MAX_LABEL_HEIGHT_PX
+        except ValueError:
+            fits_all = False   # exceeds 12" hard limit
+
+        if fits_all:
+            chunks.append(remaining)
+            break
+
+        # Binary search for the largest prefix that fits.
+        lo, hi = 1, len(remaining) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            try:
+                h = _continuous_height(remaining[:mid], profile,
+                                       continuation=continuation)
+                if h <= MAX_LABEL_HEIGHT_PX:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            except ValueError:
+                hi = mid - 1
+
+        take = max(lo, 1)   # always advance by at least one track
+        chunks.append(remaining[:take])
+        remaining = remaining[take:]
+
+    return chunks
+
+
 def _render_kwargs(tracks, profile, continuation=False, disc_info=None):
     """Return extra kwargs for render_label based on feed type."""
     if profile.get("feed") == "continuous":
@@ -452,10 +501,15 @@ def render_labels_for_release(release, args, profile, bpms=None):
             labels.append((f"disc{disc_num}", img))
 
     else:
-        # Chunk all tracks into primary + continuation labels
+        # Chunk all tracks into primary + continuation labels.
+        # Continuous labels: pack by height up to 11.5".
+        # Die-cut labels: pack by max_tracks (fixed canvas size).
         all_tracks = flatten_discs(discs)
-        chunks = [all_tracks[i:i + max_tracks]
-                  for i in range(0, len(all_tracks), max_tracks)]
+        if profile.get("feed") == "continuous":
+            chunks = _chunk_continuous(all_tracks, profile)
+        else:
+            chunks = [all_tracks[i:i + max_tracks]
+                      for i in range(0, len(all_tracks), max_tracks)]
         for idx, chunk in enumerate(chunks):
             suffix = "label" if idx == 0 else f"cont{idx}"
             kw = _render_kwargs(chunk, profile, continuation=(idx > 0))
