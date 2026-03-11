@@ -12,12 +12,17 @@ Options:
     --model MODEL           Printer model (default: QL-1110NWB, saved)
     --label-profile NAME    Label size profile name (default: dk1247, saved)
     --list-profiles         List available label size profiles and exit
+    --no-bpm                Skip Beatport BPM lookup (faster, blank write zones)
+    --discs N [N …]        With --split: only print these disc numbers (e.g. --discs 3)
+    --delay SECS            Seconds to wait between labels when printing multiple (default: 2)
 """
 
 import sys
 import os
 import re
+import time
 import argparse
+import logging
 
 # Allow importing sibling modules from this project directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import util
 import client_interface
 from PIL import Image, ImageDraw, ImageFont
+
+log = logging.getLogger(__name__)
 
 
 # ── Label size profiles ───────────────────────────────────────────────────────
@@ -166,23 +173,27 @@ def side_to_disc(side):
 
 
 def group_tracks_by_disc(release):
-    """Return {disc_num: {side_letter: [DiscogsTrack, …]}} preserving order."""
+    """Return {disc_num: {side_letter: [(global_idx, DiscogsTrack), …]}} preserving order.
+
+    global_idx is the 0-based index into release.getTrack(i), which matches
+    the keys returned by BeatportMatcher.find_bpms().
+    """
     discs = {}
     for i in range(release.getTotalTracks()):
         track = release.getTrack(i)
         side  = get_side(track["position"])
         disc  = side_to_disc(side) if side else 1
-        discs.setdefault(disc, {}).setdefault(side, []).append(track)
+        discs.setdefault(disc, {}).setdefault(side, []).append((i, track))
     return discs
 
 
 def flatten_discs(discs):
-    """Flatten disc/side groups into [(side_letter, DiscogsTrack), …] in order."""
+    """Flatten disc/side groups into [(side_letter, global_idx, DiscogsTrack), …] in order."""
     result = []
     for disc_num in sorted(discs):
         for side in sorted(discs[disc_num]):
-            for track in discs[disc_num][side]:
-                result.append((side, track))
+            for idx, track in discs[disc_num][side]:
+                result.append((side, idx, track))
     return result
 
 
@@ -221,7 +232,8 @@ def _continuous_height(tracks_with_sides, profile, continuation=False,
         header_h += _HDR_H["disc_extra"]
 
     sides_seen = []
-    for side, _ in tracks_with_sides:
+    for entry in tracks_with_sides:
+        side = entry[0]
         if not sides_seen or sides_seen[-1] != side:
             sides_seen.append(side)
     tracks_h = len(sides_seen) * _SIDE_HDR_H + len(tracks_with_sides) * _TRACK_ROW_H
@@ -240,18 +252,20 @@ def _continuous_height(tracks_with_sides, profile, continuation=False,
 
 def render_label(release, tracks_with_sides, profile,
                  is_compilation, continuation=False, disc_info=None,
-                 height_px=None, notes_lines=None):
+                 height_px=None, notes_lines=None, bpms=None):
     """Render and return a single PIL Image for one label.
 
     Args:
         release:           DiscogsRelease instance
-        tracks_with_sides: [(side_letter, DiscogsTrack), …]
+        tracks_with_sides: [(side_letter, global_idx, DiscogsTrack), …]
         profile:           label size profile dict
         is_compilation:    show per-track artists when True
         continuation:      compact header for overflow continuation labels
         disc_info:         (disc_num, total_discs) for --split mode, else None
         height_px:         override canvas height (continuous labels only)
         notes_lines:       fixed note line count; None = fill remaining space
+        bpms:              {global_track_idx: bpm_int} from BeatportMatcher,
+                           or None/empty to show blank write zones for all tracks
     """
     W  = profile["width_px"]
     H  = height_px if height_px is not None else profile["height_px"]
@@ -331,8 +345,11 @@ def render_label(release, tracks_with_sides, profile,
     # ── Track listing ─────────────────────────────────────────────────────────
 
     current_side = object()   # sentinel — guaranteed != any real side string
+    bpms = bpms or {}
 
-    for side, track in tracks_with_sides:
+    f_bpm = make_font("bold", 34)   # slightly smaller than track font for BPM values
+
+    for side, track_idx, track in tracks_with_sides:
 
         # Side header when the side changes
         if side != current_side:
@@ -359,9 +376,20 @@ def render_label(release, tracks_with_sides, profile,
         track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W - dur_w)
         draw.text((M + POS_W, y), track_str + dur_suffix, font=f_track, fill="black")
 
-        # BPM write zone underline in the right margin
+        # BPM zone: print value if known, otherwise leave a blank write zone
         bpm_line_y = y + _TRACK_ROW_H - 18
-        hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#888888", weight=3)
+        known_bpm = bpms.get(track_idx)
+        if known_bpm:
+            bpm_str = str(known_bpm)
+            bpm_w = draw.textlength(bpm_str, font=f_bpm)
+            bpm_x = W - M - (BPM_ZONE_W + bpm_w) // 2  # centre in zone
+            # Baseline-align with the underline position
+            bpm_y = bpm_line_y - 36   # text sits just above the line
+            draw.text((bpm_x, bpm_y), bpm_str, font=f_bpm, fill="#333333")
+            # Faint underline to show the write zone even with a printed value
+            hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#BBBBBB", weight=1)
+        else:
+            hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#888888", weight=3)
 
         y += _TRACK_ROW_H
 
@@ -396,25 +424,31 @@ def _render_kwargs(tracks, profile, continuation=False, disc_info=None):
     return {}
 
 
-def render_labels_for_release(release, args, profile):
-    """Return [(filename_suffix, PIL.Image), …] for all labels to produce."""
+def render_labels_for_release(release, args, profile, bpms=None):
+    """Return [(filename_suffix, PIL.Image), …] for all labels to produce.
+
+    Args:
+        bpms: {global_track_idx: bpm_int} from BeatportMatcher, or None.
+    """
     is_compilation = release.isCompilation()
     discs          = group_tracks_by_disc(release)
     max_tracks     = profile["max_tracks"]
     labels         = []
+    bpms           = bpms or {}
 
     if args.split:
         total_discs = len(discs)
         for disc_num in sorted(discs):
             disc_tracks = []
             for side in sorted(discs[disc_num]):
-                for track in discs[disc_num][side]:
-                    disc_tracks.append((side, track))
+                for idx, track in discs[disc_num][side]:
+                    disc_tracks.append((side, idx, track))
             kw = _render_kwargs(disc_tracks, profile,
                                 disc_info=(disc_num, total_discs))
             img = render_label(release, disc_tracks, profile,
                                is_compilation,
-                               disc_info=(disc_num, total_discs), **kw)
+                               disc_info=(disc_num, total_discs),
+                               bpms=bpms, **kw)
             labels.append((f"disc{disc_num}", img))
 
     else:
@@ -426,7 +460,8 @@ def render_labels_for_release(release, args, profile):
             suffix = "label" if idx == 0 else f"cont{idx}"
             kw = _render_kwargs(chunk, profile, continuation=(idx > 0))
             img = render_label(release, chunk, profile,
-                               is_compilation, continuation=(idx > 0), **kw)
+                               is_compilation, continuation=(idx > 0),
+                               bpms=bpms, **kw)
             labels.append((suffix, img))
 
     return labels
@@ -434,8 +469,12 @@ def render_labels_for_release(release, args, profile):
 
 # ── Printing ──────────────────────────────────────────────────────────────────
 
-def print_label(img, printer_url, model, profile):
-    """Send a rendered label image to the Brother printer over TCP/WiFi."""
+def print_label(img, printer_url, model, profile, retries=3, retry_delay=5):
+    """Send a rendered label image to the Brother printer over TCP/WiFi.
+
+    Retries up to `retries` times on network errors, waiting `retry_delay`
+    seconds between attempts.  Raises RuntimeError on final failure.
+    """
     from brother_ql.conversion import convert
     from brother_ql.backends.helpers import send
     from brother_ql.raster import BrotherQLRaster
@@ -453,12 +492,27 @@ def print_label(img, printer_url, model, profile):
         dpi_600=False,
         cut=True,
     )
-    send(
-        instructions=instructions,
-        printer_identifier=printer_url,
-        backend_identifier="network",
-        blocking=True,
-    )
+
+    for attempt in range(1, retries + 1):
+        try:
+            send(
+                instructions=instructions,
+                printer_identifier=printer_url,
+                backend_identifier="network",
+                blocking=True,
+            )
+            return
+        except (TimeoutError, OSError) as e:
+            if attempt < retries:
+                print(f"\n  Network error ({e}); retrying in {retry_delay}s "
+                      f"(attempt {attempt}/{retries})…", flush=True)
+                time.sleep(retry_delay)
+            else:
+                raise RuntimeError(
+                    f"Printer unreachable after {retries} attempts: {e}\n"
+                    "  Check that the printer is on, not in an error state "
+                    "(solid green LED), and reachable on the network."
+                ) from e
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -513,6 +567,38 @@ def read_id_file(path):
     return ids
 
 
+def _lookup_bpms(release, no_bpm=False):
+    """Try Beatport BPM lookup.  Returns {} on any failure or if disabled.
+
+    Failures are non-fatal: the label is printed without BPM data instead.
+    Import errors are handled separately so a missing beatport.py or absent
+    'requests' package doesn't produce a confusing traceback.
+    """
+    if no_bpm:
+        return {}
+
+    try:
+        import beatport
+    except ImportError as e:
+        log.debug("beatport module not importable: %s", e)
+        return {}
+
+    try:
+        matcher = beatport.BeatportMatcher()
+        bpms = matcher.find_bpms(release)
+        if bpms:
+            print(f"  Beatport: found BPMs for {len(bpms)} track(s)")
+        else:
+            print("  Beatport: no BPMs found")
+        return bpms
+    except beatport.BeatportError as e:
+        print(f"  Beatport: skipping BPM lookup — {e}", file=sys.stderr)
+        return {}
+    except Exception as e:
+        print(f"  Beatport: unexpected error — {e}", file=sys.stderr)
+        return {}
+
+
 def process_release(rid, args, profile, printer_url, model):
     """Fetch, render, and output labels for one release ID.
 
@@ -526,22 +612,41 @@ def process_release(rid, args, profile, printer_url, model):
         return False
     print(f"  {release}")
 
+    bpms = _lookup_bpms(release, no_bpm=getattr(args, "no_bpm", False))
+
     try:
-        labels = render_labels_for_release(release, args, profile)
+        labels = render_labels_for_release(release, args, profile, bpms=bpms)
     except ValueError as e:
         print(f"  Error rendering release {rid}: {e}", file=sys.stderr)
         return False
+    if args.split and getattr(args, "discs", None):
+        want = {f"disc{d}" for d in args.discs}
+        all_suffixes = [s for s, _ in labels]
+        labels = [(s, img) for s, img in labels if s in want]
+        if not labels:
+            print(f"  No labels match --discs {args.discs}; "
+                  f"available: {all_suffixes}", file=sys.stderr)
+            return False
+
     print(f"  {len(labels)} label(s) to produce")
 
-    for suffix, img in labels:
+    inter_label_delay = getattr(args, "delay", 2)
+
+    for i, (suffix, img) in enumerate(labels):
         if args.preview:
             os.makedirs(args.output, exist_ok=True)
             fname = os.path.join(args.output, f"{rid}_{suffix}.png")
             img.save(fname, dpi=(300, 300))
             print(f"  Saved: {fname}")
         else:
+            if i > 0 and inter_label_delay > 0:
+                time.sleep(inter_label_delay)
             print(f"  Printing {suffix}\u2026", end=" ", flush=True)
-            print_label(img, printer_url, model, profile)
+            try:
+                print_label(img, printer_url, model, profile)
+            except RuntimeError as e:
+                print(f"\n  {e}", file=sys.stderr)
+                return False
             print("done.")
     return True
 
@@ -570,6 +675,12 @@ def main():
                         help=f"Label size profile (default: {DEFAULT_PROFILE}, saved)")
     parser.add_argument("--list-profiles", action="store_true",
                         help="List available label profiles and exit")
+    parser.add_argument("--no-bpm", action="store_true",
+                        help="Skip Beatport BPM lookup (faster, blank write zones only)")
+    parser.add_argument("--discs", metavar="N", type=int, nargs="+",
+                        help="With --split: only print these disc numbers (e.g. --discs 3)")
+    parser.add_argument("--delay", metavar="SECS", type=float, default=2.0,
+                        help="Seconds to wait between labels when printing multiple (default: 2)")
     args = parser.parse_args()
 
     if args.list_profiles:
