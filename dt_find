@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""dt_find — voice/text vinyl record finder powered by a local LLM.
+
+Describe a record in plain English — vague, informal, partial — and the LLM
+searches Discogs on your behalf, opens the release page for confirmation,
+then optionally prints a sleeve label.
+
+Usage
+-----
+    ./dt_find                            # voice input (default)
+    ./dt_find --text                     # force typed description
+    ./dt_find "the blue Miles Davis one" # description inline
+
+Saved settings  (~/.discogstool/find_config)
+--------------------------------------------
+    llm_url=http://wintermute.local:8000/v1
+    llm_model=mlx-community/Qwen3.5-122B-A10B-4bit
+
+Voice dependencies (installed separately, see requirements.txt):
+    pip install sounddevice SpeechRecognition
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import webbrowser
+
+# Allow importing sibling modules
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import util
+import client_interface
+
+log = logging.getLogger(__name__)
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+CONFIG_FILE = "find_config"
+DEFAULT_LLM_URL   = "http://wintermute.local:8000/v1"
+DEFAULT_LLM_MODEL = "mlx-community/Qwen3.5-122B-A10B-4bit"
+
+# Max LLM tool-calling rounds before giving up
+MAX_SEARCH_TURNS = 8
+
+# How many Discogs search results to return to the LLM per query
+RESULTS_PER_SEARCH = 8
+
+
+def load_config() -> dict:
+    path = util.userfile(CONFIG_FILE)
+    config: dict = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    config[k.strip()] = v.strip()
+    return config
+
+
+def save_config(config: dict) -> None:
+    path = util.userfile(CONFIG_FILE)
+    with open(path, "w") as f:
+        f.write("# dt_find configuration — auto-updated\n")
+        for k, v in config.items():
+            f.write(f"{k}={v}\n")
+
+
+# ── Voice input ────────────────────────────────────────────────────────────────
+
+def record_until_enter(sample_rate: int = 16000) -> "numpy.ndarray | None":
+    """Record from the default mic until the user presses Enter.
+
+    Returns a 1-D int16 numpy array, or None on failure.
+    Requires: sounddevice, numpy.
+    """
+    try:
+        import sounddevice as sd
+        import numpy as np
+    except ImportError as e:
+        raise SystemExit(
+            f"Voice input requires: pip install sounddevice\nMissing: {e}"
+        )
+
+    import numpy as np  # ensure it's available in scope below
+    chunks: list = []
+
+    def _cb(indata, frames, time, status):  # noqa: ARG001
+        chunks.append(indata.copy())
+
+    print("  🎤  Listening… press Enter when done speaking.")
+    with sd.InputStream(samplerate=sample_rate, channels=1, dtype="int16",
+                        callback=_cb):
+        input()  # block until Enter
+
+    if not chunks:
+        return None
+    return np.concatenate(chunks).flatten()
+
+
+def transcribe_audio(audio_array: "numpy.ndarray", sample_rate: int = 16000) -> str | None:
+    """Transcribe a numpy int16 audio array using macOS on-device speech recognition.
+
+    Requires: SpeechRecognition.
+    """
+    try:
+        import speech_recognition as sr
+    except ImportError as e:
+        raise SystemExit(
+            f"Transcription requires: pip install SpeechRecognition\nMissing: {e}"
+        )
+
+    r = sr.Recognizer()
+    audio_data = sr.AudioData(audio_array.tobytes(), sample_rate, 2)
+    print("  Transcribing…", end=" ", flush=True)
+    try:
+        text = r.recognize_apple(audio_data)
+        print(f"\u201c{text}\u201d")
+        return text
+    except sr.UnknownValueError:
+        print("(could not understand audio)")
+        return None
+    except sr.RequestError as e:
+        print(f"(recognition error: {e})")
+        return None
+
+
+def get_description_voice() -> str | None:
+    """Capture a spoken description from the microphone."""
+    audio = record_until_enter()
+    if audio is None or len(audio) == 0:
+        print("No audio recorded.", file=sys.stderr)
+        return None
+    return transcribe_audio(audio)
+
+
+def get_description_text(prompt: str = "Describe the record: ") -> str | None:
+    try:
+        text = input(prompt).strip()
+        return text or None
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+# ── LLM tool definitions ───────────────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_discogs",
+            "description": (
+                "Search the Discogs database for vinyl releases. "
+                "You may call this multiple times with different parameters. "
+                "Returns up to 8 matching releases with id, artist, title, "
+                "label, catno, year, format, and country."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "q": {
+                        "type": "string",
+                        "description": "Free-text query (e.g. 'Miles Davis Kind of Blue')",
+                    },
+                    "artist": {"type": "string", "description": "Artist name"},
+                    "title": {"type": "string", "description": "Release/album title"},
+                    "label": {"type": "string", "description": "Record label name"},
+                    "year": {"type": "string", "description": "Release year"},
+                    "catno": {"type": "string", "description": "Catalog number"},
+                    "format": {
+                        "type": "string",
+                        "description": "Format filter, e.g. 'Vinyl' or 'LP'",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "select_release",
+            "description": (
+                "Call this when you have identified the correct Discogs release. "
+                "Only call it when you are genuinely confident — false positives "
+                "waste label stock. If you cannot find a confident match after "
+                "several searches, say so in text instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "release_id": {
+                        "type": "integer",
+                        "description": "The numeric Discogs release ID",
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Brief explanation of why this is the right release",
+                    },
+                },
+                "required": ["release_id", "reasoning"],
+            },
+        },
+    },
+]
+
+
+# ── System prompt ──────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+You are a vinyl record identification assistant integrated into a home music system.
+
+The user will describe a record from their collection — possibly vaguely, using
+informal names, cover art descriptions, or partial information. Your job is to
+identify the specific Discogs release they mean, then call select_release with its ID.
+
+Use the search_discogs tool to search. Call it as many times as needed.
+
+Guidelines
+----------
+* Draw on your musical knowledge to interpret descriptions:
+  - "the blue one" by Miles Davis = "Kind of Blue" (Columbia, 1959)
+  - colour descriptions often refer to iconic cover art
+  - "the one with the triangle" = Pink Floyd "Dark Side of the Moon"
+* Discogs has thousands of pressings of each album. Search broadly first
+  (artist + album title), examine the results, then narrow to the likely
+  pressing by label, year, or catalog number if the user mentioned any details.
+* Try several query formulations if the first doesn't work.
+* The user owns a physical vinyl record, so prefer results with format=Vinyl or LP.
+* Only call select_release when you are confident — if multiple pressings match
+  and you cannot distinguish, pick the most common/canonical one and say so.
+* If you genuinely cannot find a match after several searches, respond in plain
+  text explaining what you tried and asking the user for more detail.
+* Do NOT speculate a release_id — only use IDs that appeared in search results.
+"""
+
+
+# ── Discogs search tool implementation ────────────────────────────────────────
+
+def _tool_search_discogs(
+    q: str | None = None,
+    artist: str | None = None,
+    title: str | None = None,
+    label: str | None = None,
+    year: str | None = None,
+    catno: str | None = None,
+    format: str | None = None,
+) -> dict:
+    """Execute a Discogs search and return a JSON-serialisable result dict."""
+    dc = client_interface.get_client_instance()
+
+    kwargs: dict = {"type": "release"}
+    if q:       kwargs["q"]            = q
+    if artist:  kwargs["artist"]       = artist
+    if title:   kwargs["release_title"] = title   # Discogs API field name
+    if label:   kwargs["label"]        = label
+    if year:    kwargs["year"]         = str(year)
+    if catno:   kwargs["catno"]        = catno
+    if format:  kwargs["format"]       = format
+
+    try:
+        results = dc.search(**kwargs)
+        results.per_page = RESULTS_PER_SEARCH
+        page = results.page(1)
+    except Exception as e:
+        log.warning("Discogs search error: %s", e)
+        return {"error": str(e), "results": [], "count": 0}
+
+    formatted = []
+    for item in list(page)[:RESULTS_PER_SEARCH]:
+        d = getattr(item, "data", {}) or {}
+        # Discogs returns "Artist - Title" in the title field for releases
+        raw_title = d.get("title", "")
+        if " - " in raw_title:
+            item_artist, item_title = raw_title.split(" - ", 1)
+        else:
+            item_artist, item_title = "", raw_title
+
+        uri = d.get("uri", "")
+        formatted.append({
+            "id":      d.get("id"),
+            "artist":  item_artist.strip(),
+            "title":   item_title.strip(),
+            "label":   d.get("label", []),
+            "catno":   d.get("catno", ""),
+            "year":    d.get("year", ""),
+            "country": d.get("country", ""),
+            "format":  d.get("format", []),
+            "url":     f"https://www.discogs.com{uri}" if uri else None,
+        })
+
+    return {
+        "count":   getattr(results, "count", len(formatted)),
+        "results": formatted,
+    }
+
+
+def _fmt_search_args(args: dict) -> str:
+    """One-line summary of search parameters for progress display."""
+    parts = []
+    for k in ("q", "artist", "title", "label", "year", "catno", "format"):
+        if args.get(k):
+            parts.append(f"{k}={args[k]!r}")
+    return ", ".join(parts) or "(no parameters)"
+
+
+# ── Strip thinking tags ────────────────────────────────────────────────────────
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_think(text: str) -> str:
+    return _THINK_RE.sub("", text).strip()
+
+
+def _extract_think(text: str) -> str | None:
+    m = _THINK_RE.search(text)
+    return m.group(0)[7:-8].strip() if m else None  # strip <think>…</think>
+
+
+# ── LLM agent loop ─────────────────────────────────────────────────────────────
+
+def run_agent(
+    description: str,
+    llm_url: str,
+    llm_model: str,
+    verbose: bool = False,
+) -> tuple[int | None, str]:
+    """Run the tool-calling LLM agent.
+
+    Returns (release_id, reasoning) where release_id is a Discogs release ID
+    or None if the agent could not identify the record.
+    """
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise SystemExit(
+            "The openai package is required: pip install openai"
+        )
+
+    client = OpenAI(base_url=llm_url, api_key="not-required")
+
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": description},
+    ]
+
+    for turn in range(MAX_SEARCH_TURNS):
+        try:
+            response = client.chat.completions.create(
+                model=llm_model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            print(f"\nLLM error: {e}", file=sys.stderr)
+            return None, ""
+
+        msg = response.choices[0].message
+        content = msg.content or ""
+        visible = _strip_think(content)
+
+        if verbose:
+            thinking = _extract_think(content)
+            if thinking:
+                # Show thinking in dim/italic ANSI if terminal supports it
+                print(f"\033[2m[thinking…]\033[0m", end=" ", flush=True)
+
+        # Build the assistant entry for message history.
+        # The openai SDK returns a ChatCompletionMessage; convert to plain dict
+        # so we can append custom fields without type issues.
+        asst_entry: dict = {"role": "assistant", "content": content}
+        if msg.tool_calls:
+            asst_entry["tool_calls"] = [
+                {
+                    "id":       tc.id,
+                    "type":     "function",
+                    "function": {
+                        "name":      tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+        messages.append(asst_entry)
+
+        # No tool calls → LLM gave a final text response
+        if not msg.tool_calls:
+            if visible:
+                print(f"\n{visible}")
+            return None, ""
+
+        # Execute each tool call
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+
+            if name == "select_release":
+                release_id = args.get("release_id")
+                reasoning  = args.get("reasoning", "")
+                # Acknowledge the tool call so the model can close gracefully
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.id,
+                    "content":      json.dumps({"status": "ok"}),
+                })
+                return int(release_id), reasoning
+
+            elif name == "search_discogs":
+                print(f"  🔍  Searching: {_fmt_search_args(args)}", flush=True)
+                result = _tool_search_discogs(**args)
+                n = len(result.get("results", []))
+                total = result.get("count", 0)
+                print(f"      → {n} result(s) returned  ({total} total on Discogs)")
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.id,
+                    "content":      json.dumps(result),
+                })
+
+            else:
+                # Unknown tool — return an error so the model can recover
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.id,
+                    "content":      json.dumps({"error": f"Unknown tool: {name}"}),
+                })
+
+    print("\nReached search limit without a confident match.", file=sys.stderr)
+    return None, ""
+
+
+# ── Result display + confirm ───────────────────────────────────────────────────
+
+def show_and_confirm(
+    release_id: int,
+    reasoning: str,
+    open_browser: bool = True,
+    no_print: bool = False,
+) -> bool:
+    """Fetch release info, display it, open the browser, and ask the user to confirm.
+
+    Returns True if the user wants to print the label.
+    """
+    print(f"\n{'─' * 60}")
+    print(f"  Discogs release r{release_id}")
+
+    # Fetch basic info to display (lightweight — uses cache if available)
+    try:
+        rel = client_interface.DiscogsRelease(release_id)
+        print(f"  {rel.getArtist()} — {rel.getTitle()}")
+        print(f"  {rel.getLabel()}  [{rel.getCatno()}]  {rel.getYear()}  {rel.getCountry()}")
+        print(f"  {rel.getGenre()}")
+    except Exception as e:
+        log.debug("Could not fetch release detail: %s", e)
+        print(f"  (could not fetch release details: {e})")
+
+    if reasoning:
+        print(f"\n  Why: {reasoning}")
+
+    discogs_url = f"https://www.discogs.com/release/{release_id}"
+    print(f"\n  {discogs_url}")
+    print(f"{'─' * 60}\n")
+
+    if open_browser:
+        try:
+            webbrowser.open(discogs_url)
+        except Exception as e:
+            log.debug("webbrowser.open failed: %s", e)
+
+    if no_print:
+        return False
+
+    try:
+        answer = input("Print label? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+
+    return answer in ("", "y", "yes")
+
+
+# ── Print via dt_label ─────────────────────────────────────────────────────────
+
+def print_label(release_id: int, no_bpm: bool = False, preview: bool = False) -> None:
+    """Invoke dt_label for the given Discogs release ID."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dt_label")
+    cmd = [sys.executable, script, str(release_id)]
+    if no_bpm:
+        cmd.append("--no-bpm")
+    if preview:
+        cmd.extend(["--preview", "--output", "."])
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"dt_label exited with error {e.returncode}", file=sys.stderr)
+    except FileNotFoundError:
+        print(f"Could not find dt_label at {script}", file=sys.stderr)
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Voice/text vinyl record finder powered by a local LLM.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "description", nargs="?", metavar="TEXT",
+        help="Record description as a command-line argument (skips input prompt)",
+    )
+    parser.add_argument(
+        "--text", "-t", action="store_true",
+        help="Force typed text input even if voice is available",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Show LLM thinking indicators and debug info",
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true",
+        help="Don't open the browser (still shows the URL)",
+    )
+    parser.add_argument(
+        "--no-print", action="store_true",
+        help="Don't offer to print a label (browser + confirm only)",
+    )
+    parser.add_argument(
+        "--no-bpm", action="store_true",
+        help="Skip Beatport BPM lookup when printing",
+    )
+    parser.add_argument(
+        "--preview", action="store_true",
+        help="Save label as PNG instead of printing",
+    )
+    parser.add_argument(
+        "--wintermute", metavar="URL",
+        help=f"LLM server base URL (default: {DEFAULT_LLM_URL}, saved)",
+    )
+    parser.add_argument(
+        "--model", metavar="MODEL",
+        help=f"LLM model name (default: {DEFAULT_LLM_MODEL}, saved)",
+    )
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+
+    # Load/update saved config
+    config  = load_config()
+    changed = False
+    if args.wintermute:
+        config["llm_url"]   = args.wintermute; changed = True
+    if args.model:
+        config["llm_model"] = args.model;      changed = True
+    if changed:
+        save_config(config)
+
+    llm_url   = config.get("llm_url",   DEFAULT_LLM_URL)
+    llm_model = config.get("llm_model", DEFAULT_LLM_MODEL)
+
+    # ── Get description ───────────────────────────────────────────────────────
+
+    description: str | None = args.description
+
+    if not description:
+        if args.text:
+            description = get_description_text()
+        else:
+            # Try voice; fall back to typed input if voice deps missing or fail
+            try:
+                description = get_description_voice()
+            except SystemExit as e:
+                # Voice deps not installed — fall back to text silently
+                print(f"(Voice unavailable: {e})\n", file=sys.stderr)
+                description = get_description_text()
+
+    if not description:
+        print("No description provided. Exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n  \u2192 Finding: \u201c{description}\u201d")
+    print(f"  \u2192 LLM: {llm_url}  model: {llm_model}\n")
+
+    # ── Run agent ─────────────────────────────────────────────────────────────
+
+    release_id, reasoning = run_agent(
+        description,
+        llm_url=llm_url,
+        llm_model=llm_model,
+        verbose=args.verbose,
+    )
+
+    if release_id is None:
+        print("\nCould not identify the record. Try being more specific.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # ── Confirm + print ───────────────────────────────────────────────────────
+
+    should_print = show_and_confirm(
+        release_id,
+        reasoning,
+        open_browser=not args.no_browser,
+        no_print=args.no_print,
+    )
+
+    if should_print:
+        print(f"\nPrinting label for r{release_id}…")
+        print_label(release_id, no_bpm=args.no_bpm, preview=args.preview)
+
+
+if __name__ == "__main__":
+    main()
