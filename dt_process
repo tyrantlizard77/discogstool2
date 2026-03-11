@@ -278,8 +278,9 @@ def split_wav_file(path, outdir, releaseid):
             regions = get_wav_regions(markers, rate, 6)
 
     if len(regions) != rel.getTotalTracks():
-        raise ConversionException("Unexpected region count %d in %s (%s)" %
-                (len(regions), rel, path))
+        raise ConversionException(
+            "Region count mismatch: WAV has %d regions, Discogs release has %d tracks in %s (%s)" %
+            (len(regions), rel.getTotalTracks(), rel, path))
 
     created = []
     pos_seen = []
