@@ -354,6 +354,9 @@ def render_label(release, tracks_with_sides, profile,
 
     f_bpm = make_font("bold", 34)   # slightly smaller than track font for BPM values
 
+    # Pre-compute track text height so we can bottom-align it with the BPM line
+    _track_text_h = f_track.getbbox("Ag")[3]
+
     for side, track_idx, track in tracks_with_sides:
 
         # Side header when the side changes
@@ -365,8 +368,12 @@ def render_label(release, tracks_with_sides, profile,
             hl(y, color="#AAAAAA", weight=1)
             y += 10
 
+        # Compute text_y so the bottom of track text aligns with the BPM write line
+        bpm_line_y = y + _TRACK_ROW_H - 18
+        text_y     = bpm_line_y - _track_text_h
+
         pos = track["position"]
-        draw.text((M, y), pos, font=f_pos, fill="black")
+        draw.text((M, text_y), pos, font=f_pos, fill="black")
 
         # Title: "Artist \u2013 Title" on compilations, plain title otherwise
         if is_compilation:
@@ -386,18 +393,16 @@ def render_label(release, tracks_with_sides, profile,
         dur_suffix = f" ({dur})" if dur else ""
         dur_w = draw.textlength(dur_suffix, font=f_track) if dur_suffix else 0
         track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W - dur_w)
-        draw.text((M + POS_W, y), track_str + dur_suffix, font=f_track, fill="black")
+        draw.text((M + POS_W, text_y), track_str + dur_suffix, font=f_track, fill="black")
 
         # BPM zone: print value if known, otherwise leave a blank write zone
-        bpm_line_y  = y + _TRACK_ROW_H - 18
         _track_info = bpms.get(track_idx) or {}
         known_bpm   = _track_info.get("bpm")
         if known_bpm:
             bpm_str = str(known_bpm)
             bpm_w = draw.textlength(bpm_str, font=f_bpm)
             bpm_x = W - M - (BPM_ZONE_W + bpm_w) // 2  # centre in zone
-            # Align vertically with the track name text
-            draw.text((bpm_x, y), bpm_str, font=f_bpm, fill="#333333")
+            draw.text((bpm_x, text_y), bpm_str, font=f_bpm, fill="#333333")
             # Faint underline to show the write zone even with a printed value
             hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#BBBBBB", weight=1)
         else:
@@ -410,18 +415,15 @@ def render_label(release, tracks_with_sides, profile,
     y += 10
     hl(y); y += 18
 
-    draw.text((M, y), "NOTES:", font=f_notes_hdr, fill="black")
-    y += 44
-
-    # QR code sits flush in the bottom-right corner of the notes area.
-    # Ruled lines that enter the QR zone are shortened so it sits cleanly.
-    QR_SIZE = 160                      # px — ~13 mm at 300 DPI
+    # QR code sits flush in the bottom-left corner of the notes area.
+    # Ruled lines that enter the QR zone start to the right of it.
+    QR_SIZE = 200                      # px — ~17 mm at 300 DPI
     qr_top  = H - M - QR_SIZE         # y where the QR block starts
-    qr_left = W - M - QR_SIZE         # x where the QR block starts
+    qr_left = M                        # x where the QR block starts
 
     def _hl_notes(line_y):
-        x_right = qr_left - 8 if line_y >= qr_top else W - M
-        hline(draw, line_y, M, x_right, color="#DDDDDD", weight=1)
+        x_left = qr_left + QR_SIZE + 8 if line_y >= qr_top else M
+        hline(draw, line_y, x_left, W - M, color="#DDDDDD", weight=1)
 
     if notes_lines is not None:
         # Continuous labels: fixed number of ruled lines
@@ -440,7 +442,7 @@ def render_label(release, tracks_with_sides, profile,
         box_size=6,
         border=1,
     )
-    qr.add_data(f"https://www.discogs.com/release/{release.getId()}")
+    qr.add_data(f"https://discogs.com/release/{release.getId()}")
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     qr_img = qr_img.resize((QR_SIZE, QR_SIZE), Image.NEAREST)
