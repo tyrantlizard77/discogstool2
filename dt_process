@@ -3,17 +3,19 @@
 import warnings
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
-# Patch resource_tracker to suppress semaphore warnings at shutdown
-# (warnings.filterwarnings doesn't work because these come from a subprocess)
-try:
-    from multiprocessing import resource_tracker
-    _original_warn = resource_tracker.warnings.warn
-    def _patched_warn(msg, *args, **kwargs):
-        if "semaphore" not in str(msg):
-            _original_warn(msg, *args, **kwargs)
-    resource_tracker.warnings.warn = _patched_warn
-except Exception:
-    pass
+# Suppress spurious semaphore-leak warnings from Python's multiprocessing
+# resource_tracker.  The tracker runs as a daemon subprocess (a fresh Python
+# interpreter), so warnings.filterwarnings() in this process has no effect on
+# it.  Setting PYTHONWARNINGS before any Pool is created propagates the filter
+# to the daemon via inherited environment.  The semaphores are cleaned up by
+# the OS on exit — these are false positives from the tracker being overly
+# conservative.
+import os as _os
+_rt_filter = 'ignore::UserWarning:multiprocessing.resource_tracker'
+_existing_pw = _os.environ.get('PYTHONWARNINGS', '')
+if _rt_filter not in _existing_pw:
+    _os.environ['PYTHONWARNINGS'] = f"{_existing_pw},{_rt_filter}" if _existing_pw else _rt_filter
+del _os, _rt_filter, _existing_pw
 
 import glob
 import argparse
