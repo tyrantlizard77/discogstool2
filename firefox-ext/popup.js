@@ -22,7 +22,7 @@ browser.storage.local.get(STORAGE_KEYS).then(saved => {
   if (saved.split)   splitEl.checked   = saved.split;
   if (saved.preview) previewEl.checked = saved.preview;
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
-  checkBeatportStatus();
+  checkConnectionStatus();
 });
 
 // Persist settings on change
@@ -114,21 +114,46 @@ function setStatus(msg, cls = "") {
   statusEl.className = cls;
 }
 
-function checkBeatportStatus() {
+function checkConnectionStatus() {
   const port = portEl.value || DEFAULT_PORT;
-  const el   = document.getElementById("beatport-status");
+  const SERVICES = [
+    { key: "discogs",   elId: "conn-discogs",   label: "Discogs"   },
+    { key: "beatport",  elId: "conn-beatport",  label: "Beatport"  },
+    { key: "anthropic", elId: "conn-anthropic", label: "Anthropic" },
+    { key: "llm",       elId: "conn-llm",       label: "Finder"    },
+  ];
+
   fetch(`http://localhost:${port}/status`)
     .then(r => r.json())
     .then(data => {
-      const bp = data.beatport;
-      if (!bp || bp.status === "unavailable") { el.textContent = ""; el.className = ""; return; }
-      if (bp.status === "ok") {
-        el.textContent = "● Beatport OK";
-        el.className   = "ok";
-      } else {
-        el.textContent = "● Beatport: " + (bp.message || bp.status);
-        el.className   = "error";
+      for (const { key, elId, label } of SERVICES) {
+        const el  = document.getElementById(elId);
+        const svc = data[key];
+
+        // For the LLM dot, show the configured backend name in the label
+        let displayLabel = label;
+        if (key === "llm" && svc && svc.backend) {
+          displayLabel = svc.backend === "anthropic" ? "Finder (Claude)" : "Finder (Local)";
+          el.textContent = "● " + (svc.backend === "anthropic" ? "Claude" : "Local LLM");
+        }
+
+        if (!svc || svc.status === "unavailable") {
+          el.className = "conn-dot";
+          el.title     = displayLabel + ": unavailable";
+        } else if (svc.status === "ok") {
+          el.className = "conn-dot ok";
+          el.title     = displayLabel + ": connected";
+        } else {
+          el.className = "conn-dot error";
+          el.title     = displayLabel + ": " + (svc.message || svc.status);
+        }
       }
     })
-    .catch(() => { el.textContent = ""; el.className = ""; });
+    .catch(() => {
+      for (const { elId, label } of SERVICES) {
+        const el = document.getElementById(elId);
+        el.className = "conn-dot";
+        el.title     = label + ": server unreachable";
+      }
+    });
 }

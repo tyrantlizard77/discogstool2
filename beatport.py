@@ -58,6 +58,8 @@ class BeatportAuth(TypedDict, total=False):
     expires_at: float
     llm_url: str
     llm_model: str
+    anthropic_api_key: str
+    anthropic_model: str    # defaults to claude-haiku-4-5-20251001
 
 
 class _BeatportSearchResultRequired(TypedDict):
@@ -117,8 +119,15 @@ TRACK_MIN_SCORE: float = 0.72
 # Minimum fraction of Discogs tracks that must match a Beatport track
 TRACK_COVERAGE_MIN: float = 0.30
 
-# Maximum year difference for a release to be considered a match
-MAX_YEAR_DIFF: int = 1
+# Year-difference handling.
+# Within YEAR_HARD_MAX years: score is penalised by YEAR_PENALTY_FACTOR per
+# year of difference (e.g. diff=1 → ×0.85, diff=2 → ×0.72, diff=3 → ×0.61).
+# Beyond YEAR_HARD_MAX: candidate is rejected outright.
+# Rationale: digital releases often appear on Beatport 1-2 years after the
+# vinyl release date recorded on Discogs, and some catalogue uploads are
+# backdated differently across the two platforms.
+YEAR_HARD_MAX: int = 3
+YEAR_PENALTY_FACTOR: float = 0.85   # multiplied into score once per year of diff
 
 # ── Cache TTLs (days) ──────────────────────────────────────────────────────────
 
@@ -198,8 +207,32 @@ def _normalize_title(title: str) -> str:
 
 
 def _normalize_catno(catno: str) -> str:
-    """Normalize a catalog number: uppercase, remove spaces and hyphens."""
-    return re.sub(r"[\s\-]", "", (catno or "").upper())
+    """Normalize a catalog number for fuzzy comparison.
+
+    Steps applied (in order):
+    1. NFD-decompose and strip Unicode combining marks (e.g. Ó → O, ü → u).
+    2. Strip Unicode formatting/invisible characters such as zero-width spaces
+       (category Cf: U+200B, U+FEFF, etc.) that sometimes appear in Discogs
+       catalog number fields.
+    3. Uppercase.
+    4. Remove spaces and hyphens.
+    5. Strip a trailing format-edition suffix that follows a digit:
+       ``D`` (digital), ``LP``, ``EP``, ``CD``.
+       This lets ``BLKRTZ050D`` match ``BLKRTZ050`` and ``INV345LP`` match
+       ``INV345D`` (both normalise to ``INV345``).
+    """
+    if not catno:
+        return ""
+    # Step 1: remove accent combining marks
+    catno = unicodedata.normalize("NFD", catno)
+    catno = "".join(c for c in catno if unicodedata.category(c) != "Mn")
+    # Step 2: remove invisible Unicode formatting characters (zero-width spaces etc.)
+    catno = "".join(c for c in catno if unicodedata.category(c) != "Cf")
+    # Step 3-4: uppercase and strip spaces / hyphens
+    catno = re.sub(r"[\s\-]", "", catno.upper())
+    # Step 5: strip trailing format suffix preceded by a digit
+    catno = re.sub(r"(?<=\d)(D|LP|EP|CD)$", "", catno)
+    return catno
 
 
 def _strip_discogs_artist(artist: str) -> str:
@@ -731,20 +764,29 @@ class CatnoMatcher(ReleaseMatcher):
                     t_sim,
                 )
 
-                # Year gate
-                if year and bp_year and abs(int(year) - bp_year) > MAX_YEAR_DIFF:
-                    log.debug(
-                        "CatnoMatcher: year mismatch discogs=%s beatport=%s, skipping",
-                        year,
-                        bp_year,
-                    )
-                    continue
+                # Year gate: hard-reject beyond YEAR_HARD_MAX, soft-penalise within it
+                year_penalty = 1.0
+                if year and bp_year:
+                    year_diff = abs(int(year) - bp_year)
+                    if year_diff > YEAR_HARD_MAX:
+                        log.debug(
+                            "CatnoMatcher: year mismatch discogs=%s beatport=%s, skipping",
+                            year,
+                            bp_year,
+                        )
+                        continue
+                    elif year_diff > 0:
+                        year_penalty = YEAR_PENALTY_FACTOR ** year_diff
+                        log.debug(
+                            "CatnoMatcher: year soft penalty %.2f (diff=%d, discogs=%s beatport=%s)",
+                            year_penalty, year_diff, year, bp_year,
+                        )
 
                 # Score: catno similarity is primary, title is secondary
                 if c_sim >= CATNO_MIN_SCORE:
-                    score = c_sim * 0.7 + t_sim * 0.3
+                    score = (c_sim * 0.7 + t_sim * 0.3) * year_penalty
                 elif c_sim >= 0.5 and t_sim >= TITLE_MIN_SCORE:
-                    score = c_sim * 0.4 + t_sim * 0.6
+                    score = (c_sim * 0.4 + t_sim * 0.6) * year_penalty
                 else:
                     continue  # not a viable candidate
 
@@ -825,17 +867,27 @@ class TitleMatcher(ReleaseMatcher):
                     r.get("id"), bp_catno, c_sim, t_sim,
                 )
 
-                if year and bp_year and abs(int(year) - bp_year) > MAX_YEAR_DIFF:
-                    log.debug(
-                        "TitleMatcher: year mismatch discogs=%s beatport=%s, skipping",
-                        year, bp_year,
-                    )
-                    continue
+                # Year gate: hard-reject beyond YEAR_HARD_MAX, soft-penalise within it
+                year_penalty = 1.0
+                if year and bp_year:
+                    year_diff = abs(int(year) - bp_year)
+                    if year_diff > YEAR_HARD_MAX:
+                        log.debug(
+                            "TitleMatcher: year mismatch discogs=%s beatport=%s, skipping",
+                            year, bp_year,
+                        )
+                        continue
+                    elif year_diff > 0:
+                        year_penalty = YEAR_PENALTY_FACTOR ** year_diff
+                        log.debug(
+                            "TitleMatcher: year soft penalty %.2f (diff=%d, discogs=%s beatport=%s)",
+                            year_penalty, year_diff, year, bp_year,
+                        )
 
                 if c_sim >= CATNO_MIN_SCORE:
-                    score = c_sim * 0.7 + t_sim * 0.3
+                    score = (c_sim * 0.7 + t_sim * 0.3) * year_penalty
                 elif c_sim >= 0.5 and t_sim >= TITLE_MIN_SCORE:
-                    score = c_sim * 0.4 + t_sim * 0.6
+                    score = (c_sim * 0.4 + t_sim * 0.6) * year_penalty
                 else:
                     continue
 
@@ -975,6 +1027,252 @@ Respond with ONLY the JSON object, no other text."""
     def _parse_llm_response(text: str) -> tuple[str | None, float] | None:
         """Extract (beatport_id, confidence) from LLM JSON response."""
         # Find JSON object in the response (LLM may include extra text)
+        match = re.search(r'\{[^}]+\}', text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group())
+            bid = data.get("beatport_id")
+            conf = float(data.get("confidence", 0.0))
+            if bid is None:
+                return None, 0.0
+            return str(bid), conf
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+
+class AnthropicMatcher(ReleaseMatcher):
+    """Fallback release matcher using the Anthropic API (Claude Haiku).
+
+    When catalog-number and title matchers can't produce a confident result,
+    this matcher searches Beatport for candidates (using the same queries),
+    presents the top results to Claude Haiku, and asks it to decide whether
+    any of them is the same release as the Discogs input.
+
+    Because the LLM sees real candidate metadata rather than trying to recall
+    Beatport IDs from training data, it can reliably resolve:
+    - Catalog-number format variants (BLKRTZ050 vs BLKRTZ050D)
+    - 1-2 year publish-date offsets between vinyl and digital
+    - Title wording differences between the two databases
+
+    Configuration (in ~/.discogstool/beatport_auth.json)
+    ------------------------------------------------------
+    ``anthropic_api_key``
+        Anthropic API key.  Falls back to the ``ANTHROPIC_API_KEY`` environment
+        variable if absent from the auth file.
+    ``anthropic_model``
+        Model to use.  Defaults to ``claude-haiku-4-5-20251001``.
+    """
+
+    name = "anthropic"
+
+    _API_URL = "https://api.anthropic.com/v1/messages"
+    _API_VERSION = "2023-06-01"
+    _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+
+    #: Minimum confidence accepted from the model
+    MIN_CONFIDENCE: float = 0.80
+
+    #: Number of Beatport candidates to collect and send to the model
+    MAX_CANDIDATES: int = 10
+
+    #: Minimum catno or title similarity to include a candidate for the model
+    _CANDIDATE_MIN_SIM: float = 0.25
+
+    def __init__(self) -> None:
+        auth = _load_auth() or {}
+        self._api_key: str | None = (
+            auth.get("anthropic_api_key")
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
+        self._model: str = auth.get("anthropic_model") or self._DEFAULT_MODEL
+
+    def is_available(self) -> bool:
+        return bool(self._api_key)
+
+    def find_release(
+        self,
+        discogs_release: "DiscogsRelease",
+        client: _BeatportClient,
+    ) -> tuple[str | None, float]:
+        if not self._api_key:
+            log.debug("AnthropicMatcher: no API key configured, skipping")
+            return None, 0.0
+
+        candidates = self._collect_candidates(discogs_release, client)
+        if not candidates:
+            log.debug("AnthropicMatcher: no candidates found to evaluate")
+            return None, 0.0
+
+        prompt = self._build_prompt(discogs_release, candidates)
+        log.debug(
+            "AnthropicMatcher: sending %d candidates to %s", len(candidates), self._model
+        )
+
+        try:
+            response_text = self._call_api(prompt)
+        except Exception as e:
+            log.warning("AnthropicMatcher: API call failed: %s", e)
+            return None, 0.0
+
+        result = self._parse_response(response_text)
+        if result is None:
+            log.debug("AnthropicMatcher: could not parse model response")
+            return None, 0.0
+
+        beatport_id, confidence = result
+        if beatport_id is None:
+            log.debug("AnthropicMatcher: model found no match")
+            return None, 0.0
+        if confidence < self.MIN_CONFIDENCE:
+            log.debug(
+                "AnthropicMatcher: confidence %.2f below threshold %.2f",
+                confidence, self.MIN_CONFIDENCE,
+            )
+            return None, 0.0
+
+        # Verify the returned ID is one we actually presented
+        valid_ids = {str(c["id"]) for c in candidates}
+        if str(beatport_id) not in valid_ids:
+            log.warning(
+                "AnthropicMatcher: model returned ID %s not in candidate list, ignoring",
+                beatport_id,
+            )
+            return None, 0.0
+
+        log.debug(
+            "AnthropicMatcher: beatport_id=%s confidence=%.2f", beatport_id, confidence
+        )
+        return str(beatport_id), confidence
+
+    # ── Internals ──────────────────────────────────────────────────────────────
+
+    def _collect_candidates(
+        self,
+        discogs_release: "DiscogsRelease",
+        client: _BeatportClient,
+    ) -> list[dict]:
+        """Search Beatport and return up to MAX_CANDIDATES plausible results.
+
+        Uses the same query strategies as CatnoMatcher and TitleMatcher but
+        with a lower similarity threshold and no year gating, since the model
+        will judge fitness.
+        """
+        catno  = discogs_release.getCatno()  or ""
+        artist = _strip_discogs_artist(discogs_release.getArtist() or "")
+        title  = discogs_release.getTitle()  or ""
+
+        queries = list(dict.fromkeys(filter(None, [
+            f"{catno} {artist}".strip() if catno else None,
+            catno or None,
+            f"{title} {artist}".strip() if title else None,
+            title or None,
+        ])))
+
+        seen: dict[str, dict] = {}
+        for query in queries:
+            if len(seen) >= self.MAX_CANDIDATES:
+                break
+            try:
+                results = client.search_releases(query, per_page=10)
+            except BeatportError as e:
+                log.debug("AnthropicMatcher: search error for %r: %s", query, e)
+                continue
+
+            for r in results:
+                rid = str(r.get("id", ""))
+                if not rid or rid in seen:
+                    continue
+                bp_catno = r.get("catalog_number") or ""
+                bp_title = r.get("name") or ""
+                c_sim = _catno_similarity(catno, bp_catno) if catno else 0.0
+                t_sim = _title_similarity(title, bp_title) if title else 0.0
+                if max(c_sim, t_sim) < self._CANDIDATE_MIN_SIM:
+                    continue
+                seen[rid] = {
+                    "id": rid,
+                    "name": bp_title,
+                    "catalog_number": bp_catno,
+                    "publish_date": r.get("publish_date") or "",
+                    "_c_sim": c_sim,
+                    "_t_sim": t_sim,
+                }
+                if len(seen) >= self.MAX_CANDIDATES:
+                    break
+
+        # Sort by descending max(c_sim, t_sim) so best candidates appear first
+        return sorted(seen.values(), key=lambda x: max(x["_c_sim"], x["_t_sim"]), reverse=True)
+
+    def _build_prompt(self, discogs_release: "DiscogsRelease", candidates: list[dict]) -> str:
+        tracks: list[str] = []
+        for i in range(100):
+            try:
+                t = discogs_release.getTrack(i)
+                tracks.append(f"  {t.getPosition()} {t.getTitle()}")
+            except Exception:
+                break
+        track_list = "\n".join(tracks[:20]) or "  (none)"
+
+        candidate_lines = []
+        for c in candidates:
+            candidate_lines.append(
+                f'  id={c["id"]}  catno="{c["catalog_number"]}"'
+                f'  title="{c["name"]}"  date="{c["publish_date"]}"'
+            )
+        candidate_block = "\n".join(candidate_lines)
+
+        return f"""You are a music database assistant helping match a vinyl release from Discogs to its digital equivalent on Beatport.
+
+Discogs release:
+  Artist:  {discogs_release.getArtist()}
+  Title:   {discogs_release.getTitle()}
+  Label:   {discogs_release.getLabel()}
+  Catno:   {discogs_release.getCatno()}
+  Year:    {discogs_release.getYear()}
+  Country: {discogs_release.getCountry()}
+  Tracks:
+{track_list}
+
+Beatport search candidates:
+{candidate_block}
+
+Instructions:
+- The Discogs release is typically a vinyl pressing; the Beatport equivalent is the digital release of the same recording.
+- Catalog numbers often differ slightly: Beatport may append a "D" suffix (e.g. BLKRTZ050 → BLKRTZ050D) or use a different format suffix (LP vs D). These are the same release.
+- Publish dates may differ by 1-3 years between the vinyl (Discogs) and digital (Beatport) editions.
+- Match by recognising the same artist, title, and label family — not by requiring identical metadata.
+- If multiple candidates look like a match, pick the one with the closest catalog number.
+- If NO candidate is the same release, say so.
+
+Respond with ONLY a JSON object — no other text:
+{{"beatport_id": "12345678", "confidence": 0.92}}
+or if no match:
+{{"beatport_id": null, "confidence": 0.0}}
+
+"confidence" must be a float 0.0–1.0. Only set it above 0.80 if you are genuinely confident. False positives are worse than misses."""
+
+    def _call_api(self, prompt: str) -> str:
+        headers = {
+            "x-api-key": self._api_key,
+            "anthropic-version": self._API_VERSION,
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": self._model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        r = requests.post(self._API_URL, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        content = data.get("content", [])
+        if content and content[0].get("type") == "text":
+            return content[0]["text"]
+        return ""
+
+    @staticmethod
+    def _parse_response(text: str) -> tuple[str | None, float] | None:
+        """Extract (beatport_id, confidence) from the model's JSON response."""
         match = re.search(r'\{[^}]+\}', text, re.DOTALL)
         if not match:
             return None
@@ -1182,7 +1480,7 @@ class BeatportMatcher:
         cache: BeatportCache | None = None,
     ) -> None:
         if matchers is None:
-            matchers = [CatnoMatcher(), TitleMatcher(), LLMMatcher()]
+            matchers = [CatnoMatcher(), TitleMatcher(), AnthropicMatcher()]
         self._matchers = matchers
         self._cache = cache or BeatportCache()
         _attach_file_logger()
@@ -1329,17 +1627,19 @@ def _setup_credentials() -> None:
     if password:
         auth["password"] = password
 
-    llm_url = input(
-        f"LLM server URL for LLMMatcher [{auth.get('llm_url', '')}] "
-        "(leave blank to skip): "
+    anthropic_key = input(
+        "Anthropic API key for AnthropicMatcher fallback "
+        f"[{'set' if auth.get('anthropic_api_key') else 'not set'}] "
+        "(leave blank to keep existing): "
     ).strip()
-    if llm_url:
-        auth["llm_url"] = llm_url
-        llm_model = input(
-            f"LLM model name [{auth.get('llm_model', 'llama3')}]: "
-        ).strip()
-        if llm_model:
-            auth["llm_model"] = llm_model
+    if anthropic_key:
+        auth["anthropic_api_key"] = anthropic_key
+    anthropic_model = input(
+        f"Anthropic model [{auth.get('anthropic_model', AnthropicMatcher._DEFAULT_MODEL)}] "
+        "(leave blank to keep default): "
+    ).strip()
+    if anthropic_model:
+        auth["anthropic_model"] = anthropic_model
 
     # Clear cached token so it gets refreshed
     auth.pop("access_token", None)

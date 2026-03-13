@@ -25,10 +25,13 @@ from beatport import (
     _similarity,
     _strip_discogs_artist,
     _title_similarity,
+    AnthropicMatcher,
     BeatportCache,
     BeatportMatcher,
     LLMMatcher,
     ReleaseMatcher,
+    YEAR_HARD_MAX,
+    YEAR_PENALTY_FACTOR,
 )
 
 
@@ -195,6 +198,44 @@ class TestNormalizeCatno:
     def test_idempotent(self):
         n = _normalize_catno("XYZ999")
         assert _normalize_catno(n) == n
+
+    # ── New: Unicode / invisible-char / format-suffix normalisation ──────────
+
+    def test_strips_accent_combining_mark(self):
+        # STÓ023 (O with acute) should normalise the same as STO023
+        assert _normalize_catno("STÓ023") == _normalize_catno("STO023")
+
+    def test_strips_zero_width_spaces(self):
+        # Zero-width space (U+200B) must be removed
+        assert _normalize_catno("ABC\u200b123") == "ABC123"
+
+    def test_strips_zero_width_no_break_space(self):
+        assert _normalize_catno("ABC\ufeff123") == "ABC123"
+
+    def test_strips_trailing_digital_suffix_D(self):
+        # Common Beatport pattern: label appends D for digital
+        assert _normalize_catno("BLKRTZ050D") == "BLKRTZ050"
+
+    def test_strips_trailing_LP_after_digit(self):
+        assert _normalize_catno("INV345LP") == "INV345"
+
+    def test_strips_trailing_EP_after_digit(self):
+        assert _normalize_catno("LABEL007EP") == "LABEL007"
+
+    def test_strips_trailing_CD_after_digit(self):
+        assert _normalize_catno("XYZ012CD") == "XYZ012"
+
+    def test_does_not_strip_suffix_after_letter(self):
+        # "TECHEP" ends in EP but there's no digit before EP, so it stays
+        assert _normalize_catno("TECHEP") == "TECHEP"
+
+    def test_digital_suffix_matching(self):
+        # After normalisation, a catno with and without D should be identical
+        assert _normalize_catno("BLKRTZ050D") == _normalize_catno("BLKRTZ050")
+
+    def test_vinyl_vs_digital_catno_matching(self):
+        # Vinyl LP and digital D editions of the same release normalise to the same string
+        assert _normalize_catno("INV345LP") == _normalize_catno("INV345D")
 
 
 # ─── _strip_discogs_artist ────────────────────────────────────────────────────
@@ -447,6 +488,89 @@ class TestParseLLMResponse:
         _, conf = result
         assert isinstance(conf, float)
         assert conf == pytest.approx(0.9)
+
+
+# ─── AnthropicMatcher._parse_response ────────────────────────────────────────
+
+class TestAnthropicMatcherParseResponse:
+    """_parse_response reuses the same JSON extraction logic as LLMMatcher."""
+
+    def test_valid_match(self):
+        result = AnthropicMatcher._parse_response(
+            '{"beatport_id": "99887766", "confidence": 0.91}'
+        )
+        assert result == ("99887766", 0.91)
+
+    def test_null_id_returns_none_id(self):
+        result = AnthropicMatcher._parse_response(
+            '{"beatport_id": null, "confidence": 0.0}'
+        )
+        assert result == (None, 0.0)
+
+    def test_integer_id_stringified(self):
+        result = AnthropicMatcher._parse_response(
+            '{"beatport_id": 12345, "confidence": 0.88}'
+        )
+        assert result is not None
+        bid, _ = result
+        assert isinstance(bid, str)
+
+    def test_json_with_surrounding_prose(self):
+        result = AnthropicMatcher._parse_response(
+            'Based on the metadata I believe this matches:\n'
+            '{"beatport_id": "55", "confidence": 0.85}\n'
+        )
+        assert result is not None
+        assert result[0] == "55"
+
+    def test_no_json_returns_none(self):
+        assert AnthropicMatcher._parse_response("No match found.") is None
+
+    def test_malformed_json_returns_none(self):
+        assert AnthropicMatcher._parse_response("{bad json}") is None
+
+
+class TestAnthropicMatcherAvailability:
+    def test_unavailable_without_key(self):
+        matcher = AnthropicMatcher.__new__(AnthropicMatcher)
+        matcher._api_key = None
+        matcher._model = AnthropicMatcher._DEFAULT_MODEL
+        assert not matcher.is_available()
+
+    def test_available_with_key(self):
+        matcher = AnthropicMatcher.__new__(AnthropicMatcher)
+        matcher._api_key = "sk-ant-test"
+        matcher._model = AnthropicMatcher._DEFAULT_MODEL
+        assert matcher.is_available()
+
+    def test_returns_none_when_no_key(self):
+        """find_release should short-circuit and return (None, 0.0) without a key."""
+        matcher = AnthropicMatcher.__new__(AnthropicMatcher)
+        matcher._api_key = None
+        matcher._model = AnthropicMatcher._DEFAULT_MODEL
+        rel = _MockRelease([])
+        client = MagicMock()
+        bid, conf = matcher.find_release(rel, client)
+        assert bid is None
+        assert conf == 0.0
+        client.search_releases.assert_not_called()
+
+    def test_rejects_id_not_in_candidate_list(self):
+        """If the model hallucinates an ID not in the candidates, result is discarded."""
+        matcher = AnthropicMatcher.__new__(AnthropicMatcher)
+        matcher._api_key = "sk-ant-test"
+        matcher._model = AnthropicMatcher._DEFAULT_MODEL
+
+        rel = _MockRelease([_MockTrack("Track A")], catno="TEST001", year="2022")
+        client = MagicMock()
+        client.search_releases.return_value = [
+            {"id": 111, "catalog_number": "TEST001D", "name": "Test EP", "publish_date": "2022-01-01"},
+        ]
+
+        with patch.object(matcher, "_call_api", return_value='{"beatport_id": "9999999", "confidence": 0.95}'):
+            bid, conf = matcher.find_release(rel, client)
+
+        assert bid is None  # 9999999 was not in the candidate list
 
 
 # ─── _match_tracks ────────────────────────────────────────────────────────────
@@ -767,3 +891,79 @@ class TestBeatportMatcherFindBpms:
         with patch.object(beatport, "get_client", side_effect=BeatportError("auth failed")):
             result = m.find_bpms(rel)
         assert result == {}
+
+
+# ─── Year-penalty behaviour ───────────────────────────────────────────────────
+
+class TestYearPenaltyConstants:
+    """Sanity-check the new year-handling constants are present and sane."""
+
+    def test_year_hard_max_is_positive(self):
+        assert YEAR_HARD_MAX > 0
+
+    def test_year_penalty_factor_is_fraction(self):
+        assert 0.0 < YEAR_PENALTY_FACTOR < 1.0
+
+    def test_penalty_compounds_per_year(self):
+        # diff=2 should apply the factor twice
+        penalty_1 = YEAR_PENALTY_FACTOR ** 1
+        penalty_2 = YEAR_PENALTY_FACTOR ** 2
+        assert penalty_2 < penalty_1
+
+
+class TestCatnoMatcherYearPenalty:
+    """Integration-style tests for the year soft-penalty in CatnoMatcher."""
+
+    def _run_catno_matcher(self, discogs_year: str, bp_year: str) -> tuple[str | None, float]:
+        """Run CatnoMatcher against a single fake Beatport candidate."""
+        from beatport import CatnoMatcher, CATNO_MIN_SCORE
+
+        rel = _MockRelease(
+            [_MockTrack("Test Track")],
+            catno="TEST001",
+            title="Test EP",
+            year=discogs_year,
+        )
+        client = MagicMock()
+        client.search_releases.return_value = [
+            {
+                "id": 42,
+                "catalog_number": "TEST001",   # perfect catno match
+                "name": "Test EP",             # perfect title match
+                "publish_date": f"{bp_year}-01-01",
+            }
+        ]
+        matcher = CatnoMatcher()
+        return matcher.find_release(rel, client)
+
+    def test_zero_year_diff_no_penalty(self):
+        bid, score = self._run_catno_matcher("2022", "2022")
+        assert bid == "42"
+        # Perfect catno+title match, no penalty → score should be near 1.0
+        assert score > 0.95
+
+    def test_one_year_diff_reduces_score(self):
+        _, score_exact  = self._run_catno_matcher("2022", "2022")
+        _, score_offset = self._run_catno_matcher("2022", "2023")
+        assert score_offset < score_exact
+        # Should still produce a match (score > MIN_RELEASE_CONFIDENCE = 0.70)
+        assert score_offset > 0.70
+
+    def test_two_year_diff_still_matches(self):
+        bid, score = self._run_catno_matcher("2022", "2024")
+        assert bid == "42"
+        assert score > 0.0
+
+    def test_beyond_hard_max_skips(self):
+        hard_skip_year = str(2022 + YEAR_HARD_MAX + 1)
+        bid, score = self._run_catno_matcher("2022", hard_skip_year)
+        assert bid is None
+
+    def test_exact_hard_max_still_matches(self):
+        # A difference of exactly YEAR_HARD_MAX should apply penalty but not skip
+        boundary_year = str(2022 + YEAR_HARD_MAX)
+        bid, score = self._run_catno_matcher("2022", boundary_year)
+        assert bid == "42"
+        expected_penalty = YEAR_PENALTY_FACTOR ** YEAR_HARD_MAX
+        # Score should be approximately base_score * penalty
+        assert score == pytest.approx(score / expected_penalty * expected_penalty, rel=0.05)

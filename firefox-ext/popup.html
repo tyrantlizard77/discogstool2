@@ -148,13 +148,18 @@
       font-family: monospace;
     }
 
-    #beatport-status {
-      margin-top: 6px;
-      font-size: 11px;
-      color: #555;
+    #connections {
+      margin-top: 8px;
+      display: flex;
+      gap: 10px;
     }
-    #beatport-status.ok    { color: #6dbf67; }
-    #beatport-status.error { color: #e06060; }
+
+    .conn-dot {
+      font-size: 11px;
+      color: #444;
+    }
+    .conn-dot.ok    { color: #6dbf67; }
+    .conn-dot.error { color: #e06060; }
   </style>
 </head>
 <body>
@@ -197,7 +202,12 @@
       Server port
       <input type="number" id="port" min="1024" max="65535" value="5679">
     </label>
-    <div id="beatport-status"></div>
+    <div id="connections">
+      <span id="conn-discogs"  class="conn-dot" title="Discogs">●&nbsp;Discogs</span>
+      <span id="conn-beatport" class="conn-dot" title="Beatport">●&nbsp;Beatport</span>
+      <span id="conn-anthropic" class="conn-dot" title="Anthropic (Claude)">●&nbsp;Anthropic</span>
+      <span id="conn-llm" class="conn-dot" title="Finder LLM">●&nbsp;Finder</span>
+    </div>
   </footer>
 
   <script src="popup.js"></script>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dt_find — voice/text vinyl record finder powered by a local LLM.
+"""dt_find — voice/text vinyl record finder powered by an LLM.
 
 Describe a record in plain English — vague, informal, partial — and the LLM
 searches Discogs on your behalf, opens the release page for confirmation,
@@ -7,14 +7,21 @@ then optionally prints a sleeve label.
 
 Usage
 -----
-    ./dt_find                            # voice input (default)
-    ./dt_find --text                     # force typed description
-    ./dt_find "the blue Miles Davis one" # description inline
+    ./dt_find                              # voice input (default)
+    ./dt_find --text                       # force typed description
+    ./dt_find "the blue Miles Davis one"   # description inline
+    ./dt_find --backend anthropic          # use Claude Haiku via API
+    ./dt_find --backend local              # use local OpenAI-compatible LLM
 
 Saved settings  (~/.discogstool/find_config)
 --------------------------------------------
-    llm_url=http://wintermute.local:8000/v1
+    backend=anthropic                          # or: local  (default: local)
+    llm_url=http://wintermute.local:8000/v1    # for backend=local
     llm_model=mlx-community/Qwen3.5-122B-A10B-4bit
+    find_anthropic_model=claude-haiku-4-5-20251001  # optional model override
+
+For backend=anthropic the API key is read from ~/.discogstool/beatport_auth.json
+("anthropic_api_key") or the ANTHROPIC_API_KEY environment variable.
 
 Voice dependencies (installed separately, see requirements.txt):
     pip install sounddevice SpeechRecognition
@@ -29,6 +36,7 @@ import re
 import subprocess
 import sys
 import webbrowser
+from abc import ABC, abstractmethod
 
 # Allow importing sibling modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -150,6 +158,7 @@ def get_description_text(prompt: str = "Describe the record: ") -> str | None:
 
 # ── LLM tool definitions ───────────────────────────────────────────────────────
 
+# OpenAI-compatible format (used by LocalLLMBackend)
 TOOLS = [
     {
         "type": "function",
@@ -206,6 +215,49 @@ TOOLS = [
                 },
                 "required": ["release_id", "reasoning"],
             },
+        },
+    },
+]
+
+# Anthropic native tool format (used by AnthropicBackend)
+ANTHROPIC_TOOLS: list[dict] = [
+    {
+        "name": "search_discogs",
+        "description": (
+            "Search the Discogs database for vinyl releases. "
+            "You may call this multiple times with different parameters. "
+            "Returns up to 8 matching releases with id, artist, title, "
+            "label, catno, year, format, and country."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "q":      {"type": "string", "description": "Free-text query (e.g. 'Miles Davis Kind of Blue')"},
+                "artist": {"type": "string", "description": "Artist name"},
+                "title":  {"type": "string", "description": "Release/album title"},
+                "label":  {"type": "string", "description": "Record label name"},
+                "year":   {"type": "string", "description": "Release year"},
+                "catno":  {"type": "string", "description": "Catalog number"},
+                "format": {"type": "string", "description": "Format filter, e.g. 'Vinyl' or 'LP'"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "select_release",
+        "description": (
+            "Call this when you have identified the correct Discogs release. "
+            "Only call it when you are genuinely confident — false positives "
+            "waste label stock. If you cannot find a confident match after "
+            "several searches, say so in text instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "release_id": {"type": "integer", "description": "The numeric Discogs release ID"},
+                "reasoning":  {"type": "string",  "description": "Brief explanation of why this is the right release"},
+            },
+            "required": ["release_id", "reasoning"],
         },
     },
 ]
@@ -310,7 +362,7 @@ def _fmt_search_args(args: dict) -> str:
     return ", ".join(parts) or "(no parameters)"
 
 
-# ── Strip thinking tags ────────────────────────────────────────────────────────
+# ── Strip thinking tags (Qwen3 / reasoning models) ────────────────────────────
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
@@ -324,120 +376,335 @@ def _extract_think(text: str) -> str | None:
     return m.group(0)[7:-8].strip() if m else None  # strip <think>…</think>
 
 
-# ── LLM agent loop ─────────────────────────────────────────────────────────────
+# ── Abstract LLM backend ──────────────────────────────────────────────────────
 
-def run_agent(
-    description: str,
-    llm_url: str,
-    llm_model: str,
-    verbose: bool = False,
-) -> tuple[int | None, str]:
-    """Run the tool-calling LLM agent.
+class LLMBackend(ABC):
+    """Abstract base for LLM backends used by dt_find.
 
-    Returns (release_id, reasoning) where release_id is a Discogs release ID
-    or None if the agent could not identify the record.
+    Subclasses implement the model-specific agent loop and availability check.
+    Two concrete backends are provided:
+      - LocalLLMBackend  — OpenAI-compatible API (MLX, llama.cpp, vLLM, …)
+      - AnthropicBackend — Anthropic Claude API (Haiku recommended)
     """
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise SystemExit(
-            "The openai package is required: pip install openai"
-        )
 
-    client = OpenAI(base_url=llm_url, api_key="not-required")
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable backend identifier (shown in the UI and on startup)."""
 
-    messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": description},
-    ]
+    @abstractmethod
+    def check_available(self) -> tuple[bool, str]:
+        """Return (ok, error_message).
 
-    for turn in range(MAX_SEARCH_TURNS):
+        ok=True means the backend is configured and (best-effort) reachable.
+        error_message is empty when ok=True.
+        """
+
+    @abstractmethod
+    def run_agent(
+        self,
+        description: str,
+        verbose: bool = False,
+    ) -> tuple[int | None, str]:
+        """Run the tool-calling agent loop.
+
+        Returns (release_id, reasoning) where release_id is a Discogs release
+        ID, or (None, '') if the agent could not identify the record.
+        """
+
+
+# ── Local OpenAI-compatible backend ───────────────────────────────────────────
+
+class LocalLLMBackend(LLMBackend):
+    """OpenAI-compatible local LLM backend (MLX, llama.cpp, vLLM, etc.).
+
+    The LLM must support function / tool calling.  Reasoning-model <think>
+    blocks are stripped from responses before display.
+    """
+
+    def __init__(self, llm_url: str, llm_model: str) -> None:
+        self._url   = llm_url
+        self._model = llm_model
+
+    @property
+    def name(self) -> str:
+        return f"Local LLM ({self._model})"
+
+    def check_available(self) -> tuple[bool, str]:
+        if not self._url:
+            return False, "no LLM URL configured"
         try:
-            response = client.chat.completions.create(
-                model=llm_model,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-            )
+            import requests as _req
+            _req.get(f"{self._url}/models", timeout=3)
+            return True, ""
         except Exception as e:
-            print(f"\nLLM error: {e}", file=sys.stderr)
-            return None, ""
+            return False, f"LLM server unreachable: {e}"
 
-        msg = response.choices[0].message
-        content = msg.content or ""
-        visible = _strip_think(content)
+    def run_agent(
+        self,
+        description: str,
+        verbose: bool = False,
+    ) -> tuple[int | None, str]:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise SystemExit(
+                "The openai package is required: pip install openai"
+            )
 
-        if verbose:
-            thinking = _extract_think(content)
-            if thinking:
-                # Show thinking in dim/italic ANSI if terminal supports it
-                print(f"\033[2m[thinking…]\033[0m", end=" ", flush=True)
+        client = OpenAI(base_url=self._url, api_key="not-required")
 
-        # Build the assistant entry for message history.
-        # The openai SDK returns a ChatCompletionMessage; convert to plain dict
-        # so we can append custom fields without type issues.
-        asst_entry: dict = {"role": "assistant", "content": content}
-        if msg.tool_calls:
-            asst_entry["tool_calls"] = [
-                {
-                    "id":       tc.id,
-                    "type":     "function",
-                    "function": {
-                        "name":      tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(asst_entry)
+        messages: list[dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": description},
+        ]
 
-        # No tool calls → LLM gave a final text response
-        if not msg.tool_calls:
-            if visible:
-                print(f"\n{visible}")
-            return None, ""
-
-        # Execute each tool call
-        for tc in msg.tool_calls:
-            name = tc.function.name
+        for _turn in range(MAX_SEARCH_TURNS):
             try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
+                response = client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
+            except Exception as e:
+                print(f"\nLLM error: {e}", file=sys.stderr)
+                return None, ""
 
-            if name == "select_release":
-                release_id = args.get("release_id")
-                reasoning  = args.get("reasoning", "")
-                # Acknowledge the tool call so the model can close gracefully
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      json.dumps({"status": "ok"}),
-                })
-                return int(release_id), reasoning
+            msg     = response.choices[0].message
+            content = msg.content or ""
+            visible = _strip_think(content)
 
-            elif name == "search_discogs":
-                print(f"  🔍  Searching: {_fmt_search_args(args)}", flush=True)
-                result = _tool_search_discogs(**args)
-                n = len(result.get("results", []))
-                total = result.get("count", 0)
-                print(f"      → {n} result(s) returned  ({total} total on Discogs)")
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      json.dumps(result),
-                })
+            if verbose:
+                thinking = _extract_think(content)
+                if thinking:
+                    print("\033[2m[thinking…]\033[0m", end=" ", flush=True)
 
-            else:
-                # Unknown tool — return an error so the model can recover
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      json.dumps({"error": f"Unknown tool: {name}"}),
-                })
+            # Build the assistant entry for message history.
+            # The openai SDK returns a ChatCompletionMessage; convert to plain
+            # dict so we can append custom fields without type issues.
+            asst_entry: dict = {"role": "assistant", "content": content}
+            if msg.tool_calls:
+                asst_entry["tool_calls"] = [
+                    {
+                        "id":       tc.id,
+                        "type":     "function",
+                        "function": {
+                            "name":      tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            messages.append(asst_entry)
 
-    print("\nReached search limit without a confident match.", file=sys.stderr)
-    return None, ""
+            # No tool calls → LLM gave a final text response
+            if not msg.tool_calls:
+                if visible:
+                    print(f"\n{visible}")
+                return None, ""
+
+            # Execute each tool call
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                if name == "select_release":
+                    release_id = args.get("release_id")
+                    reasoning  = args.get("reasoning", "")
+                    # Acknowledge the tool call so the model can close gracefully
+                    messages.append({
+                        "role":         "tool",
+                        "tool_call_id": tc.id,
+                        "content":      json.dumps({"status": "ok"}),
+                    })
+                    return int(release_id), reasoning
+
+                elif name == "search_discogs":
+                    print(f"  🔍  Searching: {_fmt_search_args(args)}", flush=True)
+                    result = _tool_search_discogs(**args)
+                    n     = len(result.get("results", []))
+                    total = result.get("count", 0)
+                    print(f"      → {n} result(s) returned  ({total} total on Discogs)")
+                    messages.append({
+                        "role":         "tool",
+                        "tool_call_id": tc.id,
+                        "content":      json.dumps(result),
+                    })
+
+                else:
+                    # Unknown tool — return an error so the model can recover
+                    messages.append({
+                        "role":         "tool",
+                        "tool_call_id": tc.id,
+                        "content":      json.dumps({"error": f"Unknown tool: {name}"}),
+                    })
+
+        print("\nReached search limit without a confident match.", file=sys.stderr)
+        return None, ""
+
+
+# ── Anthropic Claude API backend ──────────────────────────────────────────────
+
+class AnthropicBackend(LLMBackend):
+    """Anthropic Claude API backend using native tool use.
+
+    Uses the same Anthropic API key as the Beatport AnthropicMatcher
+    (beatport_auth.json → "anthropic_api_key", or ANTHROPIC_API_KEY env var).
+    Recommended model: claude-haiku-4-5-20251001 (fast and cheap).
+    """
+
+    DEFAULT_MODEL      = "claude-haiku-4-5-20251001"
+    _API_URL           = "https://api.anthropic.com/v1/messages"
+    _ANTHROPIC_VERSION = "2023-06-01"
+
+    def __init__(self, model: str | None = None) -> None:
+        self._model = model or self.DEFAULT_MODEL
+
+    @property
+    def name(self) -> str:
+        return f"Anthropic ({self._model})"
+
+    def _get_api_key(self) -> str | None:
+        """Read API key from beatport_auth.json or ANTHROPIC_API_KEY env var."""
+        try:
+            auth_path = util.userfile("beatport_auth.json")
+            if os.path.exists(auth_path):
+                with open(auth_path) as f:
+                    data = json.load(f)
+                key = data.get("anthropic_api_key")
+                if key:
+                    return key
+        except Exception:
+            pass
+        return os.environ.get("ANTHROPIC_API_KEY")
+
+    def check_available(self) -> tuple[bool, str]:
+        key = self._get_api_key()
+        if not key:
+            return False, "no Anthropic API key configured"
+        return True, ""
+
+    def run_agent(
+        self,
+        description: str,
+        verbose: bool = False,
+    ) -> tuple[int | None, str]:
+        try:
+            import requests
+        except ImportError:
+            raise SystemExit("The requests package is required: pip install requests")
+
+        api_key = self._get_api_key()
+        if not api_key:
+            print("Anthropic API key not configured.", file=sys.stderr)
+            return None, ""
+
+        headers = {
+            "x-api-key":         api_key,
+            "anthropic-version": self._ANTHROPIC_VERSION,
+            "content-type":      "application/json",
+        }
+
+        # Anthropic uses system as a top-level field, not a message
+        messages: list[dict] = [
+            {"role": "user", "content": description},
+        ]
+
+        for _turn in range(MAX_SEARCH_TURNS):
+            payload = {
+                "model":      self._model,
+                "max_tokens": 1024,
+                "system":     SYSTEM_PROMPT,
+                "tools":      ANTHROPIC_TOOLS,
+                "messages":   messages,
+            }
+            try:
+                r = requests.post(
+                    self._API_URL, headers=headers, json=payload, timeout=60
+                )
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                print(f"\nAnthropic API error: {e}", file=sys.stderr)
+                return None, ""
+
+            content_blocks: list[dict] = data.get("content", [])
+
+            # Append the full assistant turn (text + tool_use blocks intact)
+            messages.append({"role": "assistant", "content": content_blocks})
+
+            tool_uses   = [b for b in content_blocks if b.get("type") == "tool_use"]
+            text_blocks = [b for b in content_blocks if b.get("type") == "text"]
+
+            if not tool_uses:
+                if text_blocks:
+                    print(f"\n{''.join(b.get('text', '') for b in text_blocks)}")
+                return None, ""
+
+            # Process tool calls; collect results for the next user turn
+            tool_results: list[dict] = []
+            selected: tuple[int, str] | None = None
+
+            for tc in tool_uses:
+                tc_id = tc.get("id", "")
+                name  = tc.get("name", "")
+                inp   = tc.get("input", {})
+
+                if name == "select_release":
+                    release_id = inp.get("release_id")
+                    reasoning  = inp.get("reasoning", "")
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": tc_id,
+                        "content":     json.dumps({"status": "ok"}),
+                    })
+                    selected = (int(release_id), reasoning)
+
+                elif name == "search_discogs":
+                    print(f"  🔍  Searching: {_fmt_search_args(inp)}", flush=True)
+                    result = _tool_search_discogs(**inp)
+                    n     = len(result.get("results", []))
+                    total = result.get("count", 0)
+                    print(f"      → {n} result(s) returned  ({total} total on Discogs)")
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": tc_id,
+                        "content":     json.dumps(result),
+                    })
+
+                else:
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": tc_id,
+                        "content":     json.dumps({"error": f"Unknown tool: {name}"}),
+                    })
+
+            # Tool results must be sent back as a user message
+            messages.append({"role": "user", "content": tool_results})
+
+            if selected is not None:
+                return selected
+
+        print("\nReached search limit without a confident match.", file=sys.stderr)
+        return None, ""
+
+
+# ── Backend factory ───────────────────────────────────────────────────────────
+
+def create_backend(config: dict) -> LLMBackend:
+    """Instantiate the appropriate LLMBackend from a find_config dict."""
+    backend_name = config.get("backend", "local")
+    if backend_name == "anthropic":
+        model = config.get("find_anthropic_model") or None
+        return AnthropicBackend(model=model)
+    # Default: local OpenAI-compatible server
+    url   = config.get("llm_url",   DEFAULT_LLM_URL)
+    model = config.get("llm_model", DEFAULT_LLM_MODEL)
+    return LocalLLMBackend(url, model)
 
 
 # ── Result display + confirm ───────────────────────────────────────────────────
@@ -513,7 +780,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Voice/text vinyl record finder powered by a local LLM.",
+        description="Voice/text vinyl record finder powered by an LLM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -545,12 +812,16 @@ def main() -> None:
         help="Save label as PNG instead of printing",
     )
     parser.add_argument(
+        "--backend", metavar="BACKEND", choices=["local", "anthropic"],
+        help="LLM backend: 'local' (OpenAI-compatible) or 'anthropic' (Claude API). Saved.",
+    )
+    parser.add_argument(
         "--wintermute", metavar="URL",
-        help=f"LLM server base URL (default: {DEFAULT_LLM_URL}, saved)",
+        help=f"Local LLM server base URL (default: {DEFAULT_LLM_URL}, saved)",
     )
     parser.add_argument(
         "--model", metavar="MODEL",
-        help=f"LLM model name (default: {DEFAULT_LLM_MODEL}, saved)",
+        help=f"Local LLM model name (default: {DEFAULT_LLM_MODEL}, saved)",
     )
     args = parser.parse_args()
 
@@ -560,6 +831,8 @@ def main() -> None:
     # Load/update saved config
     config  = load_config()
     changed = False
+    if args.backend:
+        config["backend"]   = args.backend;  changed = True
     if args.wintermute:
         config["llm_url"]   = args.wintermute; changed = True
     if args.model:
@@ -567,8 +840,7 @@ def main() -> None:
     if changed:
         save_config(config)
 
-    llm_url   = config.get("llm_url",   DEFAULT_LLM_URL)
-    llm_model = config.get("llm_model", DEFAULT_LLM_MODEL)
+    backend = create_backend(config)
 
     # ── Get description ───────────────────────────────────────────────────────
 
@@ -591,14 +863,12 @@ def main() -> None:
         sys.exit(1)
 
     print(f"\n  \u2192 Finding: \u201c{description}\u201d")
-    print(f"  \u2192 LLM: {llm_url}  model: {llm_model}\n")
+    print(f"  \u2192 LLM: {backend.name}\n")
 
     # ── Run agent ─────────────────────────────────────────────────────────────
 
-    release_id, reasoning = run_agent(
+    release_id, reasoning = backend.run_agent(
         description,
-        llm_url=llm_url,
-        llm_model=llm_model,
         verbose=args.verbose,
     )
 

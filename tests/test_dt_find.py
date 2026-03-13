@@ -6,7 +6,9 @@ Covers:
   - load_config / save_config: file I/O roundtrip
   - SYSTEM_PROMPT: sanity checks (contains key guidance phrases)
   - _tool_search_discogs: result formatting with a mocked Discogs client
-  - run_agent: early-exit on select_release with a mocked OpenAI client
+  - LocalLLMBackend.run_agent: tool-calling loop with a mocked OpenAI client
+  - AnthropicBackend: availability check and agent loop with mocked requests
+  - create_backend: factory selects the correct backend class
 """
 
 from __future__ import annotations
@@ -33,10 +35,15 @@ sys.modules["dt_find"] = dt_find
 _loader.exec_module(dt_find)
 
 from dt_find import (  # noqa: E402  (after dynamic import)
+    ANTHROPIC_TOOLS,
     SYSTEM_PROMPT,
+    AnthropicBackend,
+    LocalLLMBackend,
+    LLMBackend,
     _extract_think,
     _fmt_search_args,
     _strip_think,
+    create_backend,
     load_config,
     save_config,
 )
@@ -210,6 +217,13 @@ class TestLoadSaveConfig:
             result = load_config()
         assert result == {"llm_url": "http://example.com"}
 
+    def test_backend_key_roundtrips(self, tmp_path):
+        config_path = str(tmp_path / "find_config")
+        with patch.object(dt_find.util, "userfile", return_value=config_path):
+            save_config({"backend": "anthropic"})
+            result = load_config()
+        assert result["backend"] == "anthropic"
+
 
 # ─── SYSTEM_PROMPT sanity checks ─────────────────────────────────────────────
 
@@ -232,6 +246,30 @@ class TestSystemPrompt:
     def test_kind_of_blue_example(self):
         """The prompt includes the canonical 'blue one = Kind of Blue' example."""
         assert "Kind of Blue" in SYSTEM_PROMPT
+
+
+# ─── ANTHROPIC_TOOLS sanity checks ───────────────────────────────────────────
+
+class TestAnthropicTools:
+    def test_has_two_tools(self):
+        assert len(ANTHROPIC_TOOLS) == 2
+
+    def test_tool_names(self):
+        names = {t["name"] for t in ANTHROPIC_TOOLS}
+        assert "search_discogs" in names
+        assert "select_release" in names
+
+    def test_uses_input_schema_not_parameters(self):
+        """Anthropic format uses input_schema, not parameters (OpenAI format)."""
+        for tool in ANTHROPIC_TOOLS:
+            assert "input_schema" in tool
+            assert "parameters" not in tool
+
+    def test_select_release_requires_fields(self):
+        select = next(t for t in ANTHROPIC_TOOLS if t["name"] == "select_release")
+        required = select["input_schema"].get("required", [])
+        assert "release_id" in required
+        assert "reasoning" in required
 
 
 # ─── _tool_search_discogs ────────────────────────────────────────────────────
@@ -339,7 +377,7 @@ class TestToolSearchDiscogs:
         assert "count" in result
 
 
-# ─── run_agent (mocked OpenAI client) ────────────────────────────────────────
+# ─── LocalLLMBackend ─────────────────────────────────────────────────────────
 
 def _make_tool_call(tc_id: str, name: str, arguments: dict):
     """Build a mock tool call object matching the openai SDK shape."""
@@ -362,7 +400,7 @@ def _make_response(content: str = "", tool_calls=None):
     return resp
 
 
-class TestRunAgent:
+class TestLocalLLMBackend:
     def _patch_openai(self, responses: list):
         """Context manager: patch openai.OpenAI so completions return *responses* in order."""
         client_mock = MagicMock()
@@ -372,6 +410,36 @@ class TestRunAgent:
         openai_mod.OpenAI.return_value = client_mock
         return patch.dict("sys.modules", {"openai": openai_mod})
 
+    def _make_backend(self, url="http://localhost:8000/v1", model="test-model"):
+        return LocalLLMBackend(url, model)
+
+    def test_is_llm_backend_subclass(self):
+        assert issubclass(LocalLLMBackend, LLMBackend)
+
+    def test_name_includes_model(self):
+        b = self._make_backend(model="my-model")
+        assert "my-model" in b.name
+
+    def test_check_available_no_url(self):
+        b = LocalLLMBackend("", "model")
+        ok, msg = b.check_available()
+        assert not ok
+        assert "url" in msg.lower()
+
+    def test_check_available_unreachable(self):
+        b = LocalLLMBackend("http://192.0.2.1:9999/v1", "model")
+        with patch("requests.get", side_effect=Exception("refused")):
+            ok, msg = b.check_available()
+        assert not ok
+        assert msg != ""
+
+    def test_check_available_reachable(self):
+        b = self._make_backend()
+        with patch("requests.get", return_value=MagicMock(status_code=200)):
+            ok, msg = b.check_available()
+        assert ok
+        assert msg == ""
+
     def test_select_release_returns_id(self):
         """Agent should return (release_id, reasoning) when select_release is called."""
         tc = _make_tool_call("tc1", "select_release",
@@ -380,11 +448,8 @@ class TestRunAgent:
 
         with self._patch_openai(responses):
             with patch.object(dt_find, "_tool_search_discogs", return_value={"results": []}):
-                release_id, reasoning = dt_find.run_agent(
-                    "Miles Davis Kind of Blue",
-                    llm_url="http://localhost:8000/v1",
-                    llm_model="test-model",
-                )
+                b = self._make_backend()
+                release_id, reasoning = b.run_agent("Miles Davis Kind of Blue")
         assert release_id == 123456
         assert reasoning == "Exact match"
 
@@ -406,22 +471,16 @@ class TestRunAgent:
 
         with self._patch_openai(responses):
             with patch.object(dt_find, "_tool_search_discogs", return_value=search_result):
-                release_id, reasoning = dt_find.run_agent(
-                    "the blue Miles Davis one",
-                    llm_url="http://localhost:8000/v1",
-                    llm_model="test-model",
-                )
+                b = self._make_backend()
+                release_id, reasoning = b.run_agent("the blue Miles Davis one")
         assert release_id == 999
 
     def test_no_tool_calls_returns_none(self):
         """If the model responds with plain text (no tool calls), return (None, '')."""
         responses = [_make_response(content="I couldn't find that record.", tool_calls=[])]
         with self._patch_openai(responses):
-            release_id, reasoning = dt_find.run_agent(
-                "something completely obscure",
-                llm_url="http://localhost:8000/v1",
-                llm_model="test-model",
-            )
+            b = self._make_backend()
+            release_id, reasoning = b.run_agent("something completely obscure")
         assert release_id is None
 
     def test_think_tags_stripped_from_content(self):
@@ -431,12 +490,8 @@ class TestRunAgent:
             tool_calls=[],
         )]
         with self._patch_openai(responses):
-            # Should not raise; thinking block stripped silently
-            release_id, _ = dt_find.run_agent(
-                "test",
-                llm_url="http://localhost:8000/v1",
-                llm_model="test-model",
-            )
+            b = self._make_backend()
+            release_id, _ = b.run_agent("test")
         assert release_id is None
 
     def test_unknown_tool_gets_error_response(self):
@@ -448,11 +503,8 @@ class TestRunAgent:
             text_response,
         ]
         with self._patch_openai(responses):
-            release_id, _ = dt_find.run_agent(
-                "test",
-                llm_url="http://localhost:8000/v1",
-                llm_model="test-model",
-            )
+            b = self._make_backend()
+            release_id, _ = b.run_agent("test")
         assert release_id is None
 
     def test_llm_exception_returns_none(self):
@@ -463,9 +515,206 @@ class TestRunAgent:
         openai_mod.OpenAI.return_value = client_mock
 
         with patch.dict("sys.modules", {"openai": openai_mod}):
-            release_id, _ = dt_find.run_agent(
-                "test",
-                llm_url="http://localhost:8000/v1",
-                llm_model="test-model",
-            )
+            b = self._make_backend()
+            release_id, _ = b.run_agent("test")
         assert release_id is None
+
+
+# ─── AnthropicBackend ─────────────────────────────────────────────────────────
+
+def _make_anthropic_response(text_blocks=None, tool_uses=None):
+    """Build a minimal Anthropic API response dict."""
+    content = []
+    for text in (text_blocks or []):
+        content.append({"type": "text", "text": text})
+    for tc in (tool_uses or []):
+        content.append({
+            "type":  "tool_use",
+            "id":    tc["id"],
+            "name":  tc["name"],
+            "input": tc["input"],
+        })
+    return {"content": content, "stop_reason": "end_turn" if not tool_uses else "tool_use"}
+
+
+class TestAnthropicBackend:
+    def _make_backend(self, model=None):
+        return AnthropicBackend(model=model)
+
+    def _patch_api_key(self, key="sk-ant-test"):
+        return patch.object(AnthropicBackend, "_get_api_key", return_value=key)
+
+    def _patch_requests_post(self, responses: list):
+        """Patch requests.post to return *responses* (dicts) in order."""
+        mock_responses = []
+        for resp_data in responses:
+            r = MagicMock()
+            r.json.return_value = resp_data
+            r.raise_for_status = MagicMock()
+            mock_responses.append(r)
+        return patch("requests.post", side_effect=mock_responses)
+
+    def test_is_llm_backend_subclass(self):
+        assert issubclass(AnthropicBackend, LLMBackend)
+
+    def test_name_includes_model(self):
+        b = AnthropicBackend(model="claude-test-model")
+        assert "claude-test-model" in b.name
+
+    def test_default_model(self):
+        b = AnthropicBackend()
+        assert "haiku" in b.name.lower()
+
+    def test_check_available_no_key(self):
+        b = self._make_backend()
+        with patch.object(b, "_get_api_key", return_value=None):
+            ok, msg = b.check_available()
+        assert not ok
+        assert "api key" in msg.lower()
+
+    def test_check_available_with_key(self):
+        b = self._make_backend()
+        with patch.object(b, "_get_api_key", return_value="sk-ant-test"):
+            ok, msg = b.check_available()
+        assert ok
+        assert msg == ""
+
+    def test_select_release_returns_id(self):
+        """AnthropicBackend returns (release_id, reasoning) on select_release tool use."""
+        api_resp = _make_anthropic_response(tool_uses=[{
+            "id":    "tu1",
+            "name":  "select_release",
+            "input": {"release_id": 55555, "reasoning": "Matched by title"},
+        }])
+
+        with self._patch_api_key():
+            with self._patch_requests_post([api_resp]):
+                with patch.object(dt_find, "_tool_search_discogs", return_value={"results": []}):
+                    b = self._make_backend()
+                    release_id, reasoning = b.run_agent("Miles Davis blue one")
+        assert release_id == 55555
+        assert reasoning == "Matched by title"
+
+    def test_search_then_select(self):
+        """AnthropicBackend: search first, then select on the second turn."""
+        search_resp = _make_anthropic_response(tool_uses=[{
+            "id":    "tu-search",
+            "name":  "search_discogs",
+            "input": {"q": "Kind of Blue"},
+        }])
+        select_resp = _make_anthropic_response(tool_uses=[{
+            "id":    "tu-select",
+            "name":  "select_release",
+            "input": {"release_id": 777, "reasoning": "Found it"},
+        }])
+        search_result = {"count": 1, "results": [{"id": 777, "artist": "Miles Davis",
+                                                   "title": "Kind of Blue"}]}
+
+        with self._patch_api_key():
+            with self._patch_requests_post([search_resp, select_resp]):
+                with patch.object(dt_find, "_tool_search_discogs", return_value=search_result):
+                    b = self._make_backend()
+                    release_id, _ = b.run_agent("blue Miles Davis record")
+        assert release_id == 777
+
+    def test_text_response_returns_none(self):
+        """If the model responds with plain text (no tool use), return (None, '')."""
+        api_resp = _make_anthropic_response(text_blocks=["I could not find that record."])
+
+        with self._patch_api_key():
+            with self._patch_requests_post([api_resp]):
+                b = self._make_backend()
+                release_id, _ = b.run_agent("something obscure")
+        assert release_id is None
+
+    def test_api_error_returns_none(self):
+        """HTTP errors from the Anthropic API return (None, '') gracefully."""
+        with self._patch_api_key():
+            with patch("requests.post", side_effect=Exception("Network error")):
+                b = self._make_backend()
+                release_id, _ = b.run_agent("test")
+        assert release_id is None
+
+    def test_no_api_key_returns_none(self):
+        """With no API key configured, run_agent returns (None, '') immediately."""
+        with patch.object(AnthropicBackend, "_get_api_key", return_value=None):
+            b = self._make_backend()
+            release_id, _ = b.run_agent("test")
+        assert release_id is None
+
+    def test_unknown_tool_gets_error_result(self):
+        """Unknown tool names receive an error tool_result, not a crash."""
+        bad_resp = _make_anthropic_response(tool_uses=[{
+            "id":    "tu-bad",
+            "name":  "delete_everything",
+            "input": {},
+        }])
+        text_resp = _make_anthropic_response(text_blocks=["Sorry."])
+
+        with self._patch_api_key():
+            with self._patch_requests_post([bad_resp, text_resp]):
+                b = self._make_backend()
+                release_id, _ = b.run_agent("test")
+        assert release_id is None
+
+    def test_get_api_key_reads_env(self, tmp_path, monkeypatch):
+        """_get_api_key falls back to ANTHROPIC_API_KEY env var."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key-123")
+        # Patch userfile to a non-existent path so it skips the JSON file
+        with patch.object(dt_find.util, "userfile", return_value=str(tmp_path / "nope.json")):
+            b = self._make_backend()
+            key = b._get_api_key()
+        assert key == "env-key-123"
+
+    def test_get_api_key_reads_beatport_auth(self, tmp_path):
+        """_get_api_key reads anthropic_api_key from beatport_auth.json."""
+        auth_file = tmp_path / "beatport_auth.json"
+        auth_file.write_text(json.dumps({"anthropic_api_key": "json-key-456"}))
+        with patch.object(dt_find.util, "userfile", return_value=str(auth_file)):
+            b = self._make_backend()
+            key = b._get_api_key()
+        assert key == "json-key-456"
+
+
+# ─── create_backend factory ───────────────────────────────────────────────────
+
+class TestCreateBackend:
+    def test_default_is_local(self):
+        b = create_backend({})
+        assert isinstance(b, LocalLLMBackend)
+
+    def test_backend_local_explicit(self):
+        b = create_backend({"backend": "local"})
+        assert isinstance(b, LocalLLMBackend)
+
+    def test_backend_anthropic(self):
+        b = create_backend({"backend": "anthropic"})
+        assert isinstance(b, AnthropicBackend)
+
+    def test_local_uses_llm_url_and_model(self):
+        b = create_backend({
+            "backend": "local",
+            "llm_url": "http://myserver:8080/v1",
+            "llm_model": "my-custom-model",
+        })
+        assert isinstance(b, LocalLLMBackend)
+        assert "my-custom-model" in b.name
+
+    def test_anthropic_uses_find_anthropic_model(self):
+        b = create_backend({
+            "backend": "anthropic",
+            "find_anthropic_model": "claude-opus-4-6",
+        })
+        assert isinstance(b, AnthropicBackend)
+        assert "claude-opus-4-6" in b.name
+
+    def test_anthropic_default_model_when_not_specified(self):
+        b = create_backend({"backend": "anthropic"})
+        assert isinstance(b, AnthropicBackend)
+        # Should use the default Haiku model
+        assert AnthropicBackend.DEFAULT_MODEL in b.name
+
+    def test_unknown_backend_falls_back_to_local(self):
+        """Unrecognised backend values should default to local (forward compat)."""
+        b = create_backend({"backend": "future-backend"})
+        assert isinstance(b, LocalLLMBackend)

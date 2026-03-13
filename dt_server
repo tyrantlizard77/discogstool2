@@ -57,7 +57,28 @@ def preflight():
 
 @app.route("/status", methods=["GET"])
 def status():
-    return jsonify({"ok": True, "version": "1.0", "beatport": _check_beatport()})
+    return jsonify({
+        "ok":        True,
+        "version":   "1.0",
+        "discogs":   _check_discogs(),
+        "beatport":  _check_beatport(),
+        "anthropic": _check_anthropic(),
+        "llm":       _check_llm(),
+    })
+
+
+def _check_discogs():
+    """Check whether Discogs OAuth tokens are stored and readable."""
+    try:
+        import client_interface
+        token, secret = client_interface.get_user_auth_tokens()
+        if token and secret:
+            return {"status": "ok"}
+        return {"status": "error", "message": "not authenticated"}
+    except ImportError:
+        return {"status": "unavailable"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 def _check_beatport():
@@ -75,6 +96,81 @@ def _check_beatport():
         return {"status": "ok"}
     except beatport.BeatportError as e:
         return {"status": "error", "message": str(e)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def _check_anthropic():
+    """Check whether an Anthropic API key is configured."""
+    try:
+        import os, json
+        import util
+        auth_file = util.userfile("beatport_auth.json")
+        api_key = None
+        if os.path.exists(auth_file):
+            with open(auth_file) as f:
+                data = json.load(f)
+            api_key = data.get("anthropic_api_key")
+        if not api_key:
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            return {"status": "ok"}
+        return {"status": "error", "message": "no API key configured"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def _check_llm():
+    """Check whether the dt_find LLM backend is configured and reachable.
+
+    Reads ~/.discogstool/find_config to determine the active backend
+    (local or anthropic), then verifies the required credentials/connectivity.
+    Returns a status dict with an extra 'backend' key for UI labelling.
+    """
+    try:
+        import json as _json
+        import util
+        config: dict = {}
+        path = util.userfile("find_config")
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        config[k.strip()] = v.strip()
+
+        backend = config.get("backend", "local")
+
+        if backend == "anthropic":
+            # Re-use the same key lookup as _check_anthropic()
+            auth_file = util.userfile("beatport_auth.json")
+            api_key = None
+            if os.path.exists(auth_file):
+                with open(auth_file) as f:
+                    data = _json.load(f)
+                api_key = data.get("anthropic_api_key")
+            if not api_key:
+                api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if api_key:
+                return {"status": "ok", "backend": "anthropic"}
+            return {"status": "error", "message": "no Anthropic API key configured",
+                    "backend": "anthropic"}
+
+        else:  # local OpenAI-compatible server
+            llm_url = config.get("llm_url", "")
+            if not llm_url:
+                return {"status": "error", "message": "no LLM URL configured",
+                        "backend": "local"}
+            try:
+                import requests as _req
+                _req.get(f"{llm_url}/models", timeout=2)
+                return {"status": "ok", "backend": "local"}
+            except Exception as e:
+                return {"status": "error",
+                        "message": f"LLM server unreachable: {e}",
+                        "backend": "local"}
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
