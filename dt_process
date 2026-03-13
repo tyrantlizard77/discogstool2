@@ -51,9 +51,14 @@ worker_config = {
 }
 
 # Format configuration
+# extra_flags: additional ffmpeg output flags inserted before the output path.
+# ALAC: -movflags +faststart relocates the moov atom to the start of the .m4a
+# file.  Without this, ffmpeg writes moov at the end (default MP4 behaviour),
+# and Pioneer CDJ/XDJ firmware (XDJ-1000MK2 onwards) can refuse to play the
+# file from USB because it needs the moov atom before it can open the stream.
 FORMAT_CONFIG = {
-    'aiff': {'ext': '.aiff', 'codec': 'pcm_s16be', 'sample_fmt': 's16'},
-    'alac': {'ext': '.m4a', 'codec': 'alac', 'sample_fmt': 's16p'},
+    'aiff': {'ext': '.aiff', 'codec': 'pcm_s16be', 'sample_fmt': 's16',  'extra_flags': []},
+    'alac': {'ext': '.m4a',  'codec': 'alac',       'sample_fmt': 's16p', 'extra_flags': ['-movflags', '+faststart']},
 }
 
 def worker_init(config):
@@ -151,8 +156,7 @@ def normalize_loudnorm(path, tmpout):
         "-y", "-i", path,
         "-af", loudnorm_filter,
         "-acodec", fmt['codec'], "-sample_fmt", fmt['sample_fmt'], "-ar", "44100",
-        tmpout
-    ]
+    ] + fmt['extra_flags'] + [tmpout]
 
     retval = subprocess.call(cmd)
 
@@ -185,10 +189,11 @@ def process_wav_file(path, outdir, track, copy):
     if worker_config['legacy_normalize']:
         normalize_legacy(path)
         debug(f"Converting to 44.1/16 {worker_config['format'].upper()}...")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "panic",
-                "-y", "-i", path,
-                "-acodec", fmt['codec'], "-sample_fmt", fmt['sample_fmt'], "-ar", "44100",
-                tmpout]
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "panic",
+            "-y", "-i", path,
+            "-acodec", fmt['codec'], "-sample_fmt", fmt['sample_fmt'], "-ar", "44100",
+        ] + fmt['extra_flags'] + [tmpout]
         retval = subprocess.call(cmd)
         if retval:
             raise ConversionException("Encoding failed")
