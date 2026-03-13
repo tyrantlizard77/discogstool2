@@ -133,6 +133,15 @@ _FONT_CANDIDATES = {
         "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ],
+    # CJK fallback — used whenever text contains Japanese/Chinese/Korean characters.
+    # macOS ships Hiragino; Linux typically has Noto CJK.
+    "cjk": [
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ],
 }
 
 _font_path_cache = {}
@@ -155,6 +164,25 @@ def make_font(style, size):
     if path:
         return ImageFont.truetype(path, size)
     return ImageFont.load_default()
+
+
+def _needs_cjk(text):
+    """Return True if text contains CJK, Hiragana, Katakana, or Hangul characters."""
+    return any(
+        0x2E80 <= ord(ch) <= 0x9FFF or  # CJK radicals, Hiragana, Katakana, CJK Unified
+        0xAC00 <= ord(ch) <= 0xD7FF or  # Hangul syllables
+        0xF900 <= ord(ch) <= 0xFAFF     # CJK Compatibility ideographs
+        for ch in text
+    )
+
+
+def _font_for(style, size, text):
+    """Like make_font but upgrades to the CJK font when text requires it."""
+    if _needs_cjk(text):
+        path = _find_font_path("cjk")
+        if path:
+            return ImageFont.truetype(path, size)
+    return make_font(style, size)
 
 
 # ── Track grouping ────────────────────────────────────────────────────────────
@@ -305,17 +333,20 @@ def render_label(release, tracks_with_sides, profile,
     if continuation:
         # Minimal header: artist — title  (continued)
         hdr = f"{release.getArtist().upper()} \u2014 {release.getTitle()}  (continued)"
-        draw.text((M, y), truncate_text(draw, hdr, f_meta, CW), font=f_meta, fill="black")
+        f_hdr = _font_for("regular", 32, hdr)
+        draw.text((M, y), truncate_text(draw, hdr, f_hdr, CW), font=f_hdr, fill="black")
         y += 46
     else:
         # Artist (large bold caps)
         artist_str = truncate_text(draw, release.getArtist().upper(), f_artist, CW)
-        draw.text((M, y), artist_str, font=f_artist, fill="black")
+        f_artist_r = _font_for("bold", 54, artist_str)
+        draw.text((M, y), artist_str, font=f_artist_r, fill="black")
         y += 70
 
         # Release title
         title_str = truncate_text(draw, release.getTitle(), f_title, CW)
-        draw.text((M, y), title_str, font=f_title, fill="black")
+        f_title_r = _font_for("regular", 54, title_str)
+        draw.text((M, y), title_str, font=f_title_r, fill="black")
         y += 70
 
         # Disc indicator for --split labels (immediately below title)
@@ -375,11 +406,16 @@ def render_label(release, tracks_with_sides, profile,
         pos = track["position"]
         draw.text((M, text_y), pos, font=f_pos, fill="black")
 
-        # Title: "Artist \u2013 Title" on compilations, plain title otherwise
+        # Title: "Artist \u2013 Title" on compilations, plain title otherwise.
+        # synthesise=False keeps untitled tracks as-is rather than generating
+        # the "Release Title Position" form that dt_process uses.
         if is_compilation:
-            track_str = f"{track.getArtist()} \u2013 {track.getTitle()}"
+            track_str = f"{track.getArtist()} \u2013 {track.getTitle(synthesise=False)}"
         else:
-            track_str = track.getTitle()
+            track_str = track.getTitle(synthesise=False)
+
+        # Pick a CJK-capable font if the track title requires it.
+        f_track_r = _font_for("regular", 38, track_str)
 
         # Duration suffix — reserve space before truncating the title.
         # Prefer Discogs duration; fall back to Beatport length_ms if absent.
@@ -391,9 +427,9 @@ def render_label(release, tracks_with_sides, profile,
                 _s  = _ms // 1000
                 dur = f"{_s // 60}:{_s % 60:02d}"
         dur_suffix = f" ({dur})" if dur else ""
-        dur_w = draw.textlength(dur_suffix, font=f_track) if dur_suffix else 0
-        track_str = truncate_text(draw, track_str, f_track, TITLE_MAX_W - dur_w)
-        draw.text((M + POS_W, text_y), track_str + dur_suffix, font=f_track, fill="black")
+        dur_w = draw.textlength(dur_suffix, font=f_track_r) if dur_suffix else 0
+        track_str = truncate_text(draw, track_str, f_track_r, TITLE_MAX_W - dur_w)
+        draw.text((M + POS_W, text_y), track_str + dur_suffix, font=f_track_r, fill="black")
 
         # BPM zone: print value if known, otherwise leave a blank write zone
         _track_info = bpms.get(track_idx) or {}

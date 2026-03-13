@@ -278,9 +278,9 @@ class DiscogsRelease:
             genres = self.data.get("genres", [])
         return ", ".join(genres)
 
-    def getTitle(self) -> str:
+    def getTitle(self, synthesise: bool = True) -> str:
         rt = self.data["title"]
-        if not rt.startswith("Untitled"):
+        if not rt.startswith("Untitled") or not synthesise:
             return rt
 
         return self.getCatno()
@@ -377,9 +377,9 @@ class DiscogsTrack:
             artiststr = "%s / %s" % (artiststr, artist.get("name", ""))
         return artiststr.strip()
 
-    def getTitle(self) -> str:
+    def getTitle(self, synthesise: bool = True) -> str:
         t = self.tdata["title"]
-        if not t.startswith("Untitled"):
+        if not t.startswith("Untitled") or not synthesise:
             return t
 
         return "%s %s" % (self.release.getTitle(), self.tdata["position"])
