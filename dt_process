@@ -459,12 +459,19 @@ def main():
 
         if split_wavs:
             print("Split multi-track .wav files...")
-            # Splitting is I/O bound and uses numpy, run sequentially
-            result = []
-            for path, td, releaseid in split_wavs:
-                result.append(split_wav_file(path, td, releaseid))
+            n = min(args.jobs, len(split_wavs))
+            if n > 1:
+                with multiprocessing.get_context("spawn").Pool(
+                        n,
+                        initializer=worker_init,
+                        initargs=(worker_config,)) as p:
+                    results = list(tqdm.tqdm(
+                        p.imap_unordered(poolsplit, split_wavs),
+                        total=len(split_wavs)))
+            else:
+                results = [split_wav_file(*split_wavs[0])]
 
-            for res in result:
+            for res in results:
                 tracks.extend(res)
 
         for path in files:
