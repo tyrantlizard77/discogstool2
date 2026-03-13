@@ -129,11 +129,25 @@ def normalize_loudnorm(path, tmpout):
         raise ConversionException(f"Failed to parse loudnorm JSON: {e}")
 
     if stats.get('normalization_type') == 'dynamic':
-        # Linear mode wasn't achievable (gain would have caused true-peak
-        # clipping), so loudnorm fell back to dynamic compression.  Warn so
-        # this doesn't go unnoticed — dynamic mode alters the audio character.
-        print(f"WARNING: loudnorm fell back to dynamic mode for {path} "
-              "(linear normalization would clip; dynamic compression applied)")
+        # Linear mode wasn't achievable — applying the required gain would push
+        # the true peak above -1 dBTP.  Rather than accept dynamic compression
+        # (which alters transients and audio character), fall back to simple
+        # peak normalization which only scales the whole file by a constant
+        # factor and never reshapes the waveform.
+        print(f"WARNING: loudnorm linear mode would clip for {path}; "
+              "falling back to peak normalization to preserve audio dynamics")
+        fmt = FORMAT_CONFIG[worker_config['format']]
+        normalize_legacy(path)   # modifies path in-place; path is always a temp file here
+        debug(f"Converting peak-normalized file to 44.1/16 {worker_config['format'].upper()}...")
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "panic",
+            "-y", "-i", path,
+            "-acodec", fmt['codec'], "-sample_fmt", fmt['sample_fmt'], "-ar", "44100",
+        ] + fmt['extra_flags'] + [tmpout]
+        retval = subprocess.call(cmd)
+        if retval:
+            raise ConversionException("Peak normalization encoding failed")
+        return
 
     debug("Loudness stats:", stats)
 
