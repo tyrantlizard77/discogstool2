@@ -1,3 +1,37 @@
+"""SQLite cache for Discogs API responses.
+
+Storage layout
+--------------
+Database file: ~/.discogstool/discogs.db
+
+Tables:
+  responses   General-purpose key/value cache.  Keys are repr() of the
+              Python object passed to get()/put() (strings get extra quotes,
+              so the string "release-123" is stored as "'release-123'").
+              Values are pickled with the highest available protocol.
+              TTL is enforced by the caller via DiscogsDatabase(max_age=N);
+              stale entries are deleted on read rather than purged proactively.
+
+  posted      Price history for Discogs marketplace listings.  Each row is a
+              snapshot (date, price, sales stats) for a single release ID.
+              Multiple rows per release accumulate over time; callers use
+              get_last_posted() to retrieve the most recent snapshot within
+              an optional age window.
+
+Concurrency
+-----------
+db_lock (multiprocessing.Lock) is held during __init__ to serialise schema
+creation.  Reads and writes are otherwise unsynchronised at the Python level;
+WAL journal mode (set on every connection) lets SQLite handle concurrent
+readers safely without exclusive locks.
+
+Pickle protocol
+---------------
+pickle.HIGHEST_PROTOCOL is used for efficiency.  This means the cache file
+is not portable across Python major versions, but that is acceptable for a
+local developer cache that can be regenerated on demand.
+"""
+
 from __future__ import annotations
 
 import sqlite3
@@ -11,22 +45,37 @@ db_lock = multiprocessing.Lock()
 
 
 def data2blob(data: object) -> sqlite3.Binary:
+    """Serialize an arbitrary Python object to a SQLite BLOB via pickle."""
     return sqlite3.Binary(pickle.dumps(data, pickle.HIGHEST_PROTOCOL))
 
 
 def blob2data(blob: bytes) -> object:
+    """Deserialize a pickled BLOB back to a Python object."""
     return pickle.loads(blob)  # type: ignore[no-untyped-call]
 
 
 def get_ts() -> str:
+    """Return today's date as an ISO-8601 string (YYYY-MM-DD)."""
     return str(datetime.date.today())
 
 
 def ts_age(ts: str) -> int:
+    """Return the number of days elapsed since the given ISO-8601 date string."""
     d = datetime.date(*[int(i) for i in ts.split("-")])
     return (datetime.date.today() - d).days
 
 class DiscogsDatabase:
+    """Persistent SQLite cache for Discogs API responses.
+
+    Each instance opens (or creates) ~/.discogstool/discogs.db.  Cached
+    entries older than max_age days are treated as stale: getData() in
+    client_interface.py deletes and re-fetches them.
+
+    The database is opened in WAL mode so that multiple reader processes
+    (dt_process worker pool) can query concurrently without blocking each
+    other or the writer.
+    """
+
     conn: sqlite3.Connection
     max_age: int
 
@@ -40,6 +89,8 @@ class DiscogsDatabase:
 
             # maximum data age
             self.max_age = max_age
+
+            self.conn.execute("PRAGMA journal_mode=WAL")
 
             if create_flag:
                 print("Creating new database.")
@@ -62,6 +113,11 @@ class DiscogsDatabase:
                 self.conn.commit()
 
     def get(self, key: object) -> object | None:
+        """Return the cached value for key, or None if not present.
+
+        The age of the entry is NOT checked here; callers are responsible for
+        calling delete() and re-fetching when ts_age(entry) > self.max_age.
+        """
         c = self.conn.cursor()
         c.execute("SELECT * FROM responses where key=?", (repr(key),))
         r = c.fetchone()
@@ -70,16 +126,18 @@ class DiscogsDatabase:
         return blob2data(r["data"])
 
     def delete(self, key: object) -> None:
+        """Remove a cached entry by key (no-op if not present)."""
         c = self.conn.cursor()
         c.execute("DELETE FROM responses where key=?", (repr(key),))
         self.conn.commit()
 
     def put(self, key: object, value: object) -> None:
+        """Insert or replace the cached value for key, stamped with today's date."""
         c = self.conn.cursor()
         key_str = repr(key)
         b = data2blob(value)
         ts = get_ts()
-        c.execute("INSERT INTO responses VALUES (?,?,?)", (key_str, ts, b))
+        c.execute("INSERT OR REPLACE INTO responses VALUES (?,?,?)", (key_str, ts, b))
         self.conn.commit()
 
     def get_posted(self, releaseid: int) -> list[sqlite3.Row]:

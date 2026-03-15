@@ -189,3 +189,64 @@ class TestForceStereo:
         finally:
             os.unlink(path)
         assert data_out.shape[1] == 2
+
+
+# ─── Malformed / truncated files ──────────────────────────────────────────────
+
+class TestMalformedFiles:
+    def test_not_a_wav_file(self):
+        """Reading random bytes raises ValueError (not a WAV file)."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(b"not a wav file at all")
+            path = f.name
+        try:
+            with pytest.raises(ValueError, match="Not a WAV file"):
+                wavfile.read(path)
+        finally:
+            os.unlink(path)
+
+    def test_truncated_after_riff_header(self):
+        """A file truncated right after the RIFF header returns empty data (no crash)."""
+        import struct
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            # Write a valid RIFF/WAVE header (12 bytes) but nothing after
+            f.write(b"RIFF")
+            f.write(struct.pack("<I", 100))  # claimed size
+            f.write(b"WAVE")
+            path = f.name
+        try:
+            # Should complete without crash (returns empty data — no fmt/data chunks)
+            rate, data, bits = wavfile.read(path)
+            assert len(data) == 0
+        finally:
+            os.unlink(path)
+
+    def test_truncated_cue_chunk_raises(self):
+        """A cue chunk that is too short raises ValueError."""
+        import struct
+        import numpy
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+
+        try:
+            # Write a valid WAV first
+            data = numpy.zeros(100, dtype=numpy.int16)
+            wavfile.write(path, 44100, data)
+
+            with open(path, "rb") as f:
+                original = f.read()
+
+            # Append a cue chunk that claims 2 cues but has no data
+            patched = original + b"cue " + struct.pack("<II", 52, 2)  # says 2 cues, no data
+            # Adjust the RIFF size
+            new_size = len(patched) - 8
+            patched = patched[:4] + struct.pack("<I", new_size) + patched[8:]
+
+            with open(path, "wb") as f:
+                f.write(patched)
+
+            with pytest.raises((ValueError, struct.error)):
+                wavfile.read(path)
+        finally:
+            os.unlink(path)

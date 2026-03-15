@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""dt_collection — Compare local audio files against a Discogs collection.
+
+Scans one or more base directories for audio files tagged with Discogs
+release IDs, then cross-references them against a Discogs collection XML
+export to produce three optional reports:
+
+  --missing           Files found locally whose release is NOT in the
+                      Discogs collection.
+  --discogs-missing   Releases in the Discogs collection not found locally.
+  --partially-recorded  Releases where only some tracks have been recorded.
+
+Usage:
+    dt_collection [options] DIRECTORY [DIRECTORY ...]
+
+Additional options:
+    -u / --update-metadata   Re-fetch and re-embed Discogs metadata for all
+                             found files (skipped with --dry-run).
+    -c / --collection FILE   Path to a Discogs collection XML export.
+    -Y / --min-year YEAR     Ignore releases older than the given year.
+    -v / --verbose           Print each release and file as it is scanned.
+"""
 
 import argparse
 import sys
@@ -13,6 +34,28 @@ def report_header(text):
     print("-" * len(text))
 
 def collection_report(collection_xml, filelist, args):
+    """Generate collection comparison reports from a Discogs XML export and local files.
+
+    Algorithm
+    ---------
+    1. Parse collection_xml into a list of CollectionItem objects (each has a
+       releaseid).  Build release_map (rid → DiscogsRelease) and
+       duplicate_collection (rid → count) while collecting the de-duplicated
+       collection_rid_set.
+
+    2. Walk filelist (AudioFile objects).  For each file, resolve its
+       Discogs release ID and 0-based track index.  Build file_map
+       (rid → [track_indices]) to track which tracks we have locally.
+       Files whose release ID is not in the collection go into
+       not_in_collection.  Files whose track index is already in file_map
+       go into duplicate_files.
+
+    3. Emit requested reports:
+       - "--missing"            → not_in_collection
+       - "--discogs-missing"    → collection_rid_set − file_rid_set, sorted by year
+       - "--partially-recorded" → releases where file_map[rid] ⊊ range(total_tracks),
+                                listing the missing 1-based track numbers
+    """
     collection = util.parse_collection_xml(collection_xml)
 
     # Map rids to DiscogsRelease objects for easy retrieval
@@ -80,7 +123,6 @@ def collection_report(collection_xml, filelist, args):
 
     if args.all_reports or args.discogs_missing:
         report_header("Releases in Discogs not found locally")
-        print(file_rid_set)
         to_record = collection_rid_set - file_rid_set
         names = sorted(["%s %s" % (release_map[rid].getYear(), str(release_map[rid]))
                  for rid in to_record])
@@ -97,7 +139,7 @@ def collection_report(collection_xml, filelist, args):
             missing_tracks = release_tracks - tracks_set
             if missing_tracks:
                 partially_recorded.append("%s missing %s" % (release_map[rid],
-                        [i + i for i in missing_tracks]))
+                        [i + 1 for i in missing_tracks]))
 
         partially_recorded.sort()
         for n in partially_recorded:

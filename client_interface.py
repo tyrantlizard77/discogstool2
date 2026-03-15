@@ -13,7 +13,7 @@ import urllib.request, urllib.error, urllib.parse
 import sys
 import multiprocessing
 import threading
-import ctypes
+import hashlib
 import io
 from typing import TypeAlias, TypedDict, cast
 from PIL import Image
@@ -88,8 +88,13 @@ def get_user_auth_tokens() -> tuple[str, str] | tuple[None, None]:
         try:
             with open(discogs_auth, "r") as fp:
                 token, secret = fp.read().split("|")
-        except Exception:
+        except ValueError:
+            # File exists but content is malformed (e.g. missing '|' separator).
+            # Delete it so the next run triggers a fresh OAuth flow.
             os.unlink(discogs_auth)
+            return None, None
+        except OSError:
+            # Transient I/O error — don't delete the file, just return no tokens.
             return None, None
         return str(token), str(secret)
     else:
@@ -97,7 +102,11 @@ def get_user_auth_tokens() -> tuple[str, str] | tuple[None, None]:
 
 
 def set_user_auth_tokens(token: str, secret: str) -> None:
-    with open(discogs_auth, "w") as fp:
+    # Open with O_CREAT|O_WRONLY and mode 0o600 so the file is never
+    # world-readable, even transiently.  This avoids a race between write
+    # and a subsequent chmod call.
+    fd = os.open(discogs_auth, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fp:
         fp.write("%s|%s" % (token, secret))
 
 
@@ -294,7 +303,10 @@ class DiscogsRelease:
             return None
 
         uri = images[0]["uri"]
-        hashuri = hex(ctypes.c_uint64(hash(uri)).value)
+        # MD5 gives a stable, filesystem-safe filename for the cache.
+        # hash() is explicitly avoided: it is randomised by PYTHONHASHSEED,
+        # so using it would orphan cached files on every interpreter restart.
+        hashuri = hashlib.md5(uri.encode()).hexdigest()
 
         with discogs_lock:
             if os.path.exists(util.userfile(hashuri)):

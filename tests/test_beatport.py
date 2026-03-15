@@ -479,6 +479,15 @@ class TestParseLLMResponse:
         result = LLMMatcher._parse_llm_response("")
         assert result is None
 
+    def test_nested_json_does_not_break_parse(self):
+        # The old r'\{[^}]+\}' regex would fail on nested braces; raw_decode handles them.
+        result = LLMMatcher._parse_llm_response(
+            '{"beatport_id": "42", "confidence": 0.9, "meta": {"extra": "value"}}'
+        )
+        assert result is not None
+        assert result[0] == "42"
+        assert result[1] == pytest.approx(0.9)
+
     def test_confidence_type_coercion(self):
         # confidence given as string (edge case)
         result = LLMMatcher._parse_llm_response(
@@ -528,6 +537,15 @@ class TestAnthropicMatcherParseResponse:
 
     def test_malformed_json_returns_none(self):
         assert AnthropicMatcher._parse_response("{bad json}") is None
+
+    def test_nested_json_does_not_break_parse(self):
+        # The old r'\{[^}]+\}' regex would fail on nested braces; raw_decode handles them.
+        result = AnthropicMatcher._parse_response(
+            '{"beatport_id": "77", "confidence": 0.95, "debug": {"reason": "catno match"}}'
+        )
+        assert result is not None
+        assert result[0] == "77"
+        assert result[1] == pytest.approx(0.95)
 
 
 class TestAnthropicMatcherAvailability:

@@ -1026,18 +1026,22 @@ Respond with ONLY the JSON object, no other text."""
     @staticmethod
     def _parse_llm_response(text: str) -> tuple[str | None, float] | None:
         """Extract (beatport_id, confidence) from LLM JSON response."""
-        # Find JSON object in the response (LLM may include extra text)
-        match = re.search(r'\{[^}]+\}', text, re.DOTALL)
-        if not match:
+        # Use raw_decode to find the first valid JSON object (handles nested
+        # braces correctly, unlike the previous r'\{[^}]+\}' regex).
+        decoder = json.JSONDecoder()
+        idx = text.find("{")
+        if idx == -1:
+            log.warning("LLMMatcher: no JSON object found in response")
             return None
         try:
-            data = json.loads(match.group())
+            data, _ = decoder.raw_decode(text, idx)
             bid = data.get("beatport_id")
             conf = float(data.get("confidence", 0.0))
             if bid is None:
                 return None, 0.0
             return str(bid), conf
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            log.warning("LLMMatcher: failed to parse JSON response: %s", e)
             return None
 
 
@@ -1273,17 +1277,22 @@ or if no match:
     @staticmethod
     def _parse_response(text: str) -> tuple[str | None, float] | None:
         """Extract (beatport_id, confidence) from the model's JSON response."""
-        match = re.search(r'\{[^}]+\}', text, re.DOTALL)
-        if not match:
+        # Use raw_decode to find the first valid JSON object (handles nested
+        # braces correctly, unlike the previous r'\{[^}]+\}' regex).
+        decoder = json.JSONDecoder()
+        idx = text.find("{")
+        if idx == -1:
+            log.warning("AnthropicMatcher: no JSON object found in response")
             return None
         try:
-            data = json.loads(match.group())
+            data, _ = decoder.raw_decode(text, idx)
             bid = data.get("beatport_id")
             conf = float(data.get("confidence", 0.0))
             if bid is None:
                 return None, 0.0
             return str(bid), conf
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            log.warning("AnthropicMatcher: failed to parse JSON response: %s", e)
             return None
 
 
