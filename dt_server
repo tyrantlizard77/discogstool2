@@ -67,18 +67,27 @@ def status():
     })
 
 
-def _check_discogs():
-    """Check whether Discogs OAuth tokens are stored and readable."""
+def _check_service(fn):
+    """Call fn(); translate ImportError → unavailable, other exceptions → error."""
     try:
-        import client_interface
-        token, secret = client_interface.get_user_auth_tokens()
-        if token and secret:
-            return {"status": "ok"}
-        return {"status": "error", "message": "not authenticated"}
+        return fn()
     except ImportError:
         return {"status": "unavailable"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def _check_discogs():
+    """Check whether Discogs OAuth tokens are stored and readable."""
+    return _check_service(_do_check_discogs)
+
+
+def _do_check_discogs():
+    import client_interface
+    token, secret = client_interface.get_user_auth_tokens()
+    if token and secret:
+        return {"status": "ok"}
+    return {"status": "error", "message": "not authenticated"}
 
 
 def _check_beatport():
@@ -87,37 +96,34 @@ def _check_beatport():
     Calls get_client(), which auto-refreshes the OAuth token if the stored
     username/password are still valid.  Returns a status dict.
     """
-    try:
-        import beatport
-    except ImportError:
-        return {"status": "unavailable"}
-    try:
-        beatport.get_client()
-        return {"status": "ok"}
-    except beatport.BeatportError as e:
-        return {"status": "error", "message": str(e)}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    return _check_service(_do_check_beatport)
+
+
+def _do_check_beatport():
+    import beatport
+    beatport.get_client()
+    return {"status": "ok"}
 
 
 def _check_anthropic():
     """Check whether an Anthropic API key is configured."""
-    try:
-        import os, json
-        import util
-        auth_file = util.userfile("beatport_auth.json")
-        api_key = None
-        if os.path.exists(auth_file):
-            with open(auth_file) as f:
-                data = json.load(f)
-            api_key = data.get("anthropic_api_key")
-        if not api_key:
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if api_key:
-            return {"status": "ok"}
-        return {"status": "error", "message": "no API key configured"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    return _check_service(_do_check_anthropic)
+
+
+def _do_check_anthropic():
+    import json
+    import util
+    auth_file = util.userfile("beatport_auth.json")
+    api_key = None
+    if os.path.exists(auth_file):
+        with open(auth_file) as f:
+            data = json.load(f)
+        api_key = data.get("anthropic_api_key")
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return {"status": "ok"}
+    return {"status": "error", "message": "no API key configured"}
 
 
 def _check_llm():
@@ -127,52 +133,52 @@ def _check_llm():
     (local or anthropic), then verifies the required credentials/connectivity.
     Returns a status dict with an extra 'backend' key for UI labelling.
     """
-    try:
-        import json as _json
-        import util
-        config: dict = {}
-        path = util.userfile("find_config")
-        if os.path.exists(path):
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if "=" in line and not line.startswith("#"):
-                        k, v = line.split("=", 1)
-                        config[k.strip()] = v.strip()
+    return _check_service(_do_check_llm)
 
-        backend = config.get("backend", "local")
 
-        if backend == "anthropic":
-            # Re-use the same key lookup as _check_anthropic()
-            auth_file = util.userfile("beatport_auth.json")
-            api_key = None
-            if os.path.exists(auth_file):
-                with open(auth_file) as f:
-                    data = _json.load(f)
-                api_key = data.get("anthropic_api_key")
-            if not api_key:
-                api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if api_key:
-                return {"status": "ok", "backend": "anthropic"}
-            return {"status": "error", "message": "no Anthropic API key configured",
-                    "backend": "anthropic"}
+def _do_check_llm():
+    import json as _json
+    import util
+    config: dict = {}
+    path = util.userfile("find_config")
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    config[k.strip()] = v.strip()
 
-        else:  # local OpenAI-compatible server
-            llm_url = config.get("llm_url", "")
-            if not llm_url:
-                return {"status": "error", "message": "no LLM URL configured",
-                        "backend": "local"}
-            try:
-                import requests as _req
-                _req.get(f"{llm_url}/models", timeout=2)
-                return {"status": "ok", "backend": "local"}
-            except Exception as e:
-                return {"status": "error",
-                        "message": f"LLM server unreachable: {e}",
-                        "backend": "local"}
+    backend = config.get("backend", "local")
 
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    if backend == "anthropic":
+        # Re-use the same key lookup as _do_check_anthropic()
+        auth_file = util.userfile("beatport_auth.json")
+        api_key = None
+        if os.path.exists(auth_file):
+            with open(auth_file) as f:
+                data = _json.load(f)
+            api_key = data.get("anthropic_api_key")
+        if not api_key:
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            return {"status": "ok", "backend": "anthropic"}
+        return {"status": "error", "message": "no Anthropic API key configured",
+                "backend": "anthropic"}
+
+    else:  # local OpenAI-compatible server
+        llm_url = config.get("llm_url", "")
+        if not llm_url:
+            return {"status": "error", "message": "no LLM URL configured",
+                    "backend": "local"}
+        try:
+            import requests as _req
+            _req.get(f"{llm_url}/models", timeout=2)
+            return {"status": "ok", "backend": "local"}
+        except Exception as e:
+            return {"status": "error",
+                    "message": f"LLM server unreachable: {e}",
+                    "backend": "local"}
 
 
 @app.route("/preview/<path:filename>", methods=["GET"])

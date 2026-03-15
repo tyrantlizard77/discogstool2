@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -30,6 +32,8 @@ _loader.exec_module(dt_process)
 get_possible_positions        = dt_process.get_possible_positions
 get_wav_regions               = dt_process.get_wav_regions
 get_wav_regions_from_markers  = dt_process.get_wav_regions_from_markers
+normalize_loudnorm            = dt_process.normalize_loudnorm
+ConversionException           = dt_process.ConversionException
 
 
 # ─── get_possible_positions ───────────────────────────────────────────────────
@@ -181,3 +185,77 @@ class TestGetWavRegionsFromMarkers:
         markers = [self._marker(start, length)]
         regions = get_wav_regions_from_markers(markers, self.RATE * 200, self.RATE, min_len=10)
         assert regions[0] == (start, start + length)
+
+
+# ─── normalize_loudnorm ───────────────────────────────────────────────────────
+
+class TestNormalizeLoudnorm:
+    """Tests for the two-pass EBU R128 normalize_loudnorm() function.
+
+    All subprocess calls are mocked so no real ffmpeg is required.
+    """
+
+    def _pass1_result(self, normalization_type: str = "linear") -> MagicMock:
+        """Return a fake subprocess.run result for loudnorm pass 1."""
+        stats = {
+            "input_i":            "-20.00",
+            "input_tp":           "-10.00",
+            "input_lra":          "5.00",
+            "input_thresh":       "-30.00",
+            "output_i":           "-14.00",
+            "output_tp":          "-1.00",
+            "output_lra":         "5.00",
+            "output_thresh":      "-24.00",
+            "normalization_type": normalization_type,
+            "target_offset":      "-0.50",
+        }
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = f"[Parsed_loudnorm_0 @ 0x0]\n{json.dumps(stats)}\n"
+        return result
+
+    def test_two_pass_happy_path(self):
+        """Pass 1 returns linear stats; pass 2 ffmpeg is called with linear=true."""
+        with patch("subprocess.run", return_value=self._pass1_result("linear")), \
+             patch("subprocess.call", return_value=0) as mock_call:
+            normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")
+
+        # Verify pass 2 included linear=true in the loudnorm filter argument
+        call_args = mock_call.call_args[0][0]
+        assert any("linear=true" in arg for arg in call_args)
+
+    def test_dynamic_fallback_to_peak(self):
+        """When normalization_type=dynamic, normalize_legacy is called instead."""
+        with patch("subprocess.run", return_value=self._pass1_result("dynamic")), \
+             patch.object(dt_process, "normalize_legacy") as mock_legacy, \
+             patch("subprocess.call", return_value=0):
+            normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")
+
+        mock_legacy.assert_called_once_with("/tmp/input.wav")
+
+    def test_pass1_failure_raises(self):
+        """Non-zero returncode from pass 1 raises ConversionException."""
+        result = MagicMock()
+        result.returncode = 1
+        result.stderr = ""
+        with patch("subprocess.run", return_value=result):
+            with pytest.raises(ConversionException, match="pass 1 failed"):
+                normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")
+
+    def test_no_loudnorm_marker_raises(self):
+        """Missing [Parsed_loudnorm marker in pass 1 output raises ConversionException."""
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = "Some output without the marker\n{}\n"
+        with patch("subprocess.run", return_value=result):
+            with pytest.raises(ConversionException, match="loudnorm stats not found"):
+                normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")
+
+    def test_malformed_json_raises(self):
+        """[Parsed_loudnorm present but broken JSON raises ConversionException."""
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = "[Parsed_loudnorm_0 @ 0x0]\n{not valid json\n"
+        with patch("subprocess.run", return_value=result):
+            with pytest.raises(ConversionException, match="Failed to parse loudnorm"):
+                normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")

@@ -219,48 +219,25 @@ TOOLS = [
     },
 ]
 
-# Anthropic native tool format (used by AnthropicBackend)
-ANTHROPIC_TOOLS: list[dict] = [
-    {
-        "name": "search_discogs",
-        "description": (
-            "Search the Discogs database for vinyl releases. "
-            "You may call this multiple times with different parameters. "
-            "Returns up to 8 matching releases with id, artist, title, "
-            "label, catno, year, format, and country."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "q":      {"type": "string", "description": "Free-text query (e.g. 'Miles Davis Kind of Blue')"},
-                "artist": {"type": "string", "description": "Artist name"},
-                "title":  {"type": "string", "description": "Release/album title"},
-                "label":  {"type": "string", "description": "Record label name"},
-                "year":   {"type": "string", "description": "Release year"},
-                "catno":  {"type": "string", "description": "Catalog number"},
-                "format": {"type": "string", "description": "Format filter, e.g. 'Vinyl' or 'LP'"},
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "select_release",
-        "description": (
-            "Call this when you have identified the correct Discogs release. "
-            "Only call it when you are genuinely confident — false positives "
-            "waste label stock. If you cannot find a confident match after "
-            "several searches, say so in text instead."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "release_id": {"type": "integer", "description": "The numeric Discogs release ID"},
-                "reasoning":  {"type": "string",  "description": "Brief explanation of why this is the right release"},
-            },
-            "required": ["release_id", "reasoning"],
-        },
-    },
-]
+def _openai_to_anthropic(tools: list[dict]) -> list[dict]:
+    """Convert OpenAI-format tool definitions to Anthropic native format.
+
+    OpenAI format: {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
+    Anthropic format: {"name": ..., "description": ..., "input_schema": ...}
+    """
+    result = []
+    for t in tools:
+        fn = t["function"]
+        result.append({
+            "name": fn["name"],
+            "description": fn["description"],
+            "input_schema": fn["parameters"],
+        })
+    return result
+
+
+# Anthropic native tool format (generated from TOOLS above)
+ANTHROPIC_TOOLS: list[dict] = _openai_to_anthropic(TOOLS)
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────

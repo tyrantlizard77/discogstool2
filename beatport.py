@@ -677,6 +677,82 @@ class ReleaseMatcher(ABC):
     #: Human-readable name used in cache records and log messages
     name: str = "unknown"
 
+    def _score_candidates(
+        self,
+        results: list[dict],
+        catno: str,
+        title: str,
+        year: str,
+        matcher_name: str,
+    ) -> tuple[str | None, float]:
+        """Score a list of Beatport search results and return the best match.
+
+        Shared implementation used by CatnoMatcher and TitleMatcher to avoid
+        duplicating the year-gate and scoring logic.
+
+        Parameters
+        ----------
+        results:
+            List of Beatport search result dicts (from _BeatportClient.search_releases).
+        catno, title, year:
+            Discogs release metadata for comparison.
+        matcher_name:
+            Human-readable name for log messages (e.g. "CatnoMatcher").
+
+        Returns
+        -------
+        (beatport_id, score) — best matching candidate, or (None, 0.0).
+        """
+        best_id: str | None = None
+        best_score: float = 0.0
+        for r in results:
+            bp_catno = r.get("catalog_number") or ""
+            bp_title = r.get("name") or ""
+            bp_year = None
+            if r.get("publish_date"):
+                try:
+                    bp_year = int(str(r["publish_date"])[:4])
+                except (ValueError, TypeError):
+                    pass
+
+            c_sim = _catno_similarity(catno, bp_catno)
+            t_sim = _title_similarity(title, bp_title)
+
+            log.debug(
+                "%s: candidate [%s] catno=%r c_sim=%.2f t_sim=%.2f",
+                matcher_name, r.get("id"), bp_catno, c_sim, t_sim,
+            )
+
+            # Year gate: hard-reject beyond YEAR_HARD_MAX, soft-penalise within it
+            year_penalty = 1.0
+            if year and bp_year:
+                year_diff = abs(int(year) - bp_year)
+                if year_diff > YEAR_HARD_MAX:
+                    log.debug(
+                        "%s: year mismatch discogs=%s beatport=%s, skipping",
+                        matcher_name, year, bp_year,
+                    )
+                    continue
+                elif year_diff > 0:
+                    year_penalty = YEAR_PENALTY_FACTOR ** year_diff
+                    log.debug(
+                        "%s: year soft penalty %.2f (diff=%d, discogs=%s beatport=%s)",
+                        matcher_name, year_penalty, year_diff, year, bp_year,
+                    )
+
+            # Score: catno similarity is primary, title is secondary
+            if c_sim >= CATNO_MIN_SCORE:
+                score = (c_sim * 0.7 + t_sim * 0.3) * year_penalty
+            elif c_sim >= 0.5 and t_sim >= TITLE_MIN_SCORE:
+                score = (c_sim * 0.4 + t_sim * 0.6) * year_penalty
+            else:
+                continue  # not a viable candidate
+
+            if score > best_score:
+                best_score = score
+                best_id = str(r["id"])
+        return best_id, best_score
+
     @abstractmethod
     def find_release(
         self,
@@ -743,56 +819,10 @@ class CatnoMatcher(ReleaseMatcher):
                 log.debug("CatnoMatcher: search error for %r: %s", query, e)
                 continue
 
-            for r in results:
-                bp_catno = r.get("catalog_number") or ""
-                bp_title = r.get("name") or ""
-                bp_year = None
-                if r.get("publish_date"):
-                    try:
-                        bp_year = int(str(r.get("publish_date", ""))[:4])
-                    except (ValueError, TypeError):
-                        pass
-
-                c_sim = _catno_similarity(catno, bp_catno)
-                t_sim = _title_similarity(title, bp_title)
-
-                log.debug(
-                    "CatnoMatcher: candidate [%s] catno=%r c_sim=%.2f t_sim=%.2f",
-                    r.get("id"),
-                    bp_catno,
-                    c_sim,
-                    t_sim,
-                )
-
-                # Year gate: hard-reject beyond YEAR_HARD_MAX, soft-penalise within it
-                year_penalty = 1.0
-                if year and bp_year:
-                    year_diff = abs(int(year) - bp_year)
-                    if year_diff > YEAR_HARD_MAX:
-                        log.debug(
-                            "CatnoMatcher: year mismatch discogs=%s beatport=%s, skipping",
-                            year,
-                            bp_year,
-                        )
-                        continue
-                    elif year_diff > 0:
-                        year_penalty = YEAR_PENALTY_FACTOR ** year_diff
-                        log.debug(
-                            "CatnoMatcher: year soft penalty %.2f (diff=%d, discogs=%s beatport=%s)",
-                            year_penalty, year_diff, year, bp_year,
-                        )
-
-                # Score: catno similarity is primary, title is secondary
-                if c_sim >= CATNO_MIN_SCORE:
-                    score = (c_sim * 0.7 + t_sim * 0.3) * year_penalty
-                elif c_sim >= 0.5 and t_sim >= TITLE_MIN_SCORE:
-                    score = (c_sim * 0.4 + t_sim * 0.6) * year_penalty
-                else:
-                    continue  # not a viable candidate
-
-                if score > best_score:
-                    best_score = score
-                    best_id = str(r["id"])
+            bid, score = self._score_candidates(results, catno, title, year, "CatnoMatcher")
+            if score > best_score:
+                best_score = score
+                best_id = bid
 
             if best_id:
                 break  # don't try fallback query if first worked
@@ -849,51 +879,10 @@ class TitleMatcher(ReleaseMatcher):
                 log.debug("TitleMatcher: search error for %r: %s", query, e)
                 continue
 
-            for r in results:
-                bp_catno = r.get("catalog_number") or ""
-                bp_title = r.get("name")            or ""
-                bp_year  = None
-                if r.get("publish_date"):
-                    try:
-                        bp_year = int(str(r.get("publish_date", ""))[:4])
-                    except (ValueError, TypeError):
-                        pass
-
-                c_sim = _catno_similarity(catno, bp_catno)
-                t_sim = _title_similarity(title, bp_title)
-
-                log.debug(
-                    "TitleMatcher: candidate [%s] catno=%r c_sim=%.2f t_sim=%.2f",
-                    r.get("id"), bp_catno, c_sim, t_sim,
-                )
-
-                # Year gate: hard-reject beyond YEAR_HARD_MAX, soft-penalise within it
-                year_penalty = 1.0
-                if year and bp_year:
-                    year_diff = abs(int(year) - bp_year)
-                    if year_diff > YEAR_HARD_MAX:
-                        log.debug(
-                            "TitleMatcher: year mismatch discogs=%s beatport=%s, skipping",
-                            year, bp_year,
-                        )
-                        continue
-                    elif year_diff > 0:
-                        year_penalty = YEAR_PENALTY_FACTOR ** year_diff
-                        log.debug(
-                            "TitleMatcher: year soft penalty %.2f (diff=%d, discogs=%s beatport=%s)",
-                            year_penalty, year_diff, year, bp_year,
-                        )
-
-                if c_sim >= CATNO_MIN_SCORE:
-                    score = (c_sim * 0.7 + t_sim * 0.3) * year_penalty
-                elif c_sim >= 0.5 and t_sim >= TITLE_MIN_SCORE:
-                    score = (c_sim * 0.4 + t_sim * 0.6) * year_penalty
-                else:
-                    continue
-
-                if score > best_score:
-                    best_score = score
-                    best_id    = str(r["id"])
+            bid, score = self._score_candidates(results, catno, title, year, "TitleMatcher")
+            if score > best_score:
+                best_score = score
+                best_id = bid
 
             if best_id:
                 break
@@ -1466,18 +1455,47 @@ class BeatportMatcher:
     -----
         matcher = BeatportMatcher()
         bpms = matcher.find_bpms(discogs_release)
-        # bpms: {discogs_track_index: bpm_int} for tracks with known BPM
+        # bpms: {discogs_track_index: {"bpm": int, "duration_ms": int}}
 
-    Matcher priority
-    ----------------
-    Matchers are tried in order.  The first result meeting its confidence
-    threshold is used.  To add a new matching strategy, subclass
-    ReleaseMatcher and pass it in the *matchers* list.
+    Matcher cascade
+    ---------------
+    Matchers are tried in order until one exceeds MIN_RELEASE_CONFIDENCE:
+
+    1. **CatnoMatcher** — searches ``<catno> <artist>`` (and ``<catno>`` alone
+       as a fallback).  Scores by catno similarity (weight 0.7) + title
+       similarity (weight 0.3).  Fastest and most accurate when the catalog
+       number is clean.
+
+    2. **TitleMatcher** — searches ``<title> <artist>`` (and ``<title>``
+       alone).  Same scoring gates as CatnoMatcher.  Used when catno-based
+       search doesn't surface the release (e.g. new or niche labels).
+
+    3. **AnthropicMatcher** — collects candidates from multiple Beatport
+       queries, sends them to Claude Haiku along with the Discogs metadata, and
+       asks it to pick the best match.  Only reached when the cheaper matchers
+       fail, because it makes an API call with cost and latency.
+
+    Year-difference handling
+    ------------------------
+    Digital releases often appear on Beatport later than the vinyl Discogs
+    date.  A year penalty of ``YEAR_PENALTY_FACTOR ** year_diff`` (0.85 per
+    year of difference) is applied to the score.  Candidates beyond
+    ``YEAR_HARD_MAX`` years (3) are hard-rejected.
+
+    Cache behaviour
+    ---------------
+    - Confirmed matches are stored in ``beatport.db`` (``matches`` table)
+      permanently.
+    - Releases with no match are stored in ``nomatches`` and retried after
+      30 days.
+    - Beatport release JSON is cached in ``release_cache`` for 90 days.
 
     False positive protection
     -------------------------
     Even after a confident release match, the track-level coverage gate
     ensures the match makes sense (enough Discogs tracks found on Beatport).
+    The AnthropicMatcher also validates the model's returned ID against the
+    candidate list to prevent hallucinated IDs.
     """
 
     #: Minimum confidence from any matcher to accept a release match

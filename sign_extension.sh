@@ -26,8 +26,12 @@ fi
 
 load_creds() {
     if [[ -f "$AMO_AUTH_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$AMO_AUTH_FILE"
+        while IFS='=' read -r key value; do
+            # Skip blank lines and comments; only accept UPPER_CASE_VAR=value
+            [[ -z "$key" || "$key" == \#* ]] && continue
+            [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+            printf -v "$key" '%s' "$value"
+        done < "$AMO_AUTH_FILE"
     fi
 }
 

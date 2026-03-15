@@ -132,12 +132,16 @@ def process_file(path, outdir, track):
     dest = af.rename_file(outdir, worker_config['verbose'], False, True, False)
     debug("Renamed %s -> %s:" % (path, dest))
 
-# Two-pass EBU R128 loudness normalization using ffmpeg
-# Returns path to normalized file (tmpout)
+# Two-pass EBU R128 loudness normalization using ffmpeg.
+# Pass 1 measures the file; pass 2 applies a single constant gain (linear=true)
+# so the waveform shape is never altered.  Returns path to normalized file (tmpout).
 def normalize_loudnorm(path, tmpout):
     debug("Analyzing loudness (pass 1)...")
 
-    # Pass 1: Analyze the file
+    # Pass 1: Run loudnorm in measurement-only mode.
+    # "-f null -" discards all output; loudnorm writes JSON stats to stderr.
+    # "print_format=json" requests machine-readable output instead of the
+    # default human-readable table.
     result = subprocess.run([
         "ffmpeg", "-hide_banner", "-i", path,
         "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json",
@@ -147,10 +151,9 @@ def normalize_loudnorm(path, tmpout):
     if result.returncode != 0:
         raise ConversionException(f"ffmpeg loudnorm pass 1 failed (exit {result.returncode})")
 
-    # Parse the JSON output from stderr.  ffmpeg loudnorm prints a block that
-    # starts with "[Parsed_loudnorm" and then a { ... } JSON object on the
-    # following lines.  Anchor on that marker so we don't accidentally grab an
-    # earlier { } in the output (e.g. from other filters or future ffmpeg output).
+    # Parse the JSON stats from stderr.  ffmpeg may emit other "{...}" blocks
+    # earlier in the output (e.g. from stream metadata or other filters), so
+    # we anchor on the "[Parsed_loudnorm" marker to find the right one.
     output = result.stderr
     marker = output.find('[Parsed_loudnorm')
     if marker == -1:
@@ -167,11 +170,14 @@ def normalize_loudnorm(path, tmpout):
         raise ConversionException(f"Failed to parse loudnorm JSON: {e}")
 
     if stats.get('normalization_type') == 'dynamic':
-        # Linear mode wasn't achievable — applying the required gain would push
-        # the true peak above -1 dBTP.  Rather than accept dynamic compression
-        # (which alters transients and audio character), fall back to simple
-        # peak normalization which only scales the whole file by a constant
-        # factor and never reshapes the waveform.
+        # loudnorm reports "dynamic" when applying the required gain to reach
+        # I=−14 LUFS would push the true peak above −1 dBTP.  In that case
+        # ffmpeg would apply dynamic compression to stay within the true-peak
+        # ceiling, which alters transients and the audio character.
+        #
+        # We refuse dynamic compression and instead fall back to simple peak
+        # normalization (normalize-audio / normalize), which applies a single
+        # constant scale factor (no reshaping) to bring the peak to 0 dBFS.
         print(f"WARNING: loudnorm linear mode would clip for {path}; "
               "falling back to peak normalization to preserve audio dynamics")
         fmt = FORMAT_CONFIG[worker_config['format']]
@@ -189,7 +195,10 @@ def normalize_loudnorm(path, tmpout):
 
     debug("Loudness stats:", stats)
 
-    # Pass 2: Apply normalization with measured values and convert to output format
+    # Pass 2: Re-run ffmpeg with the measured values fed back as "measured_*"
+    # parameters and "linear=true".  This tells loudnorm to apply a single
+    # constant gain instead of dynamic compression — the waveform shape is
+    # preserved exactly, only the overall level changes.
     fmt = FORMAT_CONFIG[worker_config['format']]
     debug(f"Normalizing and converting to 44.1/16 {worker_config['format'].upper()} (pass 2)...")
 
@@ -297,6 +306,31 @@ def get_wav_regions(markers, rate, min_len):
     return regions
 
 def split_wav_file(path, outdir, releaseid):
+    """Split a multi-track WAV into individual track WAV files.
+
+    Reads region/marker data embedded by Reaper in the WAV chunks and writes
+    one output WAV per track into *outdir*.  Returns a list of
+    (DiscogsTrack, path, extension, copy) tuples for the caller to process.
+
+    Fallback strategy (tried in order until region count == release track count)
+    -----------------------------------------------------------------------------
+    1. smpl loops ≥ 30 s  — Reaper exports regions as smpl chunk loop points.
+                             Minimum 30 s filters out silence/noise between
+                             takes recorded in the same session.
+    2. smpl loops ≥ 6 s   — Retry with shorter minimum, for tracks <30 s.
+    3. ltxt markers ≥ 30 s — Cue points with explicit sample-length data
+                             (ltxt chunk).  Same 30 s minimum.
+    4. ltxt markers ≥ 6 s  — Retry with shorter minimum.
+    5. cue positions ≥ 30 s — Raw cue point positions (no length data); gaps
+                               between consecutive positions are used as region
+                               boundaries.
+    6. cue positions ≥ 6 s  — Retry with shorter minimum.
+                               ("Thanks, Giegling 20 and STL" — both labels
+                               press releases with sub-30-second tracks.)
+
+    If no fallback produces the correct number of regions, a ConversionException
+    is raised describing the mismatch.
+    """
     rel = client_interface.DiscogsRelease(releaseid)
     debug("SPLIT %s (%s)" % (path, rel))
 
@@ -507,6 +541,7 @@ def main():
                         p.imap_unordered(poolsplit, split_wavs),
                         total=len(split_wavs)))
             else:
+                worker_init(worker_config)
                 results = [split_wav_file(*split_wavs[0])]
 
             for res in results:
@@ -542,6 +577,7 @@ def main():
                                         total=len(tracks)))
         else:
             # Single track, no need for pool overhead
+            worker_init(worker_config)
             for trackinfo in tracks:
                 process_track(trackinfo)
 

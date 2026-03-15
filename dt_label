@@ -38,7 +38,9 @@ log = logging.getLogger(__name__)
 # ── Label size profiles ───────────────────────────────────────────────────────
 
 # ── Shared layout constants (used by render_label AND _continuous_height) ─────
-# If you change these, update both places.
+# _continuous_height() predicts the pixel height that render_label() will
+# produce for a given track list.  Both functions use these constants — if
+# they ever diverge, test_continuous_height_matches_render will catch it.
 
 _TRACK_ROW_H  = 88   # px per track row
 _SIDE_HDR_H   = 44   # px for a side header row

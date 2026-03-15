@@ -68,11 +68,14 @@ printBtn.addEventListener("click", async () => {
   printBtn.disabled = true;
   setStatus(preview ? "Generating preview…" : "Sending to printer…");
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
   try {
     const resp = await fetch(`http://localhost:${port}/print`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ release_id: releaseId, profile, preview, split, discs }),
+      signal: controller.signal,
     });
 
     const data = await resp.json();
@@ -97,6 +100,7 @@ printBtn.addEventListener("click", async () => {
       setStatus(err.message, "error");
     }
   } finally {
+    clearTimeout(timer);
     printBtn.disabled = false;
   }
 });
@@ -123,7 +127,7 @@ function checkConnectionStatus() {
     { key: "llm",       elId: "conn-llm",       label: "Finder"    },
   ];
 
-  fetch(`http://localhost:${port}/status`)
+  fetch(`http://localhost:${port}/status`, { signal: AbortSignal.timeout(5000) })
     .then(r => r.json())
     .then(data => {
       for (const { key, elId, label } of SERVICES) {

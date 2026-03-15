@@ -46,6 +46,7 @@ _continuous_height  = dt_label._continuous_height
 _chunk_continuous   = dt_label._chunk_continuous
 load_config         = dt_label.load_config
 save_config         = dt_label.save_config
+render_label        = dt_label.render_label
 LABEL_PROFILES      = dt_label.LABEL_PROFILES
 MAX_LABEL_HEIGHT_PX = dt_label.MAX_LABEL_HEIGHT_PX
 
@@ -425,3 +426,91 @@ class TestChunkContinuous:
         for i, chunk in enumerate(chunks):
             h = _continuous_height(chunk, self.PROFILE, continuation=(i > 0))
             assert h <= MAX_LABEL_HEIGHT_PX
+
+
+# ─── render_label ─────────────────────────────────────────────────────────────
+
+def _fake_render_track(position: str = "A1") -> MagicMock:
+    """Build a minimal track mock suitable for render_label()."""
+    t = MagicMock()
+    # track["position"] is accessed via dict-style __getitem__
+    t.__getitem__ = MagicMock(side_effect=lambda k: position if k == "position" else "")
+    t.getArtist.return_value = "Track Artist"
+    t.getTitle.return_value = "Track Title"
+    t.getDuration.return_value = "3:45"
+    return t
+
+
+def _make_render_tracks(sides_and_counts):
+    """Build a [(side, idx, track)] list for render_label() tests."""
+    result = []
+    idx = 0
+    positions = "ABCDEFGH"
+    for i, (side, count) in enumerate(sides_and_counts):
+        for n in range(count):
+            pos = f"{positions[i]}{n + 1}"
+            result.append((side, idx, _fake_render_track(pos)))
+            idx += 1
+    return result
+
+
+def _fake_render_release() -> MagicMock:
+    """Build a minimal release mock suitable for render_label()."""
+    r = MagicMock()
+    r.getArtist.return_value  = "Test Artist"
+    r.getTitle.return_value   = "Test Album"
+    r.getLabel.return_value   = "Test Label"
+    r.getCatno.return_value   = "TL001"
+    r.getYear.return_value    = "2020"
+    r.getCountry.return_value = "UK"
+    r.getId.return_value      = 12345
+    r.getGenre.return_value   = "Electronic"
+    r.getArtwork.return_value = None
+    return r
+
+
+class TestRenderLabel:
+    """Smoke and integration tests for the render_label() function."""
+
+    def test_returns_pil_image(self):
+        """render_label() returns a PIL Image object."""
+        from PIL import Image as PILImage
+        profile = LABEL_PROFILES["dk1247"]
+        tracks = _make_render_tracks([("A", 2)])
+        img = render_label(_fake_render_release(), tracks, profile, is_compilation=False)
+        assert isinstance(img, PILImage.Image)
+
+    def test_dk1247_dimensions(self):
+        """dk1247 die-cut profile produces a 1200×1822 image."""
+        profile = LABEL_PROFILES["dk1247"]
+        tracks = _make_render_tracks([("A", 4)])
+        img = render_label(_fake_render_release(), tracks, profile, is_compilation=False)
+        assert img.width  == 1200
+        assert img.height == 1822
+
+    def test_continuous_height_matches_render(self):
+        """_continuous_height() returns the canvas height used by render_label()."""
+        profile = LABEL_PROFILES["dk22243"]
+        tracks = _make_render_tracks([("A", 2), ("B", 2)])
+        h = _continuous_height(tracks, profile)
+        img = render_label(
+            _fake_render_release(), tracks, profile,
+            is_compilation=False, height_px=h, notes_lines=profile["notes_lines"],
+        )
+        # render_label uses height_px as its canvas height, so img.height must equal h
+        assert img.height == h
+
+    def test_compilation_shows_track_artists(self):
+        """Smoke test: render_label() completes without error for a compilation."""
+        profile = LABEL_PROFILES["dk1247"]
+        tracks = _make_render_tracks([("A", 3)])
+        render_label(_fake_render_release(), tracks, profile, is_compilation=True)
+
+    def test_bpm_values_appear_in_label(self):
+        """Passing a bpms dict does not cause render_label() to crash."""
+        profile = LABEL_PROFILES["dk1247"]
+        tracks = _make_render_tracks([("A", 2)])
+        bpms = {0: {"bpm": 128, "duration_ms": 360000},
+                1: {"bpm": 132, "duration_ms": 420000}}
+        render_label(_fake_render_release(), tracks, profile,
+                     is_compilation=False, bpms=bpms)

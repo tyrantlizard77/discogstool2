@@ -1,3 +1,32 @@
+"""libtags — Audio tag I/O for the discogstool2 pipeline.
+
+Provides a format-agnostic interface over Mutagen for reading and writing
+metadata tags in AIFF/FLAC (ID3v2.3) and ALAC/M4A (MP4) files.
+
+Key components
+--------------
+AudioFile
+    The main class.  Wraps a Mutagen file object and exposes tags by logical
+    name ("artist", "title", "track", etc.) regardless of the underlying
+    format.  Constructed from a filename; reads the existing comment tag to
+    resolve the Discogs release and track number automatically.
+
+tag_map
+    Nested dict mapping logical tag names to format-specific tag IDs:
+    ``tag_map["ID3"]["artist"] == "TPE1"``,
+    ``tag_map["MP4Tags"]["artist"] == "\\xa9ART"``, etc.
+
+track_from_comment(comment, index)
+    Parses the embedded comment string (written as
+    ``"{LABEL} [{CATNO}] Discogs: {RELEASE_ID}"``) to look up the
+    DiscogsRelease and return the correct DiscogsTrack for that file.
+
+sanitize(fn)
+    Converts an arbitrary string to a filesystem-safe filename by decomposing
+    accented characters (NFD normalisation + Mn category drop) and replacing
+    any remaining disallowed characters with ``_``.
+"""
+
 import mutagen
 import mutagen.id3
 import sys
@@ -175,11 +204,19 @@ class AudioFile(object):
         if self.tagstype == "ID3":
             clazz = getattr(mutagen.id3, mkey[:4])
             if mkey == "COMM::eng":
+                # encoding=3 → UTF-8 (ID3v2.3 encoding byte; 1 = UTF-16, 3 = UTF-8)
                 value = clazz(encoding=3, desc="", lang='eng', text=value)
             elif mkey == "APIC":
+                # Remove any existing artwork before adding the new one (APIC
+                # frames can repeat; we always want exactly one).
                 self.obj.tags.delall("APIC")
+                # imghdr.what() sniffs the magic bytes to distinguish JPEG from PNG.
                 raw_fmt = imghdr.what(None, h=cast(bytes, value))
                 mimetype = "image/" + (raw_fmt or "jpeg")
+                # APIC: Attached Picture frame (ID3v2 spec §4.14).
+                #   type=0  → Picture type 0x00 = "Other" / Cover (Front) per Table A.3
+                #   encoding=0 → ISO-8859-1 for MIME type and description strings
+                #                (the image data itself is raw bytes, not encoded text)
                 value = clazz(type=0, encoding=0, mime=mimetype, data=value)
             else:
                 if mkey == "TRCK":
@@ -191,17 +228,20 @@ class AudioFile(object):
                 elif mkey == "TCMP":
                     value = str(value)
                 # mutagen id3 can't seem to handle unicode values
+                # encoding=3 → UTF-8 text encoding for all other text frames
                 value = clazz(encoding=3, text=value)
         elif self.tagstype == "MP4Tags":
             if mkey == "trkn":
                 value = [value]
             elif mkey == "covr":
                 raw_bytes = cast(bytes, value)
-                # Detect image format for MP4Cover
+                # MP4Cover requires an explicit format constant.
+                # Check the PNG magic bytes (\x89PNG\r\n\x1a\n); everything
+                # else is assumed to be JPEG (the only other format CDJs accept).
                 if raw_bytes[:8] == b'\x89PNG\r\n\x1a\n':
-                    fmt = MP4Cover.FORMAT_PNG
+                    fmt = MP4Cover.FORMAT_PNG   # mutagen.mp4.MP4Cover.FORMAT_PNG
                 else:
-                    fmt = MP4Cover.FORMAT_JPEG
+                    fmt = MP4Cover.FORMAT_JPEG  # mutagen.mp4.MP4Cover.FORMAT_JPEG
                 value = [MP4Cover(raw_bytes, imageformat=fmt)]
 
         self.obj.tags[mkey] = value
