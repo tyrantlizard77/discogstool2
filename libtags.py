@@ -7,6 +7,7 @@ import os.path
 import shutil
 import filecmp
 import re
+import unicodedata
 import imghdr
 from typing import cast
 # MutagenFileType is imported from mutagen's private _file module because
@@ -22,6 +23,8 @@ import client_interface
 whitelist = frozenset([i for i in "1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[]()-_+.' "])
 
 def sanitize(fn: str) -> str:
+    # Decompose accented chars (è → e + combining accent), drop the accents
+    fn = ''.join(c for c in unicodedata.normalize('NFD', fn) if unicodedata.category(c) != 'Mn')
     return "".join([i if (i in whitelist) else "_" for i in fn])
 
 tag_map: dict[str, dict[str, str]] = {

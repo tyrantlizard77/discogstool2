@@ -45,10 +45,15 @@ class TestSanitize:
         assert "|" not in result
         assert result == "a_b_c_d"
 
-    def test_unicode_replaced(self):
-        result = sanitize("Ré\u00e9")
-        # é is not in the whitelist → _
-        assert result == "R__"
+    def test_accents_stripped(self):
+        # Accented Latin chars are decomposed and accents stripped
+        assert sanitize("Réé") == "Ree"
+        assert sanitize("Ñoño") == "Nono"
+        assert sanitize("über") == "uber"
+
+    def test_non_latin_replaced(self):
+        # Characters with no ASCII base still become _
+        assert sanitize("日本語") == "___"
 
     def test_empty_string(self):
         assert sanitize("") == ""
