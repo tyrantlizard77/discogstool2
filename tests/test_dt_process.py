@@ -226,12 +226,21 @@ class TestNormalizeLoudnorm:
 
     def test_dynamic_fallback_to_peak(self):
         """When normalization_type=dynamic, normalize_legacy is called instead."""
+        dt_process.worker_config["format"] = "alac"  # ensure FORMAT_CONFIG lookup succeeds
         with patch("subprocess.run", return_value=self._pass1_result("dynamic")), \
              patch.object(dt_process, "normalize_legacy") as mock_legacy, \
              patch("subprocess.call", return_value=0):
             normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")
 
         mock_legacy.assert_called_once_with("/tmp/input.wav")
+
+    def test_pass2_failure_raises(self):
+        """Non-zero returncode from pass 2 (encoding) raises ConversionException."""
+        dt_process.worker_config["format"] = "alac"
+        with patch("subprocess.run", return_value=self._pass1_result("linear")), \
+             patch("subprocess.call", return_value=1):
+            with pytest.raises(ConversionException, match="Loudnorm normalization failed"):
+                normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")
 
     def test_pass1_failure_raises(self):
         """Non-zero returncode from pass 1 raises ConversionException."""

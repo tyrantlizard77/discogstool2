@@ -94,7 +94,9 @@ printBtn.addEventListener("click", async () => {
       setStatus("Label sent to printer.", "ok");
     }
   } catch (err) {
-    if (err.name === "TypeError" && err.message.includes("NetworkError")) {
+    if (err.name === "AbortError") {
+      setStatus("Request timed out — is dt_server running on port " + port + "?", "error");
+    } else if (err.name === "TypeError" && err.message.includes("NetworkError")) {
       setStatus("dt_server not running on port " + port, "error");
     } else {
       setStatus(err.message, "error");
