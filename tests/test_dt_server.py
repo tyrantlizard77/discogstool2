@@ -144,45 +144,43 @@ class TestPrintEndpoint:
         assert data["ok"] is False
         assert "message" in data
 
-    def test_valid_release_id_calls_dt_label(self, client):
-        """A valid release ID should invoke _run_dt_label (mocked to avoid subprocess)."""
-        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
+    def test_valid_release_id_queues_job(self, client):
+        """A valid release ID should enqueue a print job (not block on subprocess)."""
+        with patch.object(dt_server._print_queue, "put") as mock_put:
             response = client.post("/print",
                                    data=json.dumps({"release_id": "12345"}),
                                    content_type="application/json")
-        mock_run.assert_called_once()
+        mock_put.assert_called_once()
         assert response.status_code == 200
 
-    def test_successful_print_returns_ok(self, client):
-        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")):
+    def test_successful_print_returns_ok_queued(self, client):
+        with patch.object(dt_server._print_queue, "put"):
             response = client.post("/print",
                                    data=json.dumps({"release_id": "12345"}),
                                    content_type="application/json")
         data = json.loads(response.data)
         assert data["ok"] is True
+        assert data.get("queued") is True
 
     def test_dt_label_failure_returns_500(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(1, "error output")):
-            response = client.post("/print",
-                                   data=json.dumps({"release_id": "12345"}),
-                                   content_type="application/json")
-        assert response.status_code == 500
-        data = json.loads(response.data)
+            with dt_server.app.app_context():
+                resp, status = dt_server._run_print("12345", "dk1247")
+        assert status == 500
+        data = json.loads(resp.data)
         assert data["ok"] is False
 
     def test_profile_passed_to_dt_label(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
-            client.post("/print",
-                        data=json.dumps({"release_id": "12345", "profile": "dk22243"}),
-                        content_type="application/json")
+            with dt_server.app.app_context():
+                dt_server._run_print("12345", "dk22243")
         args_used = mock_run.call_args[0][0]
         assert "dk22243" in args_used
 
     def test_split_flag_passed(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
-            client.post("/print",
-                        data=json.dumps({"release_id": "12345", "split": True}),
-                        content_type="application/json")
+            with dt_server.app.app_context():
+                dt_server._run_print("12345", "dk1247", split=True)
         args_used = mock_run.call_args[0][0]
         assert "--split" in args_used
 

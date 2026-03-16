@@ -18,6 +18,8 @@ import argparse
 import tempfile
 import subprocess
 import glob
+import queue
+import threading
 
 from flask import Flask, request, jsonify, send_from_directory
 
@@ -33,6 +35,28 @@ app = Flask(__name__)
 # Cleared on each new preview request and on server exit.
 PREVIEW_DIR = tempfile.mkdtemp(prefix="dt_label_previews_")
 atexit.register(shutil.rmtree, PREVIEW_DIR, ignore_errors=True)
+
+# ── Print job queue ───────────────────────────────────────────────────────────
+# Serialises dt_label subprocess calls so concurrent extension requests do not
+# race each other at the printer. Only one print job runs at a time.
+
+_print_queue: queue.Queue = queue.Queue()
+
+
+def _print_worker() -> None:
+    """Background daemon thread: drain _print_queue one job at a time."""
+    while True:
+        release_id, profile, split, discs = _print_queue.get()
+        try:
+            with app.app_context():
+                _run_print(release_id, profile, split=split, discs=discs)
+        except Exception as e:
+            print(f"[dt_server] print worker error: {e}", file=sys.stderr)
+        finally:
+            _print_queue.task_done()
+
+
+threading.Thread(target=_print_worker, daemon=True, name="print-worker").start()
 
 
 # ── CORS (allow requests from any moz-extension:// origin) ───────────────────
@@ -202,8 +226,8 @@ def print_label():
 
     if preview:
         return _run_preview(release_id, profile, split=split, discs=discs)
-    else:
-        return _run_print(release_id, profile, split=split, discs=discs)
+    _print_queue.put((release_id, profile, split, discs))
+    return jsonify({"ok": True, "queued": True})
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

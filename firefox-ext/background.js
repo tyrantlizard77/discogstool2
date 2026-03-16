@@ -74,8 +74,11 @@ browser.menus.onClicked.addListener(async (info) => {
   const split   = stored.split   || false;
   const preview = stored.preview || false;
 
+  // For print jobs the server responds immediately (job is queued); no timeout
+  // needed. For preview the server blocks until dt_label finishes, so keep the
+  // 30-second guard.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
+  const timer = preview ? setTimeout(() => controller.abort(), 30_000) : null;
   try {
     const resp = await fetch(`http://localhost:${port}/print`, {
       method: "POST",
@@ -92,6 +95,6 @@ browser.menus.onClicked.addListener(async (info) => {
   } catch (err) {
     console.error("Print Label context menu error:", err);
   } finally {
-    clearTimeout(timer);
+    if (timer !== null) clearTimeout(timer);
   }
 });
