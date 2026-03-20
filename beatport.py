@@ -378,6 +378,8 @@ class BeatportCache:
                VALUES (?,?,?,?,?)""",
             (str(discogs_id), str(beatport_id), confidence, matcher, self._today()),
         )
+        # Remove any stale nomatch entry so the match is found on future lookups
+        c.execute("DELETE FROM nomatches WHERE discogs_id=?", (str(discogs_id),))
         self._conn.commit()
 
     # ── nomatch cache ──────────────────────────────────────────────────────────
@@ -469,7 +471,7 @@ class _BeatportClient:
     def search_releases(self, query: str, per_page: int = 5) -> list[BeatportSearchResult]:
         result = self._get_raw("catalog/search", q=query, type="releases", per_page=per_page)
         if isinstance(result, dict):
-            releases = result.get("tracks", [])  # fallback
+            releases = result.get("releases", [])
             return cast(list[BeatportSearchResult], releases)
         return cast(list[BeatportSearchResult], result)
 
@@ -1543,11 +1545,6 @@ class BeatportMatcher:
             discogs_release.getYear(),
         )
 
-        # Check cached nomatch
-        if not force and self._cache.is_known_nomatch(discogs_id):
-            log.debug("Discogs release %s is a cached nomatch, skipping", discogs_id)
-            return {}
-
         # We need an authenticated client for both matching and BPM resolution.
         # Get it once here and pass it through to avoid redundant auth file reads.
         try:
@@ -1556,7 +1553,7 @@ class BeatportMatcher:
             log.warning("Cannot get Beatport client: %s", e)
             return {}
 
-        # Check cached match — still need client for BPM resolution
+        # Check cached match first — a real match always wins over a nomatch entry
         cached_match = self._cache.get_match(discogs_id)
         if cached_match:
             beatport_id, confidence, matcher_name = cached_match
@@ -1568,6 +1565,11 @@ class BeatportMatcher:
                 matcher_name,
             )
             return self._resolve_bpms(discogs_release, beatport_id, client)
+
+        # Check cached nomatch (no point running matchers again if we recently failed)
+        if not force and self._cache.is_known_nomatch(discogs_id):
+            log.debug("Discogs release %s is a cached nomatch, skipping", discogs_id)
+            return {}
 
         # Try each matcher in order
         beatport_id: str | None = None
@@ -1730,7 +1732,7 @@ if __name__ == "__main__":
         # Import here to avoid circular dependency during module load
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from client_interface import DiscogsRelease
+        from client_interface import DiscogsRelease, ClientException
 
         dr = DiscogsRelease(int(args.release))
         matcher = BeatportMatcher()
@@ -1747,7 +1749,7 @@ if __name__ == "__main__":
                     ms      = info.get("duration_ms")
                     dur_str = f"{ms//1000//60}:{ms//1000%60:02d}" if ms else "-"
                     print(f"  [{i:3d}] {t.getPosition():4s} {t.getTitle():<50s}  bpm={bpm_str}  dur={dur_str}")
-                except (IndexError, AttributeError):
+                except (IndexError, AttributeError, ClientException):
                     break
         else:
             print(f"No BPMs found for Discogs release {args.release}")
