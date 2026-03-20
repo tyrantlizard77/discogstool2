@@ -22,15 +22,20 @@ import pytest
 import beatport
 from beatport import (
     _catno_similarity,
+    _choose_bpm,
     _match_tracks,
     _normalize_catno,
     _normalize_title,
     _similarity,
     _strip_discogs_artist,
+    _strip_transient_keys,
     _title_similarity,
+    _verify_bpms,
     AnthropicMatcher,
     BeatportCache,
     BeatportMatcher,
+    BPM_VERIFY_MIN_CONFIDENCE,
+    BPM_VERIFY_TOLERANCE,
     LLMMatcher,
     ReleaseMatcher,
     YEAR_HARD_MAX,
@@ -105,9 +110,16 @@ def _bp_track(
     bpm: int | None = None,
     length_ms: int | None = None,
     mix_name: str = "Original Mix",
+    track_id: int | None = None,
+    sample_url: str | None = None,
 ) -> dict:
     """Helper: build a minimal Beatport track stub."""
-    return {"name": name, "bpm": bpm, "length_ms": length_ms, "mix_name": mix_name}
+    d: dict = {"name": name, "bpm": bpm, "length_ms": length_ms, "mix_name": mix_name}
+    if track_id is not None:
+        d["id"] = track_id
+    if sample_url is not None:
+        d["sample_url"] = sample_url
+    return d
 
 
 # ─── _normalize_title ─────────────────────────────────────────────────────────
@@ -1099,3 +1111,230 @@ def test_known_good_match(discogs_id: int, expected_bp_id: str, description: str
         f"{description}: expected Beatport ID {expected_bp_id}, "
         f"neither CatnoMatcher nor TitleMatcher matched"
     )
+
+
+# ─── BPM Verification ────────────────────────────────────────────────────────
+
+def _make_track_data(
+    declared_bpm: int,
+    sample_url: str = "https://geo-samples.beatport.com/test.LOFI.mp3",
+    track_id: str = "99001",
+    idx: int = 0,
+) -> dict[int, dict]:
+    """Build a single-track dict like _match_tracks() returns (with transient keys)."""
+    return {
+        idx: {
+            "bpm": declared_bpm,
+            "duration_ms": 360000,
+            "sample_url": sample_url,
+            "beatport_track_id": track_id,
+        }
+    }
+
+
+def _mock_essentia(detected_bpm: float, confidence: float):
+    """Create mock essentia modules with controllable MonoLoader + RhythmExtractor2013.
+
+    Returns a dict suitable for ``patch.dict("sys.modules", ...)``.
+    """
+    mock_std = MagicMock()
+    mock_std.MonoLoader.return_value.return_value = MagicMock()  # audio array
+    mock_std.RhythmExtractor2013.return_value.return_value = (
+        detected_bpm, [], confidence, [], [],
+    )
+    # The parent 'essentia' module must have .standard pointing to the same mock
+    mock_parent = MagicMock()
+    mock_parent.standard = mock_std
+    return {"essentia": mock_parent, "essentia.standard": mock_std}
+
+
+class TestChooseBpm:
+    """Unit tests for _choose_bpm logic (no I/O, no mocking needed)."""
+
+    def test_within_tolerance_keeps_declared(self):
+        assert _choose_bpm(128, 130.0, 4.0, 0) == 128
+
+    def test_outside_tolerance_overrides(self):
+        assert _choose_bpm(162, 121.0, 4.5, 0) == 121
+
+    def test_octave_double_keeps_declared(self):
+        assert _choose_bpm(128, 256.0, 5.0, 0) == 128
+
+    def test_octave_half_keeps_declared(self):
+        assert _choose_bpm(128, 64.0, 5.0, 0) == 128
+
+    def test_octave_near_boundary(self):
+        # 128 * 2 = 256.  detected=254 → 0.78% off 256, within 5% tolerance
+        assert _choose_bpm(128, 254.0, 5.0, 0) == 128
+
+    def test_low_confidence_keeps_declared(self):
+        assert _choose_bpm(162, 121.0, 1.5, 0) == 162
+
+    def test_nonsensical_low_keeps_declared(self):
+        assert _choose_bpm(128, 20.0, 5.0, 0) == 128
+
+    def test_nonsensical_high_keeps_declared(self):
+        assert _choose_bpm(128, 300.0, 5.0, 0) == 128
+
+    def test_exact_match_keeps_declared(self):
+        assert _choose_bpm(128, 128.0, 5.0, 0) == 128
+
+    def test_rounds_detected(self):
+        # detected=121.4 rounds to 121
+        assert _choose_bpm(162, 121.4, 4.5, 0) == 121
+
+    def test_detected_rounds_up(self):
+        # detected=121.6 rounds to 122
+        assert _choose_bpm(162, 121.6, 4.5, 0) == 122
+
+
+class TestVerifyBpms:
+    """Integration-level tests for _verify_bpms with mocked Essentia + HTTP."""
+
+    def _cache(self) -> BeatportCache:
+        return BeatportCache(db_path=":memory:")
+
+    @patch("beatport.requests.get")
+    def test_override_wrong_bpm(self, mock_get):
+        """Detected BPM significantly different → override."""
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        es_mods = _mock_essentia(121.0, 4.5)
+
+        data = _make_track_data(declared_bpm=162)
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, self._cache())
+
+        assert result[0]["bpm"] == 121
+
+    @patch("beatport.requests.get")
+    def test_within_tolerance_keeps_declared(self, mock_get):
+        """Detected BPM close enough → keep declared."""
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        es_mods = _mock_essentia(130.0, 4.0)
+
+        data = _make_track_data(declared_bpm=128)
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, self._cache())
+
+        assert result[0]["bpm"] == 128
+
+    @patch("beatport.requests.get")
+    def test_low_confidence_keeps_declared(self, mock_get):
+        """Low confidence detection → keep declared despite disagreement."""
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        es_mods = _mock_essentia(121.0, 1.5)
+
+        data = _make_track_data(declared_bpm=162)
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, self._cache())
+
+        assert result[0]["bpm"] == 162
+
+    @patch("beatport.requests.get")
+    def test_octave_double_keeps_declared(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        es_mods = _mock_essentia(256.0, 5.0)
+
+        data = _make_track_data(declared_bpm=128)
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, self._cache())
+
+        assert result[0]["bpm"] == 128
+
+    def test_no_essentia_returns_unchanged(self):
+        """When essentia is not installed, BPMs pass through unchanged."""
+        data = _make_track_data(declared_bpm=162)
+        # Ensure essentia is NOT importable
+        with patch.dict("sys.modules", {"essentia": None, "essentia.standard": None}):
+            result = _verify_bpms(data, self._cache())
+
+        assert result[0]["bpm"] == 162
+
+    def test_no_sample_url_skips(self):
+        """Track without sample_url passes through without download."""
+        data = {0: {"bpm": 128, "duration_ms": 360000, "sample_url": None, "beatport_track_id": "99"}}
+        es_mods = _mock_essentia(121.0, 5.0)
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, self._cache())
+        assert result[0]["bpm"] == 128
+
+    @patch("beatport.requests.get")
+    def test_download_failure_keeps_declared(self, mock_get):
+        """HTTP error → keep declared BPM."""
+        mock_get.side_effect = Exception("Connection refused")
+        es_mods = _mock_essentia(0.0, 0.0)  # won't be called
+
+        data = _make_track_data(declared_bpm=128)
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, self._cache())
+
+        assert result[0]["bpm"] == 128
+
+    @patch("beatport.requests.get")
+    def test_cache_hit_skips_download(self, mock_get):
+        """Pre-populated bpm_verified cache → no download, returns cached BPM."""
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://example.com/test.mp3", 162, 121.0, 4.5, 121)
+
+        data = _make_track_data(declared_bpm=162)
+        es_mods = _mock_essentia(0.0, 0.0)  # should not be called
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, cache)
+
+        assert result[0]["bpm"] == 121
+        mock_get.assert_not_called()
+
+    @patch("beatport.requests.get")
+    def test_force_reverify_bypasses_cache(self, mock_get):
+        """force=True → re-download and re-analyze even with cached result."""
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://example.com/test.mp3", 162, 162.0, 1.0, 162)
+
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        es_mods = _mock_essentia(121.0, 4.5)
+
+        data = _make_track_data(declared_bpm=162)
+        with patch.dict("sys.modules", es_mods):
+            result = _verify_bpms(data, cache, force=True)
+
+        assert result[0]["bpm"] == 121
+        mock_get.assert_called_once()
+
+    @patch("beatport.requests.get")
+    def test_cache_stores_result(self, mock_get):
+        """After verification, result is cached in bpm_verified table."""
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        es_mods = _mock_essentia(121.0, 4.5)
+        cache = self._cache()
+
+        data = _make_track_data(declared_bpm=162)
+        with patch.dict("sys.modules", es_mods):
+            _verify_bpms(data, cache)
+
+        assert cache.get_verified_bpm("99001") == 121
+
+    def test_sample_url_stripped_from_result(self):
+        """Transient keys are removed from the returned dict."""
+        data = _make_track_data(declared_bpm=128)
+        es_mods = _mock_essentia(128.0, 5.0)
+        # Even without download (will fail), the strip should happen
+        with patch("beatport.requests.get", return_value=MagicMock(status_code=200, content=b"fake")):
+            with patch.dict("sys.modules", es_mods):
+                result = _verify_bpms(data, self._cache())
+
+        assert "sample_url" not in result[0]
+        assert "beatport_track_id" not in result[0]
+
+
+class TestStripTransientKeys:
+    def test_strips_both_keys(self):
+        data = {0: {"bpm": 128, "duration_ms": 360000, "sample_url": "x", "beatport_track_id": "1"}}
+        result = _strip_transient_keys(data)
+        assert "sample_url" not in result[0]
+        assert "beatport_track_id" not in result[0]
+        assert result[0]["bpm"] == 128
+
+    def test_handles_missing_keys(self):
+        data = {0: {"bpm": 128, "duration_ms": 360000}}
+        result = _strip_transient_keys(data)
+        assert result[0]["bpm"] == 128

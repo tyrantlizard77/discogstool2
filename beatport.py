@@ -80,6 +80,9 @@ class BeatportTrack(TypedDict, total=False):
     mix_name: str
     bpm: int
     length_ms: int
+    sample_url: str         # LOFI preview MP3 on Beatport CDN
+    sample_start_ms: int
+    sample_end_ms: int
 
 
 class _BeatportReleaseRequired(TypedDict):
@@ -133,6 +136,21 @@ YEAR_PENALTY_FACTOR: float = 0.85   # multiplied into score once per year of dif
 
 RELEASE_CACHE_TTL_DAYS: int = 90
 NOMATCH_TTL_DAYS: int = 30
+
+# ── BPM verification thresholds ───────────────────────────────────────────────
+
+# Maximum allowed relative difference between detected and declared BPM
+# before we override Beatport's value with the local Essentia detection.
+BPM_VERIFY_TOLERANCE: float = 0.05    # 5%
+
+# Minimum confidence from Essentia's RhythmExtractor2013 to trust the
+# detection.  The confidence scale is typically 1-6; values below this
+# mean the rhythm extractor was unsure and we keep Beatport's declared BPM.
+BPM_VERIFY_MIN_CONFIDENCE: float = 2.5
+
+# Sane BPM range.  Detections outside this are discarded.
+BPM_VERIFY_MIN: float = 40.0
+BPM_VERIFY_MAX: float = 250.0
 
 # ── Auth config path ───────────────────────────────────────────────────────────
 
@@ -306,6 +324,15 @@ class BeatportCache:
                 discogs_id   TEXT PRIMARY KEY,
                 checked_date TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS bpm_verified (
+                beatport_track_id TEXT PRIMARY KEY,
+                sample_url        TEXT NOT NULL,
+                declared_bpm      INTEGER NOT NULL,
+                detected_bpm      REAL NOT NULL,
+                confidence        REAL NOT NULL,
+                chosen_bpm        INTEGER NOT NULL,
+                verified_date     TEXT NOT NULL
+            );
         """)
         self._conn.commit()
 
@@ -415,6 +442,46 @@ class BeatportCache:
         """Remove a nomatch entry (e.g. to force a retry)."""
         c = self._conn.cursor()
         c.execute("DELETE FROM nomatches WHERE discogs_id=?", (str(discogs_id),))
+        self._conn.commit()
+
+    # ── BPM verification cache ────────────────────────────────────────────────
+
+    def get_verified_bpm(self, beatport_track_id: str) -> int | None:
+        """Return cached verified BPM for a Beatport track, or None."""
+        c = self._conn.cursor()
+        c.execute(
+            "SELECT chosen_bpm FROM bpm_verified WHERE beatport_track_id=?",
+            (str(beatport_track_id),),
+        )
+        row = c.fetchone()
+        return int(row["chosen_bpm"]) if row else None
+
+    def put_verified_bpm(
+        self,
+        beatport_track_id: str,
+        sample_url: str,
+        declared_bpm: int,
+        detected_bpm: float,
+        confidence: float,
+        chosen_bpm: int,
+    ) -> None:
+        """Cache a BPM verification result."""
+        c = self._conn.cursor()
+        c.execute(
+            """INSERT OR REPLACE INTO bpm_verified
+               (beatport_track_id, sample_url, declared_bpm, detected_bpm,
+                confidence, chosen_bpm, verified_date)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                str(beatport_track_id),
+                sample_url,
+                declared_bpm,
+                detected_bpm,
+                confidence,
+                chosen_bpm,
+                self._today(),
+            ),
+        )
         self._conn.commit()
 
 
@@ -1348,9 +1415,12 @@ def _match_tracks(
 ) -> dict[int, dict[str, int | None]]:
     """Fuzzy-match Discogs tracks to Beatport tracks by title.
 
-    Returns a dict: {discogs_track_index (0-based): {"bpm": int|None, "duration_ms": int|None}}.
+    Returns a dict: {discogs_track_index (0-based): {"bpm": int|None, "duration_ms": int|None,
+    "sample_url": str|None, "beatport_track_id": str|None}}.
     Includes an entry whenever title similarity >= TRACK_MIN_SCORE and at least
-    one of bpm or duration_ms is available.
+    one of bpm or duration_ms is available.  The ``sample_url`` and
+    ``beatport_track_id`` keys are transient — consumed by ``_verify_bpms()``
+    and stripped before returning to callers.
 
     Digital releases on Beatport may have different track orders and
     exclusive tracks compared to the vinyl release on Discogs.
@@ -1370,9 +1440,11 @@ def _match_tracks(
             combined = f"{name} ({mix})"
         else:
             combined = name
-        bpm       = bt.get("bpm")
-        length_ms = bt.get("length_ms")
-        bp_normalized.append((_normalize_title(combined), bpm, length_ms))
+        bpm        = bt.get("bpm")
+        length_ms  = bt.get("length_ms")
+        sample_url = bt.get("sample_url")
+        track_id   = bt.get("id")
+        bp_normalized.append((_normalize_title(combined), bpm, length_ms, sample_url, track_id))
 
     # Collect Discogs tracks
     discogs_tracks = []
@@ -1396,23 +1468,29 @@ def _match_tracks(
         if not dt_title:
             continue
 
-        best_score:     float    = 0.0
-        best_bpm:       int | None = None
-        best_length_ms: int | None = None
+        best_score:      float      = 0.0
+        best_bpm:        int | None = None
+        best_length_ms:  int | None = None
+        best_sample_url: str | None = None
+        best_track_id:   int | None = None
 
-        for bp_title, bp_bpm, bp_length_ms in bp_normalized:
+        for bp_title, bp_bpm, bp_length_ms, bp_sample_url, bp_track_id in bp_normalized:
             score = _similarity(dt_title, bp_title)
             if score > best_score:
-                best_score     = score
-                best_bpm       = bp_bpm
-                best_length_ms = bp_length_ms
+                best_score      = score
+                best_bpm        = bp_bpm
+                best_length_ms  = bp_length_ms
+                best_sample_url = bp_sample_url
+                best_track_id   = bp_track_id
 
         if best_score >= TRACK_MIN_SCORE:
             title_matched_count += 1
             if best_bpm is not None or best_length_ms is not None:
                 result[idx] = {
-                    "bpm":         int(best_bpm) if best_bpm is not None else None,
-                    "duration_ms": int(best_length_ms) if best_length_ms is not None else None,
+                    "bpm":               int(best_bpm) if best_bpm is not None else None,
+                    "duration_ms":       int(best_length_ms) if best_length_ms is not None else None,
+                    "sample_url":        best_sample_url,
+                    "beatport_track_id": str(best_track_id) if best_track_id is not None else None,
                 }
                 log.debug(
                     "Track match: [%d] %r → bpm=%s dur_ms=%s (score=%.2f)",
@@ -1444,6 +1522,175 @@ def _match_tracks(
             return {}
 
     return result
+
+
+def _verify_bpms(
+    track_data: dict[int, dict],
+    cache: BeatportCache,
+    force: bool = False,
+) -> dict[int, dict[str, int | None]]:
+    """Cross-reference Beatport BPMs against local audio analysis of previews.
+
+    Downloads each matched track's preview MP3 from Beatport's CDN, runs
+    Essentia's RhythmExtractor2013 on it, and overrides the declared BPM when
+    the local detection disagrees beyond ``BPM_VERIFY_TOLERANCE`` (accounting
+    for octave errors).
+
+    The transient ``sample_url`` and ``beatport_track_id`` keys are consumed
+    here and stripped from the returned dict.
+
+    Parameters
+    ----------
+    track_data:
+        Output from ``_match_tracks()`` — includes transient ``sample_url``
+        and ``beatport_track_id`` keys alongside ``bpm`` and ``duration_ms``.
+    cache:
+        BeatportCache instance for reading/writing bpm_verified entries.
+    force:
+        If True, ignore cached verification results and re-analyze.
+    """
+    import tempfile
+
+    try:
+        import essentia.standard as es  # type: ignore[import-untyped]
+    except ImportError:
+        log.debug("essentia not installed — skipping BPM verification")
+        return _strip_transient_keys(track_data)
+
+    for idx, entry in track_data.items():
+        declared_bpm = entry.get("bpm")
+        sample_url = entry.pop("sample_url", None)
+        bp_track_id = entry.pop("beatport_track_id", None)
+
+        if declared_bpm is None or sample_url is None or bp_track_id is None:
+            continue
+
+        # Check cache first
+        if not force:
+            cached = cache.get_verified_bpm(bp_track_id)
+            if cached is not None:
+                log.debug(
+                    "BPM verify: track [%d] using cached verified bpm=%d",
+                    idx, cached,
+                )
+                entry["bpm"] = cached
+                continue
+
+        # Download preview MP3 and analyze
+        try:
+            detected_bpm, confidence = _analyze_preview(sample_url, es)
+        except Exception as e:
+            log.warning(
+                "BPM verify: track [%d] analysis failed: %s — keeping declared=%d",
+                idx, e, declared_bpm,
+            )
+            cache.put_verified_bpm(
+                bp_track_id, sample_url, declared_bpm, 0.0, 0.0, declared_bpm,
+            )
+            continue
+
+        chosen_bpm = _choose_bpm(declared_bpm, detected_bpm, confidence, idx)
+        entry["bpm"] = chosen_bpm
+
+        cache.put_verified_bpm(
+            bp_track_id, sample_url, declared_bpm, detected_bpm, confidence, chosen_bpm,
+        )
+
+    return _strip_transient_keys(track_data)
+
+
+def _analyze_preview(
+    sample_url: str,
+    es: object,
+) -> tuple[float, float]:
+    """Download a preview MP3 and return (bpm, confidence) from Essentia.
+
+    Raises on download or analysis failure.
+    """
+    import tempfile
+
+    resp = requests.get(sample_url, timeout=_HTTP_TIMEOUT)
+    resp.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=True) as tmp:
+        tmp.write(resp.content)
+        tmp.flush()
+
+        audio = es.MonoLoader(filename=tmp.name, sampleRate=44100)()  # type: ignore[attr-defined]
+        bpm, _ticks, confidence, _estimates, _intervals = (
+            es.RhythmExtractor2013(method="multifeature")(audio)  # type: ignore[attr-defined]
+        )
+
+    return float(bpm), float(confidence)
+
+
+def _choose_bpm(
+    declared: int,
+    detected: float,
+    confidence: float,
+    track_idx: int,
+) -> int:
+    """Decide whether to keep the declared BPM or override with detected.
+
+    Handles octave errors (detected ≈ 2× or 0.5× declared) and low-confidence
+    detections.  Returns the chosen integer BPM.
+    """
+    detected_rounded = round(detected)
+
+    # Sanity check: nonsensical detection
+    if detected < BPM_VERIFY_MIN or detected > BPM_VERIFY_MAX:
+        log.debug(
+            "BPM verify: track [%d] declared=%d detected=%.1f OUT OF RANGE — kept declared",
+            track_idx, declared, detected,
+        )
+        return declared
+
+    # Octave-error check: detected is ≈ 2× or ≈ 0.5× declared
+    for multiplier in (2.0, 0.5):
+        octave_target = declared * multiplier
+        if octave_target > 0 and abs(detected - octave_target) / octave_target <= BPM_VERIFY_TOLERANCE:
+            log.info(
+                "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
+                "→ octave error (%.1f×), kept declared",
+                track_idx, declared, detected, confidence, multiplier,
+            )
+            return declared
+
+    # Check if declared and detected agree (within tolerance)
+    rel_diff = abs(detected - declared) / declared if declared > 0 else 1.0
+    if rel_diff <= BPM_VERIFY_TOLERANCE:
+        log.debug(
+            "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
+            "→ within tolerance (%.1f%%), kept declared",
+            track_idx, declared, detected, confidence, rel_diff * 100,
+        )
+        return declared
+
+    # Significant disagreement — only override if confidence is high enough
+    if confidence < BPM_VERIFY_MIN_CONFIDENCE:
+        log.info(
+            "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
+            "→ low confidence, kept declared",
+            track_idx, declared, detected, confidence,
+        )
+        return declared
+
+    log.info(
+        "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
+        "→ OVERRIDDEN to %d",
+        track_idx, declared, detected, confidence, detected_rounded,
+    )
+    return detected_rounded
+
+
+def _strip_transient_keys(
+    track_data: dict[int, dict],
+) -> dict[int, dict[str, int | None]]:
+    """Remove ``sample_url`` and ``beatport_track_id`` from each entry."""
+    for entry in track_data.values():
+        entry.pop("sample_url", None)
+        entry.pop("beatport_track_id", None)
+    return track_data
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1518,6 +1765,8 @@ class BeatportMatcher:
         self,
         discogs_release: "DiscogsRelease",
         force: bool = False,
+        verify: bool = True,
+        reverify: bool = False,
     ) -> dict[int, dict[str, int | None]]:
         """Find BPMs and durations for all tracks in a Discogs release.
 
@@ -1527,6 +1776,11 @@ class BeatportMatcher:
             A DiscogsRelease instance.
         force:
             If True, ignore cached nomatch entries and retry.
+        verify:
+            If True (default), cross-reference Beatport BPMs against local
+            audio analysis of the preview MP3 using Essentia.
+        reverify:
+            If True, ignore cached BPM verification results and re-analyze.
 
         Returns
         -------
@@ -1564,7 +1818,10 @@ class BeatportMatcher:
                 confidence,
                 matcher_name,
             )
-            return self._resolve_bpms(discogs_release, beatport_id, client)
+            return self._resolve_bpms(
+                discogs_release, beatport_id, client,
+                verify=verify, reverify=reverify,
+            )
 
         # Check cached nomatch (no point running matchers again if we recently failed)
         if not force and self._cache.is_known_nomatch(discogs_id):
@@ -1610,15 +1867,20 @@ class BeatportMatcher:
             winning_matcher,
         )
         self._cache.put_match(discogs_id, beatport_id, best_confidence, winning_matcher)
-        return self._resolve_bpms(discogs_release, beatport_id, client)
+        return self._resolve_bpms(
+            discogs_release, beatport_id, client,
+            verify=verify, reverify=reverify,
+        )
 
     def _resolve_bpms(
         self,
         discogs_release: "DiscogsRelease",
         beatport_id: str,
         client: _BeatportClient | None = None,
+        verify: bool = True,
+        reverify: bool = False,
     ) -> dict[int, dict[str, int | None]]:
-        """Fetch Beatport tracks and fuzzy-match to Discogs tracks."""
+        """Fetch Beatport tracks, fuzzy-match to Discogs tracks, and verify BPMs."""
         if client is None:
             try:
                 client = get_client()
@@ -1635,7 +1897,14 @@ class BeatportMatcher:
             log.debug("No tracks found in Beatport release %s", beatport_id)
             return {}
 
-        return _match_tracks(discogs_release, beatport_tracks)
+        result = _match_tracks(discogs_release, beatport_tracks)
+
+        if verify:
+            result = _verify_bpms(result, self._cache, force=reverify)
+        else:
+            result = _strip_transient_keys(result)
+
+        return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1713,6 +1982,16 @@ if __name__ == "__main__":
         metavar="DISCOGS_ID",
         help="Remove cached match for a Discogs release",
     )
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip BPM verification via preview audio analysis",
+    )
+    parser.add_argument(
+        "--reverify",
+        action="store_true",
+        help="Re-download and re-analyze preview audio (ignores bpm_verified cache)",
+    )
     args = parser.parse_args()
 
     if args.setup:
@@ -1736,7 +2015,10 @@ if __name__ == "__main__":
 
         dr = DiscogsRelease(int(args.release))
         matcher = BeatportMatcher()
-        bpms = matcher.find_bpms(dr, force=args.force)
+        bpms = matcher.find_bpms(
+            dr, force=args.force,
+            verify=not args.no_verify, reverify=args.reverify,
+        )
         if bpms:
             print(f"\nBeatport data for Discogs release {args.release}:")
             for i in range(200):

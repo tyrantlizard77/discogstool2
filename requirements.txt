@@ -9,3 +9,4 @@ brother-ql-inventree
 flask
 requests
 qrcode
+essentia

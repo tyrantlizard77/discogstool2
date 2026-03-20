@@ -76,6 +76,8 @@ Year handling: beyond 3-year difference → hard reject. Within 3 years → mult
 
 Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf category), spaces, hyphens, and trailing format suffixes after a digit (`D`, `LP`, `EP`, `CD`). So `BLKRTZ050D`, `BLKRTZ050LP`, and `BLKRTZ050` all normalise to `BLKRTZ050`.
 
+**BPM verification**: After track matching, `_verify_bpms()` downloads each matched track's Beatport preview MP3 (`sample_url`) and runs Essentia's `RhythmExtractor2013(method='multifeature')` locally. If the detected BPM diverges from Beatport's declared value by more than 5% (and confidence is ≥ 2.5), the local detection overrides. Octave errors (detected ≈ 2× or 0.5× declared) are detected and the declared value is kept. Results are cached permanently in the `bpm_verified` table in `beatport.db`, keyed by Beatport track ID. CLI flags: `--no-verify` skips verification, `--reverify` ignores cached results and re-analyzes.
+
 ### DiscogsRelease / DiscogsTrack
 
 `DiscogsRelease(release_id)` is lazy — data is fetched on first access and pickled into `discogs.db`. `DiscogsTrack` wraps a 0-based index into the release tracklist. Both are used throughout `dt_process`, `dt_label`, and `beatport.py`.
@@ -89,7 +91,7 @@ Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf categ
 | `~/.discogstool/discogs_auth` | `TOKEN\|SECRET` | Discogs OAuth tokens |
 | `~/.discogstool/beatport_auth.json` | JSON | Beatport + Anthropic credentials |
 | `~/.discogstool/discogs.db` | SQLite | Discogs release cache (7-day TTL, pickled) |
-| `~/.discogstool/beatport.db` | SQLite | Beatport release cache + match/nomatch records |
+| `~/.discogstool/beatport.db` | SQLite | Beatport release cache + match/nomatch + bpm_verified |
 | `~/.discogstool/beatport.log` | Rotating text | Debug log for every Beatport matching decision |
 | `~/.discogstool/label_config` | `key=value` | Printer address, model, default profile |
 | `~/.discogstool/find_config` | `key=value` | dt_find LLM backend settings |
@@ -117,6 +119,7 @@ Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf categ
 - `release_cache` — Beatport release JSON, 90-day TTL, keyed by Beatport release ID
 - `matches` — confirmed Discogs→Beatport ID mappings, permanent
 - `nomatches` — releases with no Beatport match, retried after 30 days
+- `bpm_verified` — Essentia-verified BPMs, keyed by Beatport track ID, permanent (use `--reverify` to re-analyze)
 
 ---
 
@@ -190,6 +193,8 @@ Reads `anthropic_api_key` from `~/.discogstool/beatport_auth.json` or `ANTHROPIC
 python3 beatport.py --setup      # interactive: username, password, Anthropic key
 python3 beatport.py --release 12345678          # test a lookup
 python3 beatport.py --release 12345678 --force  # bypass nomatch cache
+python3 beatport.py --release 12345678 --no-verify   # skip BPM verification
+python3 beatport.py --release 12345678 --reverify    # re-analyze preview audio
 python3 beatport.py --clear-match 12345678      # remove cached result
 ```
 
