@@ -2,9 +2,11 @@
 
 Covers:
   - _split_args: --split / --discs argument fragment builder
+  - _bpm_args: --no-bpm argument fragment builder
   - /status endpoint: JSON with ok+version+beatport fields
   - /print endpoint: invalid release ID rejection (400)
   - /print endpoint: valid release ID dispatches to _run_dt_label
+  - /print endpoint: hide_bpm flag passed through to subprocess
   - /preview/<filename> endpoint: serves files from PREVIEW_DIR
   - OPTIONS preflight: 204 response
 """
@@ -33,6 +35,7 @@ sys.modules["dt_server"] = dt_server
 _loader.exec_module(dt_server)
 
 _split_args = dt_server._split_args
+_bpm_args   = dt_server._bpm_args
 app         = dt_server.app
 
 # Configure Flask test mode
@@ -75,6 +78,16 @@ class TestSplitArgs:
         result = _split_args(True, [2])
         assert "2" in result
         assert "--discs" in result
+
+
+# ─── _bpm_args ────────────────────────────────────────────────────────────────
+
+class TestBpmArgs:
+    def test_no_bpm_false_returns_empty(self):
+        assert _bpm_args(False) == []
+
+    def test_no_bpm_true_returns_flag(self):
+        assert _bpm_args(True) == ["--no-bpm"]
 
 
 # ─── /status endpoint ─────────────────────────────────────────────────────────
@@ -184,6 +197,38 @@ class TestPrintEndpoint:
         args_used = mock_run.call_args[0][0]
         assert "--split" in args_used
 
+    def test_no_bpm_flag_not_present_by_default(self, client):
+        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
+            with dt_server.app.app_context():
+                dt_server._run_print("12345", "dk1247")
+        args_used = mock_run.call_args[0][0]
+        assert "--no-bpm" not in args_used
+
+    def test_no_bpm_flag_passed_when_requested(self, client):
+        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
+            with dt_server.app.app_context():
+                dt_server._run_print("12345", "dk1247", no_bpm=True)
+        args_used = mock_run.call_args[0][0]
+        assert "--no-bpm" in args_used
+
+    def test_hide_bpm_queued_with_job(self, client):
+        """hide_bpm=true in the POST payload should be forwarded into the print queue."""
+        with patch.object(dt_server._print_queue, "put") as mock_put:
+            client.post("/print",
+                        data=json.dumps({"release_id": "12345", "hide_bpm": True}),
+                        content_type="application/json")
+        queued_args = mock_put.call_args[0][0]
+        # Tuple is (release_id, profile, split, discs, no_bpm)
+        assert queued_args[-1] is True  # no_bpm
+
+    def test_hide_bpm_false_by_default_in_queue(self, client):
+        with patch.object(dt_server._print_queue, "put") as mock_put:
+            client.post("/print",
+                        data=json.dumps({"release_id": "12345"}),
+                        content_type="application/json")
+        queued_args = mock_put.call_args[0][0]
+        assert queued_args[-1] is False  # no_bpm defaults to False
+
 
 # ─── /print preview mode ──────────────────────────────────────────────────────
 
@@ -206,6 +251,22 @@ class TestPreviewMode:
         data = json.loads(response.data)
         assert data["ok"] is True
         assert "preview_urls" in data
+
+    def test_preview_no_bpm_flag_passed(self, client, tmp_path):
+        """hide_bpm=true in a preview request should pass --no-bpm to dt_label."""
+        def fake_run(args, *, capture=False):
+            import pathlib
+            (pathlib.Path(dt_server.PREVIEW_DIR) / "label.png").write_bytes(b"fake")
+            return (0, "")
+
+        with patch.object(dt_server, "PREVIEW_DIR", str(tmp_path)), \
+             patch.object(dt_server, "_run_dt_label", side_effect=fake_run) as mock_run:
+            client.post("/print",
+                        data=json.dumps({"release_id": "12345", "preview": True, "hide_bpm": True}),
+                        content_type="application/json")
+
+        args_used = mock_run.call_args[0][0]
+        assert "--no-bpm" in args_used
 
     def test_preview_no_pngs_returns_500(self, client, tmp_path):
         """If dt_label exits 0 but produces no PNG, return 500."""

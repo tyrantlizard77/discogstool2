@@ -46,10 +46,10 @@ _print_queue: queue.Queue = queue.Queue()
 def _print_worker() -> None:
     """Background daemon thread: drain _print_queue one job at a time."""
     while True:
-        release_id, profile, split, discs = _print_queue.get()
+        release_id, profile, split, discs, no_bpm = _print_queue.get()
         try:
             with app.app_context():
-                _run_print(release_id, profile, split=split, discs=discs)
+                _run_print(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
         except Exception as e:
             print(f"[dt_server] print worker error: {e}", file=sys.stderr)
         finally:
@@ -220,13 +220,14 @@ def print_label():
     preview    = bool(data.get("preview", False))
     split      = bool(data.get("split", False))
     discs      = data.get("discs")   # list of ints or None
+    no_bpm     = bool(data.get("hide_bpm", False))
 
     if not release_id.isdigit():
         return jsonify({"ok": False, "message": f"Invalid release ID: {release_id!r}"}), 400
 
     if preview:
-        return _run_preview(release_id, profile, split=split, discs=discs)
-    _print_queue.put((release_id, profile, split, discs))
+        return _run_preview(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
+    _print_queue.put((release_id, profile, split, discs, no_bpm))
     return jsonify({"ok": True, "queued": True})
 
 
@@ -259,16 +260,21 @@ def _split_args(split, discs):
     return args
 
 
-def _run_print(release_id, profile, split=False, discs=None):
+def _bpm_args(no_bpm):
+    """Build --no-bpm argument fragment."""
+    return ["--no-bpm"] if no_bpm else []
+
+
+def _run_print(release_id, profile, split=False, discs=None, no_bpm=False):
     rc, output = _run_dt_label(
-        ["--label-profile", profile] + _split_args(split, discs) + [release_id]
+        ["--label-profile", profile] + _split_args(split, discs) + _bpm_args(no_bpm) + [release_id]
     )
     if rc != 0:
         return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
     return jsonify({"ok": True})
 
 
-def _run_preview(release_id, profile, split=False, discs=None):
+def _run_preview(release_id, profile, split=False, discs=None, no_bpm=False):
     # Clear any previous previews
     for old in glob.glob(os.path.join(PREVIEW_DIR, "*.png")):
         try:
@@ -280,7 +286,7 @@ def _run_preview(release_id, profile, split=False, discs=None):
         "--preview",
         "--label-profile", profile,
         "--output", PREVIEW_DIR,
-    ] + _split_args(split, discs) + [release_id], capture=True)
+    ] + _split_args(split, discs) + _bpm_args(no_bpm) + [release_id], capture=True)
 
     if rc != 0:
         return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500

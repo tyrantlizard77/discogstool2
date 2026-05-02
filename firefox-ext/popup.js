@@ -1,6 +1,6 @@
 const RELEASE_RE = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
 const DEFAULT_PORT = 5679;
-const STORAGE_KEYS = ["port", "profile", "split", "preview"];
+const STORAGE_KEYS = ["port", "profile", "split", "hide_bpm", "preview"];
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const releaseIdEl  = document.getElementById("release-id");
@@ -8,6 +8,7 @@ const profileEl    = document.getElementById("profile");
 const splitEl      = document.getElementById("split");
 const discsRowEl   = document.getElementById("discs-row");
 const discsEl      = document.getElementById("discs");
+const hideBpmEl    = document.getElementById("hide-bpm");
 const previewEl    = document.getElementById("preview-only");
 const printBtn     = document.getElementById("print-btn");
 const statusEl     = document.getElementById("status");
@@ -17,10 +18,11 @@ let releaseId = null;
 
 // ── Restore saved settings ────────────────────────────────────────────────────
 browser.storage.local.get(STORAGE_KEYS).then(saved => {
-  if (saved.port)    portEl.value      = saved.port;
-  if (saved.profile) profileEl.value   = saved.profile;
-  if (saved.split)   splitEl.checked   = saved.split;
-  if (saved.preview) previewEl.checked = saved.preview;
+  if (saved.port)     portEl.value       = saved.port;
+  if (saved.profile)  profileEl.value    = saved.profile;
+  if (saved.split)    splitEl.checked    = saved.split;
+  if (saved.hide_bpm) hideBpmEl.checked  = saved.hide_bpm;
+  if (saved.preview)  previewEl.checked  = saved.preview;
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
   checkConnectionStatus();
 });
@@ -36,6 +38,9 @@ splitEl.addEventListener("change", () => {
   browser.storage.local.set({ split: splitEl.checked });
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
   if (!splitEl.checked) discsEl.value = "";
+});
+hideBpmEl.addEventListener("change", () => {
+  browser.storage.local.set({ hide_bpm: hideBpmEl.checked });
 });
 previewEl.addEventListener("change", () => {
   browser.storage.local.set({ preview: previewEl.checked });
@@ -64,6 +69,7 @@ printBtn.addEventListener("click", async () => {
   const preview = previewEl.checked;
   const split   = splitEl.checked;
   const discs   = parseDiscs(discsEl.value);
+  const hideBpm = hideBpmEl.checked;
 
   printBtn.disabled = true;
   setStatus(preview ? "Generating preview…" : "Sending to printer…");
@@ -74,7 +80,7 @@ printBtn.addEventListener("click", async () => {
     const resp = await fetch(`http://localhost:${port}/print`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ release_id: releaseId, profile, preview, split, discs }),
+      body: JSON.stringify({ release_id: releaseId, profile, preview, split, discs, hide_bpm: hideBpm }),
       signal: controller.signal,
     });
 
