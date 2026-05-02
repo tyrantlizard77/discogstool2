@@ -21,8 +21,8 @@ import pytest
 
 import beatport
 from beatport import (
+    _accept_detected_bpm,
     _catno_similarity,
-    _choose_bpm,
     _match_tracks,
     _normalize_catno,
     _normalize_title,
@@ -35,7 +35,6 @@ from beatport import (
     BeatportCache,
     BeatportMatcher,
     BPM_VERIFY_MIN_CONFIDENCE,
-    BPM_VERIFY_TOLERANCE,
     LLMMatcher,
     ReleaseMatcher,
     YEAR_HARD_MAX,
@@ -880,7 +879,8 @@ class TestBeatportMatcherFindBpms:
         with patch.object(beatport, "get_client", return_value=MagicMock()):
             result = m.find_bpms(rel)
         assert counting.call_count == 0  # matcher NOT invoked
-        assert result[0]["bpm"] == 128
+        # Tracks have no sample_url so Essentia can't verify — BPM is None under new policy
+        assert result[0]["bpm"] is None
 
     def test_successful_match_is_cached(self):
         """A new successful match should be saved to the match cache."""
@@ -914,7 +914,8 @@ class TestBeatportMatcherFindBpms:
             result = m.find_bpms(rel)
         cached = cache.get_match(str(rel.getId()))
         assert cached[0] == "bp-high"
-        assert result[0]["bpm"] == 99
+        # Track has no sample_url so Essentia can't verify — BPM is None under new policy
+        assert result[0]["bpm"] is None
 
     def test_client_error_returns_empty(self):
         """If get_client raises BeatportError, find_bpms returns {}."""
@@ -1148,44 +1149,47 @@ def _mock_essentia(detected_bpm: float, confidence: float):
     return {"essentia": mock_parent, "essentia.standard": mock_std}
 
 
-class TestChooseBpm:
-    """Unit tests for _choose_bpm logic (no I/O, no mocking needed)."""
+class TestAcceptDetectedBpm:
+    """Unit tests for _accept_detected_bpm (no I/O, no mocking needed)."""
 
-    def test_within_tolerance_keeps_declared(self):
-        assert _choose_bpm(128, 130.0, 4.0, 0) == 128
+    def test_in_range_high_confidence_accepted(self):
+        assert _accept_detected_bpm(128.0, 4.5) == 128
 
-    def test_outside_tolerance_overrides(self):
-        assert _choose_bpm(162, 121.0, 4.5, 0) == 121
+    def test_rounds_down(self):
+        assert _accept_detected_bpm(128.4, 4.5) == 128
 
-    def test_octave_double_keeps_declared(self):
-        assert _choose_bpm(128, 256.0, 5.0, 0) == 128
+    def test_rounds_up(self):
+        assert _accept_detected_bpm(128.6, 4.5) == 129
 
-    def test_octave_half_keeps_declared(self):
-        assert _choose_bpm(128, 64.0, 5.0, 0) == 128
+    def test_below_range_rejected(self):
+        assert _accept_detected_bpm(30.0, 5.0) is None
 
-    def test_octave_near_boundary(self):
-        # 128 * 2 = 256.  detected=254 → 0.78% off 256, within 5% tolerance
-        assert _choose_bpm(128, 254.0, 5.0, 0) == 128
+    def test_above_range_rejected(self):
+        assert _accept_detected_bpm(300.0, 5.0) is None
 
-    def test_low_confidence_keeps_declared(self):
-        assert _choose_bpm(162, 121.0, 1.5, 0) == 162
+    def test_low_confidence_rejected(self):
+        assert _accept_detected_bpm(128.0, 1.5) is None
 
-    def test_nonsensical_low_keeps_declared(self):
-        assert _choose_bpm(128, 20.0, 5.0, 0) == 128
+    def test_at_confidence_threshold_accepted(self):
+        assert _accept_detected_bpm(128.0, BPM_VERIFY_MIN_CONFIDENCE) == 128
 
-    def test_nonsensical_high_keeps_declared(self):
-        assert _choose_bpm(128, 300.0, 5.0, 0) == 128
+    def test_just_below_confidence_threshold_rejected(self):
+        assert _accept_detected_bpm(128.0, BPM_VERIFY_MIN_CONFIDENCE - 0.01) is None
 
-    def test_exact_match_keeps_declared(self):
-        assert _choose_bpm(128, 128.0, 5.0, 0) == 128
+    def test_at_min_bpm_boundary_accepted(self):
+        # Exactly BPM_VERIFY_MIN (40) with high confidence should be accepted
+        from beatport import BPM_VERIFY_MIN
+        assert _accept_detected_bpm(BPM_VERIFY_MIN, 4.0) == int(BPM_VERIFY_MIN)
 
-    def test_rounds_detected(self):
-        # detected=121.4 rounds to 121
-        assert _choose_bpm(162, 121.4, 4.5, 0) == 121
+    def test_at_max_bpm_boundary_accepted(self):
+        from beatport import BPM_VERIFY_MAX
+        assert _accept_detected_bpm(BPM_VERIFY_MAX, 4.0) == int(BPM_VERIFY_MAX)
 
-    def test_detected_rounds_up(self):
-        # detected=121.6 rounds to 122
-        assert _choose_bpm(162, 121.6, 4.5, 0) == 122
+    def test_declared_bpm_irrelevant(self):
+        # Even when detected == formerly-"declared" value, only confidence matters
+        # Previously would be kept if "within tolerance" of declared; now accepted
+        # purely on confidence.
+        assert _accept_detected_bpm(130.0, 4.0) == 130  # not 128 (the old declared)
 
 
 class TestVerifyBpms:
@@ -1207,8 +1211,8 @@ class TestVerifyBpms:
         assert result[0]["bpm"] == 121
 
     @patch("beatport.requests.get")
-    def test_within_tolerance_keeps_declared(self, mock_get):
-        """Detected BPM close enough → keep declared."""
+    def test_within_tolerance_uses_detected(self, mock_get):
+        """Detected BPM close to declared but different → use detected (Beatport declared ignored)."""
         mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
         es_mods = _mock_essentia(130.0, 4.0)
 
@@ -1216,11 +1220,11 @@ class TestVerifyBpms:
         with patch.dict("sys.modules", es_mods):
             result = _verify_bpms(data, self._cache())
 
-        assert result[0]["bpm"] == 128
+        assert result[0]["bpm"] == 130  # detected, not declared
 
     @patch("beatport.requests.get")
-    def test_low_confidence_keeps_declared(self, mock_get):
-        """Low confidence detection → keep declared despite disagreement."""
+    def test_low_confidence_returns_none(self, mock_get):
+        """Low confidence detection → BPM is None (not declared fallback)."""
         mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
         es_mods = _mock_essentia(121.0, 1.5)
 
@@ -1228,39 +1232,38 @@ class TestVerifyBpms:
         with patch.dict("sys.modules", es_mods):
             result = _verify_bpms(data, self._cache())
 
-        assert result[0]["bpm"] == 162
+        assert result[0]["bpm"] is None
 
     @patch("beatport.requests.get")
-    def test_octave_double_keeps_declared(self, mock_get):
+    def test_above_range_returns_none(self, mock_get):
+        """Detected BPM above BPM_VERIFY_MAX → rejected, BPM is None."""
         mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
-        es_mods = _mock_essentia(256.0, 5.0)
+        es_mods = _mock_essentia(256.0, 5.0)  # 256 > BPM_VERIFY_MAX (250)
 
         data = _make_track_data(declared_bpm=128)
         with patch.dict("sys.modules", es_mods):
             result = _verify_bpms(data, self._cache())
 
-        assert result[0]["bpm"] == 128
+        assert result[0]["bpm"] is None
 
-    def test_no_essentia_returns_unchanged(self):
-        """When essentia is not installed, BPMs pass through unchanged."""
+    def test_no_essentia_raises(self):
+        """When essentia is not installed, _verify_bpms raises ImportError."""
         data = _make_track_data(declared_bpm=162)
-        # Ensure essentia is NOT importable
         with patch.dict("sys.modules", {"essentia": None, "essentia.standard": None}):
-            result = _verify_bpms(data, self._cache())
+            with pytest.raises((ImportError, TypeError)):
+                _verify_bpms(data, self._cache())
 
-        assert result[0]["bpm"] == 162
-
-    def test_no_sample_url_skips(self):
-        """Track without sample_url passes through without download."""
+    def test_no_sample_url_bpm_is_none(self):
+        """Track without sample_url → BPM is None (no declared fallback)."""
         data = {0: {"bpm": 128, "duration_ms": 360000, "sample_url": None, "beatport_track_id": "99"}}
         es_mods = _mock_essentia(121.0, 5.0)
         with patch.dict("sys.modules", es_mods):
             result = _verify_bpms(data, self._cache())
-        assert result[0]["bpm"] == 128
+        assert result[0]["bpm"] is None
 
     @patch("beatport.requests.get")
-    def test_download_failure_keeps_declared(self, mock_get):
-        """HTTP error → keep declared BPM."""
+    def test_download_failure_bpm_is_none(self, mock_get):
+        """HTTP error → BPM is None (no declared fallback)."""
         mock_get.side_effect = Exception("Connection refused")
         es_mods = _mock_essentia(0.0, 0.0)  # won't be called
 
@@ -1268,7 +1271,7 @@ class TestVerifyBpms:
         with patch.dict("sys.modules", es_mods):
             result = _verify_bpms(data, self._cache())
 
-        assert result[0]["bpm"] == 128
+        assert result[0]["bpm"] is None
 
     @patch("beatport.requests.get")
     def test_cache_hit_skips_download(self, mock_get):

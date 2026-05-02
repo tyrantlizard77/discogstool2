@@ -39,33 +39,24 @@ log = logging.getLogger(__name__)
 
 # ── Decision explanation ───────────────────────────────────────────────────────
 
-def _explain_decision(declared: int, detected: float, confidence: float) -> str:
-    """Return a human-readable string explaining why a BPM was kept or overridden."""
-    # Analysis failure is encoded as detected=0, confidence=0
-    if detected == 0.0 and confidence == 0.0:
-        return "analysis failed → kept declared"
+def _explain_decision(detected: float | None, confidence: float | None) -> str:
+    """Return a human-readable string explaining why a BPM was accepted or rejected."""
+    if detected is None or confidence is None or (detected == 0.0 and confidence == 0.0):
+        return "analysis failed → no BPM"
 
     if detected < bp.BPM_VERIFY_MIN or detected > bp.BPM_VERIFY_MAX:
         return (
-            f"detected {detected:.1f} out of range "
-            f"[{bp.BPM_VERIFY_MIN:.0f}–{bp.BPM_VERIFY_MAX:.0f}] → kept declared"
+            f"out of range [{bp.BPM_VERIFY_MIN:.0f}–{bp.BPM_VERIFY_MAX:.0f}]"
+            f" → rejected"
         )
 
-    for mult in (2.0, 0.5):
-        target = declared * mult
-        if target > 0 and abs(detected - target) / target <= bp.BPM_VERIFY_TOLERANCE:
-            return f"octave error (×{mult:.1f}) → kept declared"
-
-    rel_diff = abs(detected - declared) / declared if declared > 0 else 1.0
-    pct = rel_diff * 100
-
-    if rel_diff <= bp.BPM_VERIFY_TOLERANCE:
-        return f"within tolerance ({pct:.1f}%) → kept declared"
-
     if confidence < bp.BPM_VERIFY_MIN_CONFIDENCE:
-        return f"diff {pct:.1f}%, low confidence ({confidence:.2f}) → kept declared"
+        return (
+            f"confidence {confidence:.2f} < {bp.BPM_VERIFY_MIN_CONFIDENCE:.1f}"
+            f" → rejected"
+        )
 
-    return f"diff {pct:.1f}% → OVERRIDDEN"
+    return f"confidence {confidence:.2f} ≥ {bp.BPM_VERIFY_MIN_CONFIDENCE:.1f} → accepted"
 
 
 # ── Duration formatting ────────────────────────────────────────────────────────
@@ -95,24 +86,20 @@ def _run_essentia_for_track(
     sample_url   = entry.get("sample_url")
     bp_track_id  = entry.get("beatport_track_id")
 
-    if declared_bpm is None or sample_url is None or bp_track_id is None:
+    if sample_url is None or bp_track_id is None:
         return {
             "declared_bpm": declared_bpm,
             "detected_bpm": None,
             "confidence":   None,
-            "chosen_bpm":   declared_bpm,
-            "decision":     "no preview available" if declared_bpm is not None else "no Beatport BPM",
+            "chosen_bpm":   None,
+            "decision":     "no preview available",
         }
 
     # Check cache first (unless --reverify)
     if not reverify:
         detail = cache.get_verified_bpm_detail(bp_track_id)
         if detail is not None:
-            decision = _explain_decision(
-                detail["declared_bpm"],
-                detail["detected_bpm"],
-                detail["confidence"],
-            )
+            decision = _explain_decision(detail["detected_bpm"], detail["confidence"])
             return {
                 "declared_bpm": detail["declared_bpm"],
                 "detected_bpm": detail["detected_bpm"],
@@ -123,11 +110,11 @@ def _run_essentia_for_track(
 
     # Fresh analysis — raises on download or Essentia failure
     detected_bpm, confidence = bp._analyze_preview(sample_url, es)
-    chosen_bpm = bp._choose_bpm(declared_bpm, detected_bpm, confidence, idx)
+    chosen_bpm = bp._accept_detected_bpm(detected_bpm, confidence)
     cache.put_verified_bpm(
         bp_track_id, sample_url, declared_bpm, detected_bpm, confidence, chosen_bpm,
     )
-    decision = _explain_decision(declared_bpm, detected_bpm, confidence)
+    decision = _explain_decision(detected_bpm, confidence)
     return {
         "declared_bpm": declared_bpm,
         "detected_bpm": detected_bpm,
@@ -157,7 +144,7 @@ def _print_track(
     declared_bpm = bp_entry.get("bpm")
     dur_str      = _fmt_duration(bp_entry.get("duration_ms"))
     bpm_str      = str(declared_bpm) if declared_bpm is not None else "—"
-    print(f"         Beatport:  {bpm_str:>5} BPM   duration {dur_str}")
+    print(f"         Beatport:  {bpm_str:>5} BPM (declared, not used)   duration {dur_str}")
 
     det  = analysis["detected_bpm"]
     conf = analysis["confidence"]

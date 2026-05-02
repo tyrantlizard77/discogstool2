@@ -139,13 +139,9 @@ NOMATCH_TTL_DAYS: int = 30
 
 # ── BPM verification thresholds ───────────────────────────────────────────────
 
-# Maximum allowed relative difference between detected and declared BPM
-# before we override Beatport's value with the local Essentia detection.
-BPM_VERIFY_TOLERANCE: float = 0.05    # 5%
-
-# Minimum confidence from Essentia's RhythmExtractor2013 to trust the
+# Minimum confidence from Essentia's RhythmExtractor2013 to accept a
 # detection.  The confidence scale is typically 1-6; values below this
-# mean the rhythm extractor was unsure and we keep Beatport's declared BPM.
+# mean the rhythm extractor was unsure and the BPM is discarded.
 BPM_VERIFY_MIN_CONFIDENCE: float = 2.5
 
 # Sane BPM range.  Detections outside this are discarded.
@@ -327,14 +323,40 @@ class BeatportCache:
             CREATE TABLE IF NOT EXISTS bpm_verified (
                 beatport_track_id TEXT PRIMARY KEY,
                 sample_url        TEXT NOT NULL,
-                declared_bpm      INTEGER NOT NULL,
+                declared_bpm      INTEGER,
                 detected_bpm      REAL NOT NULL,
                 confidence        REAL NOT NULL,
-                chosen_bpm        INTEGER NOT NULL,
+                chosen_bpm        INTEGER,
                 verified_date     TEXT NOT NULL
             );
         """)
+        # Migration: relax NOT NULL on declared_bpm / chosen_bpm for existing DBs.
+        # SQLite doesn't support ALTER COLUMN, so we recreate the table if the old
+        # strict schema is still in place (detected by a pragma on the column info).
+        self._migrate_bpm_verified()
         self._conn.commit()
+
+    def _migrate_bpm_verified(self) -> None:
+        """Recreate bpm_verified without NOT NULL on declared_bpm/chosen_bpm."""
+        c = self._conn.cursor()
+        cols = {row["name"]: row["notnull"]
+                for row in c.execute("PRAGMA table_info(bpm_verified)")}
+        # If either column still has NOT NULL, rebuild the table.
+        if cols.get("declared_bpm") or cols.get("chosen_bpm"):
+            c.executescript("""
+                ALTER TABLE bpm_verified RENAME TO _bpm_verified_old;
+                CREATE TABLE bpm_verified (
+                    beatport_track_id TEXT PRIMARY KEY,
+                    sample_url        TEXT NOT NULL,
+                    declared_bpm      INTEGER,
+                    detected_bpm      REAL NOT NULL,
+                    confidence        REAL NOT NULL,
+                    chosen_bpm        INTEGER,
+                    verified_date     TEXT NOT NULL
+                );
+                INSERT INTO bpm_verified SELECT * FROM _bpm_verified_old;
+                DROP TABLE _bpm_verified_old;
+            """)
 
     @staticmethod
     def _today() -> str:
@@ -447,14 +469,21 @@ class BeatportCache:
     # ── BPM verification cache ────────────────────────────────────────────────
 
     def get_verified_bpm(self, beatport_track_id: str) -> int | None:
-        """Return cached verified BPM for a Beatport track, or None."""
+        """Return cached verified BPM for a Beatport track, or None.
+
+        Returns None both when the track has not been analyzed and when it was
+        analyzed but rejected (low confidence / out of range).  Use
+        ``get_verified_bpm_detail()`` to distinguish the two cases.
+        """
         c = self._conn.cursor()
         c.execute(
             "SELECT chosen_bpm FROM bpm_verified WHERE beatport_track_id=?",
             (str(beatport_track_id),),
         )
         row = c.fetchone()
-        return int(row["chosen_bpm"]) if row else None
+        if row is None:
+            return None
+        return int(row["chosen_bpm"]) if row["chosen_bpm"] is not None else None
 
     def get_verified_bpm_detail(self, beatport_track_id: str) -> dict | None:
         """Return the full bpm_verified record for a Beatport track, or None.
@@ -472,10 +501,10 @@ class BeatportCache:
         if row is None:
             return None
         return {
-            "declared_bpm":  int(row["declared_bpm"]),
+            "declared_bpm":  int(row["declared_bpm"]) if row["declared_bpm"] is not None else None,
             "detected_bpm":  float(row["detected_bpm"]),
             "confidence":    float(row["confidence"]),
-            "chosen_bpm":    int(row["chosen_bpm"]),
+            "chosen_bpm":    int(row["chosen_bpm"]) if row["chosen_bpm"] is not None else None,
             "verified_date": row["verified_date"],
         }
 
@@ -483,10 +512,10 @@ class BeatportCache:
         self,
         beatport_track_id: str,
         sample_url: str,
-        declared_bpm: int,
+        declared_bpm: int | None,
         detected_bpm: float,
         confidence: float,
-        chosen_bpm: int,
+        chosen_bpm: int | None,
     ) -> None:
         """Cache a BPM verification result."""
         c = self._conn.cursor()
@@ -1547,17 +1576,49 @@ def _match_tracks(
     return result
 
 
+def _accept_detected_bpm(detected: float, confidence: float) -> int | None:
+    """Return the Essentia-detected BPM as an integer if it passes quality gates.
+
+    Beatport's declared BPM is not consulted.  A detection is accepted only
+    when both conditions hold:
+
+    - BPM is within the sane range ``[BPM_VERIFY_MIN, BPM_VERIFY_MAX]``
+    - Essentia confidence >= ``BPM_VERIFY_MIN_CONFIDENCE``
+
+    Returns ``None`` if either check fails — callers should treat a ``None``
+    result as "BPM unknown" and leave the write zone blank on the label.
+    """
+    if detected < BPM_VERIFY_MIN or detected > BPM_VERIFY_MAX:
+        log.debug(
+            "BPM detect: %.1f out of range [%.0f–%.0f] — rejected",
+            detected, BPM_VERIFY_MIN, BPM_VERIFY_MAX,
+        )
+        return None
+    if confidence < BPM_VERIFY_MIN_CONFIDENCE:
+        log.debug(
+            "BPM detect: %.1f BPM, conf=%.2f below threshold %.2f — rejected",
+            detected, confidence, BPM_VERIFY_MIN_CONFIDENCE,
+        )
+        return None
+    accepted = round(detected)
+    log.info("BPM detect: %.1f BPM, conf=%.2f — accepted as %d", detected, confidence, accepted)
+    return accepted
+
+
 def _verify_bpms(
     track_data: dict[int, dict],
     cache: BeatportCache,
     force: bool = False,
 ) -> dict[int, dict[str, int | None]]:
-    """Cross-reference Beatport BPMs against local audio analysis of previews.
+    """Determine BPMs from local Essentia analysis of Beatport preview audio.
 
-    Downloads each matched track's preview MP3 from Beatport's CDN, runs
-    Essentia's RhythmExtractor2013 on it, and overrides the declared BPM when
-    the local detection disagrees beyond ``BPM_VERIFY_TOLERANCE`` (accounting
-    for octave errors).
+    Downloads each matched track's preview MP3 from Beatport's CDN and runs
+    Essentia's RhythmExtractor2013.  A BPM is recorded only when the detection
+    confidence meets ``BPM_VERIFY_MIN_CONFIDENCE``; otherwise the track's BPM
+    is set to ``None`` (blank write zone on the label).
+
+    Beatport's declared BPM is stored in the cache for diagnostic reference but
+    is not used in the acceptance decision.
 
     The transient ``sample_url`` and ``beatport_track_id`` keys are consumed
     here and stripped from the returned dict.
@@ -1576,42 +1637,43 @@ def _verify_bpms(
     import essentia.standard as es  # type: ignore[import-untyped]
 
     for idx, entry in track_data.items():
-        declared_bpm = entry.get("bpm")
-        sample_url = entry.pop("sample_url", None)
-        bp_track_id = entry.pop("beatport_track_id", None)
+        declared_bpm = entry.get("bpm")   # stored for diagnostics; not used in decision
+        sample_url   = entry.pop("sample_url", None)
+        bp_track_id  = entry.pop("beatport_track_id", None)
 
-        if declared_bpm is None or sample_url is None or bp_track_id is None:
+        # Default: no BPM.  Only overwritten if Essentia accepts the detection.
+        entry["bpm"] = None
+
+        if sample_url is None or bp_track_id is None:
+            log.debug("BPM detect: track [%d] no preview URL — skipping", idx)
             continue
 
-        # Check cache first
+        # Check cache first (get_verified_bpm_detail returns None only when the
+        # track has *never* been analyzed, distinguishing it from a cached None).
         if not force:
-            cached = cache.get_verified_bpm(bp_track_id)
-            if cached is not None:
+            detail = cache.get_verified_bpm_detail(bp_track_id)
+            if detail is not None:
                 log.debug(
-                    "BPM verify: track [%d] using cached verified bpm=%d",
-                    idx, cached,
+                    "BPM detect: track [%d] cached bpm=%s",
+                    idx, detail["chosen_bpm"],
                 )
-                entry["bpm"] = cached
+                entry["bpm"] = detail["chosen_bpm"]  # int or None
                 continue
 
-        # Download preview MP3 and analyze
+        # Download preview MP3 and run Essentia
         try:
             detected_bpm, confidence = _analyze_preview(sample_url, es)
         except Exception as e:
-            log.warning(
-                "BPM verify: track [%d] analysis failed: %s — keeping declared=%d",
-                idx, e, declared_bpm,
-            )
+            log.warning("BPM detect: track [%d] analysis failed: %s — no BPM", idx, e)
             cache.put_verified_bpm(
-                bp_track_id, sample_url, declared_bpm, 0.0, 0.0, declared_bpm,
+                bp_track_id, sample_url, declared_bpm or 0, 0.0, 0.0, None,
             )
             continue
 
-        chosen_bpm = _choose_bpm(declared_bpm, detected_bpm, confidence, idx)
+        chosen_bpm = _accept_detected_bpm(detected_bpm, confidence)
         entry["bpm"] = chosen_bpm
-
         cache.put_verified_bpm(
-            bp_track_id, sample_url, declared_bpm, detected_bpm, confidence, chosen_bpm,
+            bp_track_id, sample_url, declared_bpm or 0, detected_bpm, confidence, chosen_bpm,
         )
 
     return _strip_transient_keys(track_data)
@@ -1640,65 +1702,6 @@ def _analyze_preview(
         )
 
     return float(bpm), float(confidence)
-
-
-def _choose_bpm(
-    declared: int,
-    detected: float,
-    confidence: float,
-    track_idx: int,
-) -> int:
-    """Decide whether to keep the declared BPM or override with detected.
-
-    Handles octave errors (detected ≈ 2× or 0.5× declared) and low-confidence
-    detections.  Returns the chosen integer BPM.
-    """
-    detected_rounded = round(detected)
-
-    # Sanity check: nonsensical detection
-    if detected < BPM_VERIFY_MIN or detected > BPM_VERIFY_MAX:
-        log.debug(
-            "BPM verify: track [%d] declared=%d detected=%.1f OUT OF RANGE — kept declared",
-            track_idx, declared, detected,
-        )
-        return declared
-
-    # Octave-error check: detected is ≈ 2× or ≈ 0.5× declared
-    for multiplier in (2.0, 0.5):
-        octave_target = declared * multiplier
-        if octave_target > 0 and abs(detected - octave_target) / octave_target <= BPM_VERIFY_TOLERANCE:
-            log.info(
-                "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
-                "→ octave error (%.1f×), kept declared",
-                track_idx, declared, detected, confidence, multiplier,
-            )
-            return declared
-
-    # Check if declared and detected agree (within tolerance)
-    rel_diff = abs(detected - declared) / declared if declared > 0 else 1.0
-    if rel_diff <= BPM_VERIFY_TOLERANCE:
-        log.debug(
-            "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
-            "→ within tolerance (%.1f%%), kept declared",
-            track_idx, declared, detected, confidence, rel_diff * 100,
-        )
-        return declared
-
-    # Significant disagreement — only override if confidence is high enough
-    if confidence < BPM_VERIFY_MIN_CONFIDENCE:
-        log.info(
-            "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
-            "→ low confidence, kept declared",
-            track_idx, declared, detected, confidence,
-        )
-        return declared
-
-    log.info(
-        "BPM verify: track [%d] declared=%d detected=%.1f conf=%.2f "
-        "→ OVERRIDDEN to %d",
-        track_idx, declared, detected, confidence, detected_rounded,
-    )
-    return detected_rounded
 
 
 def _strip_transient_keys(

@@ -1,8 +1,8 @@
 """Tests for dt_bpm — per-track BPM diagnostic tool.
 
 Covers:
-  - _explain_decision: all decision branches (failed, out-of-range, octave error,
-    within tolerance, low confidence, overridden)
+  - _explain_decision: all decision branches (failed, out-of-range, low
+    confidence, accepted)
   - _fmt_duration: None, zero, and non-zero durations
   - BeatportCache.get_verified_bpm_detail: missing entry, present entry
   - _run_essentia_for_track: no preview, cache hit, cache miss (fresh analysis),
@@ -46,7 +46,7 @@ _loader.exec_module(dt_bpm)
 
 # ── Re-use the in-memory cache helper from the beatport tests ─────────────────
 
-from beatport import BeatportCache, BPM_VERIFY_TOLERANCE, BPM_VERIFY_MIN_CONFIDENCE
+from beatport import BeatportCache, BPM_VERIFY_MIN_CONFIDENCE
 
 
 def _make_cache() -> BeatportCache:
@@ -58,78 +58,47 @@ def _make_cache() -> BeatportCache:
 class TestExplainDecision:
     """All branches of the decision-explanation helper."""
 
-    def test_analysis_failed(self):
-        result = dt_bpm._explain_decision(128, 0.0, 0.0)
+    def test_analysis_failed_both_zero(self):
+        result = dt_bpm._explain_decision(0.0, 0.0)
         assert "failed" in result
-        assert "declared" in result
+
+    def test_analysis_failed_none(self):
+        result = dt_bpm._explain_decision(None, None)
+        assert "failed" in result
 
     def test_detected_below_range(self):
         # Below BPM_VERIFY_MIN (40)
-        result = dt_bpm._explain_decision(128, 30.0, 4.0)
+        result = dt_bpm._explain_decision(30.0, 4.0)
         assert "range" in result
-        assert "declared" in result
+        assert "rejected" in result
 
     def test_detected_above_range(self):
         # Above BPM_VERIFY_MAX (250)
-        result = dt_bpm._explain_decision(128, 300.0, 4.0)
+        result = dt_bpm._explain_decision(300.0, 4.0)
         assert "range" in result
-        assert "declared" in result
+        assert "rejected" in result
 
-    def test_octave_error_double(self):
-        # detected ≈ 2× declared — use declared=100 so 2× = 200 stays inside BPM_VERIFY_MAX
-        result = dt_bpm._explain_decision(100, 200.0, 4.0)
-        assert "octave" in result
-        assert "2.0" in result
-        assert "declared" in result
-
-    def test_octave_error_half(self):
-        # detected ≈ 0.5× declared
-        result = dt_bpm._explain_decision(128, 64.0, 4.0)
-        assert "octave" in result
-        assert "0.5" in result
-        assert "declared" in result
-
-    def test_octave_within_tolerance(self):
-        # detected is within 5% of 0.5× declared — should trigger octave guard
-        declared = 130
-        half = declared * 0.5  # 65.0
-        slightly_off = half * 1.02  # 66.3 — still within 5% of 65
-        result = dt_bpm._explain_decision(declared, slightly_off, 4.0)
-        assert "octave" in result
-
-    def test_within_tolerance(self):
-        # diff < 5%
-        result = dt_bpm._explain_decision(130, 131.0, 4.0)
-        assert "tolerance" in result
-        assert "declared" in result
-
-    def test_low_confidence(self):
-        # diff > 5% but confidence below threshold
+    def test_low_confidence_rejected(self):
         low_conf = BPM_VERIFY_MIN_CONFIDENCE - 0.1
-        result = dt_bpm._explain_decision(130, 145.0, low_conf)
+        result = dt_bpm._explain_decision(128.0, low_conf)
         assert "confidence" in result
-        assert "declared" in result
+        assert "rejected" in result
 
-    def test_overridden(self):
-        # diff > 5% and confidence >= threshold
-        high_conf = BPM_VERIFY_MIN_CONFIDENCE + 1.0
-        result = dt_bpm._explain_decision(130, 145.0, high_conf)
-        assert "OVERRIDDEN" in result
+    def test_high_confidence_accepted(self):
+        result = dt_bpm._explain_decision(128.0, BPM_VERIFY_MIN_CONFIDENCE + 1.0)
+        assert "accepted" in result
 
-    def test_within_tolerance_boundary_exactly(self):
-        # exactly at the tolerance boundary should be kept
-        declared = 100
-        detected = declared * (1 + BPM_VERIFY_TOLERANCE)  # exactly 5% over
-        result = dt_bpm._explain_decision(declared, detected, 5.0)
-        assert "tolerance" in result
+    def test_at_confidence_threshold_accepted(self):
+        result = dt_bpm._explain_decision(128.0, BPM_VERIFY_MIN_CONFIDENCE)
+        assert "accepted" in result
 
-    def test_just_over_tolerance_high_confidence_overrides(self):
-        # just over 5% with high confidence → override
-        declared = 100
-        detected = declared * (1 + BPM_VERIFY_TOLERANCE + 0.01)  # 6% over
-        high_conf = BPM_VERIFY_MIN_CONFIDENCE + 1.0
-        result = dt_bpm._explain_decision(declared, detected, high_conf)
-        assert "OVERRIDDEN" in result
+    def test_just_below_confidence_threshold_rejected(self):
+        result = dt_bpm._explain_decision(128.0, BPM_VERIFY_MIN_CONFIDENCE - 0.01)
+        assert "rejected" in result
+
+    def test_in_range_shows_confidence_value(self):
+        result = dt_bpm._explain_decision(128.0, 4.5)
+        assert "4.50" in result
 
 
 # ─── _fmt_duration ────────────────────────────────────────────────────────────
@@ -212,13 +181,6 @@ def _entry(
 
 
 class TestRunEssentiaForTrack:
-    def test_no_declared_bpm_returns_no_bpm(self):
-        cache = _make_cache()
-        result = dt_bpm._run_essentia_for_track(0, _entry(bpm=None), cache, False)
-        assert result["declared_bpm"] is None
-        assert result["detected_bpm"] is None
-        assert "no Beatport BPM" in result["decision"]
-
     def test_no_sample_url_returns_no_preview(self):
         cache = _make_cache()
         result = dt_bpm._run_essentia_for_track(0, _entry(sample_url=None), cache, False)
@@ -229,6 +191,14 @@ class TestRunEssentiaForTrack:
         cache = _make_cache()
         result = dt_bpm._run_essentia_for_track(0, _entry(bp_track_id=None), cache, False)
         assert result["detected_bpm"] is None
+
+    def test_no_declared_bpm_still_analyzes(self):
+        """bpm=None in the entry does not skip analysis — only missing sample_url/bp_track_id does."""
+        cache = _make_cache()
+        with patch("beatport._analyze_preview", return_value=(128.0, 4.5)):
+            result = dt_bpm._run_essentia_for_track(0, _entry(bpm=None), cache, False)
+        assert result["detected_bpm"] == pytest.approx(128.0)
+        assert result["chosen_bpm"] == 128
 
     def test_cache_hit_returns_cached_data(self):
         cache = _make_cache()
@@ -259,21 +229,21 @@ class TestRunEssentiaForTrack:
         assert detail is not None
         assert detail["detected_bpm"] == pytest.approx(127.5)
 
-    def test_overridden_bpm_reflected_in_result(self):
+    def test_high_confidence_returns_detected_bpm(self):
+        """High-confidence detection → chosen_bpm is the rounded detected value."""
         cache = _make_cache()
-        # declared=130, detected=145 (>5%), high confidence → override
         with patch("beatport._analyze_preview", return_value=(145.0, 5.5)):
             result = dt_bpm._run_essentia_for_track(0, _entry(bpm=130), cache, reverify=False)
-        assert result["declared_bpm"] == 130
-        assert result["chosen_bpm"]   != 130
-        assert "OVERRIDDEN" in result["decision"]
+        assert result["chosen_bpm"] == 145
+        assert "accepted" in result["decision"]
 
-    def test_within_tolerance_keeps_declared(self):
+    def test_low_confidence_returns_none_bpm(self):
+        """Low-confidence detection → chosen_bpm is None regardless of declared BPM."""
         cache = _make_cache()
-        with patch("beatport._analyze_preview", return_value=(128.5, 4.5)):
+        with patch("beatport._analyze_preview", return_value=(128.5, 1.0)):
             result = dt_bpm._run_essentia_for_track(0, _entry(bpm=128), cache, reverify=False)
-        assert result["chosen_bpm"] == 128
-        assert "tolerance" in result["decision"]
+        assert result["chosen_bpm"] is None
+        assert "rejected" in result["decision"]
 
 
 # ─── main() ───────────────────────────────────────────────────────────────────
