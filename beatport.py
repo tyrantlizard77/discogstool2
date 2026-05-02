@@ -456,6 +456,29 @@ class BeatportCache:
         row = c.fetchone()
         return int(row["chosen_bpm"]) if row else None
 
+    def get_verified_bpm_detail(self, beatport_track_id: str) -> dict | None:
+        """Return the full bpm_verified record for a Beatport track, or None.
+
+        Returned dict keys: ``declared_bpm`` (int), ``detected_bpm`` (float),
+        ``confidence`` (float), ``chosen_bpm`` (int), ``verified_date`` (str).
+        """
+        c = self._conn.cursor()
+        c.execute(
+            """SELECT declared_bpm, detected_bpm, confidence, chosen_bpm, verified_date
+               FROM bpm_verified WHERE beatport_track_id=?""",
+            (str(beatport_track_id),),
+        )
+        row = c.fetchone()
+        if row is None:
+            return None
+        return {
+            "declared_bpm":  int(row["declared_bpm"]),
+            "detected_bpm":  float(row["detected_bpm"]),
+            "confidence":    float(row["confidence"]),
+            "chosen_bpm":    int(row["chosen_bpm"]),
+            "verified_date": row["verified_date"],
+        }
+
     def put_verified_bpm(
         self,
         beatport_track_id: str,
@@ -1550,12 +1573,7 @@ def _verify_bpms(
         If True, ignore cached verification results and re-analyze.
     """
     import tempfile
-
-    try:
-        import essentia.standard as es  # type: ignore[import-untyped]
-    except ImportError:
-        log.debug("essentia not installed — skipping BPM verification")
-        return _strip_transient_keys(track_data)
+    import essentia.standard as es  # type: ignore[import-untyped]
 
     for idx, entry in track_data.items():
         declared_bpm = entry.get("bpm")
