@@ -83,7 +83,7 @@ LABEL_PROFILES = {
     },
 }
 
-DEFAULT_PROFILE = "dk1247"
+DEFAULT_PROFILE = "dk22243"
 DEFAULT_MODEL   = "QL-1110NWB"
 CONFIG_FILE     = "label_config"
 
@@ -362,7 +362,7 @@ def render_label(release, tracks_with_sides, profile,
 
         # Label [catno]                          Year  Country
         label_meta = f"{release.getLabel()}  [{release.getCatno()}]"
-        year_cc    = f"{release.getYear()}  {release.getCountry()}"
+        year_cc    = f"{release.getLabelYear()}  {release.getCountry()}"
         ycc_w = draw.textlength(year_cc, font=f_meta)
         label_meta = truncate_text(draw, label_meta, f_meta, CW - ycc_w - 24)
         draw.text((M, y), label_meta, font=f_meta, fill="black")

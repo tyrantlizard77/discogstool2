@@ -293,8 +293,17 @@ class TestDiscogsRelease:
         assert rel.getCatno() == "TL-001"
 
     def test_getYear(self):
+        """getYear() always returns the raw pressing year — safe for file tagging."""
         rel = _make_release()
         assert rel.getYear() == "2022"
+
+    def test_getYear_unaffected_by_master(self):
+        """getYear() must not include master annotation even when master_id present."""
+        data = _make_release_data(year=2025, master_id=12345)
+        rel = _make_release(data)
+        # Patch getMasterYear so no network/DB call is made
+        with patch.object(rel, "getMasterYear", return_value="2004"):
+            assert rel.getYear() == "2025"
 
     def test_getCountry(self):
         rel = _make_release()
@@ -381,6 +390,95 @@ class TestDiscogsRelease:
         s = str(rel)
         assert "Test Artist" in s
         assert "Test Album" in s
+
+
+# ─── getMasterYear / getLabelYear ────────────────────────────────────────────
+
+class TestGetMasterYear:
+    """Unit tests for DiscogsRelease.getMasterYear() using a mocked DB."""
+
+    def _make_rel_with_master(self, master_id, cached_master_data):
+        """Build a release whose master data is already in the DB cache."""
+        data = _make_release_data(year=2025, master_id=master_id)
+        rel = _make_release(data)
+
+        mock_db = MagicMock()
+        mock_db.get.return_value = cached_master_data
+
+        import client_interface as ci
+        with patch.object(ci, "threadlocal") as mock_tl:
+            # Provide a pre-seeded threadlocal.db so no real DB is constructed.
+            mock_tl.db = mock_db
+            result = rel.getMasterYear()
+        return result
+
+    def test_no_master_id_returns_none(self):
+        rel = _make_release()   # no master_id in data
+        assert rel.getMasterYear() is None
+
+    def test_master_id_zero_returns_none(self):
+        data = _make_release_data(master_id=0)
+        rel = _make_release(data)
+        assert rel.getMasterYear() is None
+
+    def test_cached_master_with_year(self):
+        result = self._make_rel_with_master(
+            master_id=99,
+            cached_master_data={"year": 2004, "title": "Original Album"},
+        )
+        assert result == "2004"
+
+    def test_cached_master_year_zero_returns_none(self):
+        result = self._make_rel_with_master(
+            master_id=99,
+            cached_master_data={"year": 0},
+        )
+        assert result is None
+
+    def test_cached_master_missing_year_returns_none(self):
+        result = self._make_rel_with_master(
+            master_id=99,
+            cached_master_data={"title": "No Year Here"},
+        )
+        assert result is None
+
+
+class TestGetLabelYear:
+    """Unit tests for DiscogsRelease.getLabelYear()."""
+
+    def _rel_with_master_year(self, pressing_year, master_year_str):
+        data = _make_release_data(year=pressing_year)
+        rel = _make_release(data)
+        with patch.object(rel, "getMasterYear", return_value=master_year_str):
+            return rel.getLabelYear()
+
+    def test_repress_shows_pressing_then_original(self):
+        """Later repress: pressing=2025, master=2004 → '2025 (2004)'."""
+        result = self._rel_with_master_year(2025, "2004")
+        assert result == "2025 (2004)"
+
+    def test_first_pressing_shows_plain_year(self):
+        """Year matches master → no annotation."""
+        result = self._rel_with_master_year(2004, "2004")
+        assert result == "2004"
+
+    def test_no_master_shows_pressing_year(self):
+        """No master data → plain pressing year."""
+        result = self._rel_with_master_year(2004, None)
+        assert result == "2004"
+
+    def test_no_pressing_year_falls_back_to_master(self):
+        """Pressing year is 0/absent but master year known → show master year."""
+        data = _make_release_data(year=0)
+        rel = _make_release(data)
+        with patch.object(rel, "getMasterYear", return_value="1998"):
+            assert rel.getLabelYear() == "1998"
+
+    def test_no_years_at_all_returns_empty(self):
+        data = _make_release_data(year=0)
+        rel = _make_release(data)
+        with patch.object(rel, "getMasterYear", return_value=None):
+            assert rel.getLabelYear() == ""
 
 
 # ─── DiscogsTrack ─────────────────────────────────────────────────────────────

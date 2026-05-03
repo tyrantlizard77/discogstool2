@@ -73,6 +73,7 @@ class _DiscogsReleaseDataRequired(TypedDict):
 
 class DiscogsReleaseData(_DiscogsReleaseDataRequired, total=False):
     year: int
+    master_id: int
     images: list[DiscogsImageRef]
     country: str
     styles: list[str]
@@ -249,8 +250,70 @@ class DiscogsRelease:
     def getTrack(self, index: int) -> DiscogsTrack:
         return DiscogsTrack(self, index)
 
+    def getMasterYear(self) -> str | None:
+        """Return the earliest release year from the master release, or None.
+
+        Discogs master releases carry the year of the first-ever pressing.
+        Returns None when this release has no master, the master cannot be
+        fetched, or the master has no year set.
+        """
+        master_id = self.data.get("master_id")
+        if not master_id:  # absent, None, or 0 (Discogs uses 0 for "no master")
+            return None
+
+        db = getattr(threadlocal, "db", None)
+        if db is None:
+            db = database.DiscogsDatabase()
+            threadlocal.db = db
+
+        key = f"master-{master_id}"
+        cached = db.get(key)
+        if cached is not None:
+            year = cached.get("year")
+            return str(year) if year else None
+
+        with discogs_lock:
+            client = get_client_instance()
+            master = None
+            for i in range(3):
+                try:
+                    time.sleep(1.1 + (5 * i))
+                    master = client.master(master_id)
+                    master.refresh()
+                    break
+                except Exception:
+                    continue
+
+        if master is None:
+            return None
+
+        master_data = cast(dict, scrub_data(master.data))
+        db.put(key, master_data)
+        year = master_data.get("year")
+        return str(year) if year else None
+
     def getYear(self) -> str:
+        """Return the pressing year as a plain string (safe for file tagging)."""
         return str(self.data.get("year", ""))
+
+    def getLabelYear(self) -> str:
+        """Return the year string formatted for sleeve labels.
+
+        Shows the original release year from the master, with the pressing
+        year appended in parentheses when this is a later repress:
+          - First pressing (or no master data): "2004"
+          - Repress: "2004 (2025)"
+        """
+        pressing_year = self.data.get("year") or 0
+        master_year = self.getMasterYear()
+
+        if master_year and pressing_year and master_year != str(pressing_year):
+            return f"{pressing_year} ({master_year})"
+        if pressing_year:
+            return str(pressing_year)
+        if master_year:
+            return master_year
+        return ""
 
     def compileListData(self, listname: str, keys: list[str]) -> str:
         items = cast(list[dict[str, str]], self.data[listname])  # type: ignore[literal-required]
