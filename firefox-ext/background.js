@@ -21,7 +21,7 @@
 const RELEASE_URL = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
 const DISCOGS_URL  = /discogs\.com/;
 const DEFAULT_PORT = 5679;
-const STORAGE_KEYS = ["port", "profile", "split", "preview"];
+const STORAGE_KEYS = ["port", "profile", "split", "hide_bpm", "preview"];
 
 function updateAction(tabId, url) {
   if (url && DISCOGS_URL.test(url)) {
@@ -72,29 +72,51 @@ browser.menus.onClicked.addListener(async (info) => {
   const port    = stored.port    || DEFAULT_PORT;
   const profile = stored.profile || "dk1247";
   const split   = stored.split   || false;
+  const hideBpm = stored.hide_bpm || false;
   const preview = stored.preview || false;
 
-  // For print jobs the server responds immediately (job is queued); no timeout
-  // needed. For preview the server blocks until dt_label finishes, so keep the
-  // 30-second guard.
+  // Print jobs now block on the server until dt_label finishes, so both
+  // paths need a generous timeout. Preview is typically fast; real prints
+  // include a Discogs fetch, optional BPM lookup, and physical printing.
   const controller = new AbortController();
-  const timer = preview ? setTimeout(() => controller.abort(), 30_000) : null;
+  const timer = setTimeout(() => controller.abort(), preview ? 30_000 : 120_000);
   try {
     const resp = await fetch(`http://localhost:${port}/print`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ release_id: releaseId, profile, preview, split, discs: null }),
+      body: JSON.stringify({
+        release_id: releaseId, profile, preview, split, discs: null,
+        hide_bpm: hideBpm,
+      }),
       signal: controller.signal,
     });
     const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.message || `Server error ${resp.status}`);
+    }
     if (preview && data.preview_urls?.length) {
       for (const url of data.preview_urls) {
         browser.tabs.create({ url: `http://localhost:${port}${url}` });
       }
+    } else if (!preview) {
+      notify("Label printed", `r${releaseId} sent to printer.`);
     }
   } catch (err) {
+    const msg = err.name === "AbortError"
+      ? `Request timed out — is dt_server running on port ${port}?`
+      : err.message || String(err);
     console.error("Print Label context menu error:", err);
+    notify("Print failed", msg, true);
   } finally {
-    if (timer !== null) clearTimeout(timer);
+    clearTimeout(timer);
   }
 });
+
+function notify(title, message, isError = false) {
+  browser.notifications.create({
+    type:    "basic",
+    iconUrl: isError ? "icons/icon-48.png" : "icons/icon-48.png",
+    title,
+    message,
+  });
+}
