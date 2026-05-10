@@ -52,6 +52,14 @@ _LINE_SPACING = 55   # px between note ruling lines
 #   +disc_info:   +40 in either case
 _HDR_H = {"normal": 286, "continuation": 72, "disc_extra": 40}
 
+# Extra px added per track row when its title wraps to a second line.
+# Must match the value used in render_label().
+_EXTRA_LINE_H = 50
+
+# Extra px added to the header when the release title wraps to a second line.
+# (58 px between title lines; original 70 px spacing applies to the last line.)
+_TITLE_WRAP_LINE_H = 58
+
 # Maximum label height for continuous stock — must fit on a 12" record sleeve.
 MAX_CONTINUOUS_PX = 12 * 300   # 3600 px at 300 DPI
 
@@ -246,14 +254,111 @@ def truncate_text(draw, text, font, max_width):
     return "\u2026"
 
 
+# Discogs appends " (2)", " (3)" etc. to disambiguate artists with the same name.
+# These are database artefacts and should not appear on printed labels.
+_DISAMBIG_RE = re.compile(r'\s*\(\d+\)\s*$')
+
+
+def _strip_disambig(name: str) -> str:
+    """Remove a Discogs disambiguation suffix like ' (2)' from an artist name."""
+    return _DISAMBIG_RE.sub("", name).strip()
+
+
+def wrap_text(draw, text, font, max_width, max_lines=2):
+    """Wrap *text* at word boundaries into at most *max_lines* lines.
+
+    Returns a list of 1\u2013*max_lines* strings.  The last line is truncated
+    with '\u2026' if there is still overflow after filling all available lines.
+    """
+    if draw.textlength(text, font=font) <= max_width:
+        return [text]
+
+    words = text.split(" ")
+    lines: list[str] = []
+    current: list[str] = []
+
+    for word in words:
+        probe = " ".join(current + [word])
+        if draw.textlength(probe, font=font) <= max_width:
+            current.append(word)
+        else:
+            if current:
+                lines.append(" ".join(current))
+            else:
+                # A single word is already too wide \u2014 truncate it immediately.
+                lines.append(truncate_text(draw, word, font, max_width))
+            current = [word] if current else []
+            if len(lines) >= max_lines:
+                current = []
+                break
+
+    if current and len(lines) < max_lines:
+        lines.append(" ".join(current))
+
+    if not lines:
+        return [truncate_text(draw, text, font, max_width)]
+
+    # Always truncate the last line in case it is still too long.
+    lines[-1] = truncate_text(draw, lines[-1], font, max_width)
+    return lines
+
+
 def hline(draw, y, x0, x1, color="black", weight=2):
     draw.line([(x0, y), (x1, y)], fill=color, width=weight)
 
 
 # ── Label rendering ───────────────────────────────────────────────────────────
 
+def _measure_wrap_extra_px(tracks_with_sides, profile, is_compilation,
+                           release=None, continuation=False):
+    """Return the total extra canvas px caused by text wrapping.
+
+    Accounts for:
+      * Track titles that spill onto a second line (each adds _EXTRA_LINE_H px).
+      * The release title wrapping to a second line in the main header
+        (adds _TITLE_WRAP_LINE_H px per extra line; skipped for continuation
+        headers, which always truncate rather than wrap).
+    """
+    from PIL import Image, ImageDraw
+    W = profile["width_px"]
+    M = profile["margin_px"]
+    CW = W - 2 * M
+    BPM_ZONE_W = 110
+    POS_W      = 90
+    TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
+
+    tmp = Image.new("RGB", (W, 100), "white")
+    draw = ImageDraw.Draw(tmp)
+
+    extra = 0
+
+    # Release title wrapping (main header only).
+    if release is not None and not continuation:
+        title_raw = release.getTitle()
+        f_t = _font_for("regular", 54, title_raw)
+        title_lines = wrap_text(draw, title_raw, f_t, CW)
+        extra += (len(title_lines) - 1) * _TITLE_WRAP_LINE_H
+
+    # Track title wrapping.
+    for _side, _idx, track in tracks_with_sides:
+        if is_compilation:
+            ts = (f"{_strip_disambig(track.getArtist())} – "
+                  f"{track.getTitle(synthesise=False)}")
+        else:
+            ts = track.getTitle(synthesise=False)
+        if not isinstance(ts, str):
+            continue   # mock/stub track — skip wrapping measurement
+        f_tr = _font_for("regular", 38, ts)
+        dur = track.getDuration()
+        dur_suffix = f" ({dur})" if isinstance(dur, str) and dur else ""
+        lines = wrap_text(draw, ts + dur_suffix, f_tr, TITLE_MAX_W)
+        extra += (len(lines) - 1) * _EXTRA_LINE_H
+
+    return extra
+
+
 def _continuous_height(tracks_with_sides, profile, continuation=False,
-                       disc_info=None):
+                       disc_info=None, extra_px=0):
     """Calculate canvas height for a continuous-feed label.
 
     Uses the same layout constants as render_label so the two stay in sync.
@@ -276,7 +381,7 @@ def _continuous_height(tracks_with_sides, profile, continuation=False,
     # notes divider(28) + "NOTES:" text(44) + N ruled lines + bottom margin(M)
     notes_h = 28 + 44 + notes_lines * _LINE_SPACING
 
-    height = 2 * M + header_h + tracks_h + notes_h
+    height = 2 * M + header_h + tracks_h + notes_h + extra_px
     if height > MAX_CONTINUOUS_PX:
         raise ValueError(
             f"Label would be {height/300:.2f}\" tall — exceeds the 12\" sleeve limit.\n"
@@ -334,22 +439,27 @@ def render_label(release, tracks_with_sides, profile,
 
     if continuation:
         # Minimal header: artist — title  (continued)
-        hdr = f"{release.getArtist().upper()} \u2014 {release.getTitle()}  (continued)"
+        hdr = f"{_strip_disambig(release.getArtist()).upper()} \u2014 {release.getTitle()}  (continued)"
         f_hdr = _font_for("regular", 32, hdr)
         draw.text((M, y), truncate_text(draw, hdr, f_hdr, CW), font=f_hdr, fill="black")
         y += 46
     else:
-        # Artist (large bold caps)
-        artist_str = truncate_text(draw, release.getArtist().upper(), f_artist, CW)
+        # Artist (large bold caps) — strip Discogs "(N)" disambiguation suffixes.
+        artist_str = truncate_text(
+            draw, _strip_disambig(release.getArtist()).upper(), f_artist, CW
+        )
         f_artist_r = _font_for("bold", 54, artist_str)
         draw.text((M, y), artist_str, font=f_artist_r, fill="black")
         y += 70
 
-        # Release title
-        title_str = truncate_text(draw, release.getTitle(), f_title, CW)
-        f_title_r = _font_for("regular", 54, title_str)
-        draw.text((M, y), title_str, font=f_title_r, fill="black")
-        y += 70
+        # Release title — wrap to a second line if it doesn't fit on one.
+        title_raw   = release.getTitle()
+        f_title_r   = _font_for("regular", 54, title_raw)
+        title_lines = wrap_text(draw, title_raw, f_title_r, CW)
+        for i, line in enumerate(title_lines):
+            draw.text((M, y), line, font=f_title_r, fill="black")
+            # 58 px between wrapped lines; 70 px after the final line (original spacing).
+            y += 58 if i < len(title_lines) - 1 else 70
 
         # Disc indicator for --split labels (immediately below title)
         if disc_info:
@@ -401,26 +511,21 @@ def render_label(release, tracks_with_sides, profile,
             hl(y, color="#AAAAAA", weight=1)
             y += 10
 
-        # Compute text_y so the bottom of track text aligns with the BPM write line
-        bpm_line_y = y + _TRACK_ROW_H - 18
-        text_y     = bpm_line_y - _track_text_h
-
         pos = track["position"]
-        draw.text((M, text_y), pos, font=f_pos, fill="black")
 
-        # Title: "Artist \u2013 Title" on compilations, plain title otherwise.
+        # Title: "Artist – Title" on compilations, plain title otherwise.
         # synthesise=False keeps untitled tracks as-is rather than generating
         # the "Release Title Position" form that dt_process uses.
+        # Strip Discogs "(N)" disambiguation suffixes from artist names.
         if is_compilation:
-            track_str = f"{track.getArtist()} \u2013 {track.getTitle(synthesise=False)}"
+            track_str = f"{_strip_disambig(track.getArtist())} \u2013 {track.getTitle(synthesise=False)}"
         else:
             track_str = track.getTitle(synthesise=False)
 
         # Pick a CJK-capable font if the track title requires it.
         f_track_r = _font_for("regular", 38, track_str)
 
-        # Duration suffix — reserve space before truncating the title.
-        # Prefer Discogs duration; fall back to Beatport length_ms if absent.
+        # Duration suffix — prefer Discogs duration; fall back to Beatport length_ms.
         dur = track.getDuration()
         if not dur:
             _ti = bpms.get(track_idx) or {}
@@ -429,11 +534,23 @@ def render_label(release, tracks_with_sides, profile,
                 _s  = _ms // 1000
                 dur = f"{_s // 60}:{_s % 60:02d}"
         dur_suffix = f" ({dur})" if dur else ""
-        dur_w = draw.textlength(dur_suffix, font=f_track_r) if dur_suffix else 0
-        track_str = truncate_text(draw, track_str, f_track_r, TITLE_MAX_W - dur_w)
-        draw.text((M + POS_W, text_y), track_str + dur_suffix, font=f_track_r, fill="black")
 
-        # BPM zone: print value if known, otherwise leave a blank write zone
+        # Wrap the track title (+ duration) to at most 2 lines.
+        full_track_str = track_str + dur_suffix
+        title_lines    = wrap_text(draw, full_track_str, f_track_r, TITLE_MAX_W)
+
+        row_h      = _TRACK_ROW_H + (len(title_lines) - 1) * _EXTRA_LINE_H
+        bpm_line_y = y + row_h - 18
+        # text_y aligns the *first* title line (and the position number) with the
+        # bottom-anchor point, leaving room below for any extra wrapped lines.
+        text_y = bpm_line_y - _track_text_h - (len(title_lines) - 1) * _EXTRA_LINE_H
+
+        draw.text((M, text_y), pos, font=f_pos, fill="black")
+        for line_i, line in enumerate(title_lines):
+            draw.text((M + POS_W, text_y + line_i * _EXTRA_LINE_H),
+                      line, font=f_track_r, fill="black")
+
+        # BPM zone: print value if known, otherwise leave a blank write zone.
         _track_info = bpms.get(track_idx) or {}
         known_bpm   = _track_info.get("bpm")
         if known_bpm:
@@ -446,7 +563,7 @@ def render_label(release, tracks_with_sides, profile,
         else:
             hline(draw, bpm_line_y, W - M - BPM_ZONE_W, W - M, color="#888888", weight=3)
 
-        y += _TRACK_ROW_H
+        y += row_h
 
     # ── Notes section ─────────────────────────────────────────────────────────
 
@@ -489,7 +606,7 @@ def render_label(release, tracks_with_sides, profile,
     return img
 
 
-def _chunk_continuous(all_tracks, profile):
+def _chunk_continuous(all_tracks, profile, is_compilation=False):
     """Pack tracks greedily onto continuous labels up to MAX_LABEL_HEIGHT_PX.
 
     Returns a list of track-chunks.  The first chunk uses the normal (tall)
@@ -504,7 +621,10 @@ def _chunk_continuous(all_tracks, profile):
 
         # Check whether all remaining tracks fit on this label.
         try:
-            h = _continuous_height(remaining, profile, continuation=continuation)
+            _ex = _measure_wrap_extra_px(remaining, profile, is_compilation,
+                                         continuation=continuation)
+            h = _continuous_height(remaining, profile, continuation=continuation,
+                                   extra_px=_ex)
             fits_all = h <= MAX_LABEL_HEIGHT_PX
         except ValueError:
             fits_all = False   # exceeds 12" hard limit
@@ -518,8 +638,11 @@ def _chunk_continuous(all_tracks, profile):
         while lo < hi:
             mid = (lo + hi + 1) // 2
             try:
+                _ex = _measure_wrap_extra_px(remaining[:mid], profile,
+                                             is_compilation,
+                                             continuation=continuation)
                 h = _continuous_height(remaining[:mid], profile,
-                                       continuation=continuation)
+                                       continuation=continuation, extra_px=_ex)
                 if h <= MAX_LABEL_HEIGHT_PX:
                     lo = mid
                 else:
@@ -534,11 +657,15 @@ def _chunk_continuous(all_tracks, profile):
     return chunks
 
 
-def _render_kwargs(tracks, profile, continuation=False, disc_info=None):
+def _render_kwargs(tracks, profile, continuation=False, disc_info=None,
+                   release=None, is_compilation=False):
     """Return extra kwargs for render_label based on feed type."""
     if profile.get("feed") == "continuous":
-        h = _continuous_height(tracks, profile,
-                               continuation=continuation, disc_info=disc_info)
+        extra = _measure_wrap_extra_px(tracks, profile, is_compilation,
+                                       release=release,
+                                       continuation=continuation)
+        h = _continuous_height(tracks, profile, continuation=continuation,
+                               disc_info=disc_info, extra_px=extra)
         return {"height_px": h, "notes_lines": profile.get("notes_lines", 3)}
     return {}
 
@@ -563,7 +690,8 @@ def render_labels_for_release(release, args, profile, bpms=None):
                 for idx, track in discs[disc_num][side]:
                     disc_tracks.append((side, idx, track))
             kw = _render_kwargs(disc_tracks, profile,
-                                disc_info=(disc_num, total_discs))
+                                disc_info=(disc_num, total_discs),
+                                release=release, is_compilation=is_compilation)
             img = render_label(release, disc_tracks, profile,
                                is_compilation,
                                disc_info=(disc_num, total_discs),
@@ -576,13 +704,14 @@ def render_labels_for_release(release, args, profile, bpms=None):
         # Die-cut labels: pack by max_tracks (fixed canvas size).
         all_tracks = flatten_discs(discs)
         if profile.get("feed") == "continuous":
-            chunks = _chunk_continuous(all_tracks, profile)
+            chunks = _chunk_continuous(all_tracks, profile, is_compilation=is_compilation)
         else:
             chunks = [all_tracks[i:i + max_tracks]
                       for i in range(0, len(all_tracks), max_tracks)]
         for idx, chunk in enumerate(chunks):
             suffix = "label" if idx == 0 else f"cont{idx}"
-            kw = _render_kwargs(chunk, profile, continuation=(idx > 0))
+            kw = _render_kwargs(chunk, profile, continuation=(idx > 0),
+                               release=release, is_compilation=is_compilation)
             img = render_label(release, chunk, profile,
                                is_compilation, continuation=(idx > 0),
                                bpms=bpms, **kw)
