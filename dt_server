@@ -251,7 +251,7 @@ def _run_print(release_id, profile, split=False, discs=None, no_bpm=False):
     with _print_lock:
         rc, output = _run_dt_label(
             ["--label-profile", profile] + _split_args(split, discs)
-            + _bpm_args(no_bpm) + [release_id],
+            + _bpm_args(no_bpm) + ["--", release_id],
             capture=True,
         )
     if rc != 0:
@@ -271,7 +271,7 @@ def _run_preview(release_id, profile, split=False, discs=None, no_bpm=False):
         "--preview",
         "--label-profile", profile,
         "--output", PREVIEW_DIR,
-    ] + _split_args(split, discs) + _bpm_args(no_bpm) + [release_id], capture=True)
+    ] + _split_args(split, discs) + _bpm_args(no_bpm) + ["--", release_id], capture=True)
 
     if rc != 0:
         return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
