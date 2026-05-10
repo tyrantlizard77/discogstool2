@@ -18,7 +18,6 @@ import argparse
 import tempfile
 import subprocess
 import glob
-import queue
 import threading
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -36,27 +35,11 @@ app = Flask(__name__)
 PREVIEW_DIR = tempfile.mkdtemp(prefix="dt_label_previews_")
 atexit.register(shutil.rmtree, PREVIEW_DIR, ignore_errors=True)
 
-# ── Print job queue ───────────────────────────────────────────────────────────
-# Serialises dt_label subprocess calls so concurrent extension requests do not
-# race each other at the printer. Only one print job runs at a time.
+# ── Print serialisation lock ──────────────────────────────────────────────────
+# Ensures only one dt_label subprocess runs at a time so concurrent extension
+# requests cannot race each other at the printer.
 
-_print_queue: queue.Queue = queue.Queue()
-
-
-def _print_worker() -> None:
-    """Background daemon thread: drain _print_queue one job at a time."""
-    while True:
-        release_id, profile, split, discs, no_bpm = _print_queue.get()
-        try:
-            with app.app_context():
-                _run_print(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
-        except Exception as e:
-            print(f"[dt_server] print worker error: {e}", file=sys.stderr)
-        finally:
-            _print_queue.task_done()
-
-
-threading.Thread(target=_print_worker, daemon=True, name="print-worker").start()
+_print_lock = threading.Lock()
 
 
 # ── CORS (allow requests from any moz-extension:// origin) ───────────────────
@@ -227,8 +210,7 @@ def print_label():
 
     if preview:
         return _run_preview(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
-    _print_queue.put((release_id, profile, split, discs, no_bpm))
-    return jsonify({"ok": True, "queued": True})
+    return _run_print(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -266,9 +248,12 @@ def _bpm_args(no_bpm):
 
 
 def _run_print(release_id, profile, split=False, discs=None, no_bpm=False):
-    rc, output = _run_dt_label(
-        ["--label-profile", profile] + _split_args(split, discs) + _bpm_args(no_bpm) + [release_id]
-    )
+    with _print_lock:
+        rc, output = _run_dt_label(
+            ["--label-profile", profile] + _split_args(split, discs)
+            + _bpm_args(no_bpm) + [release_id],
+            capture=True,
+        )
     if rc != 0:
         return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
     return jsonify({"ok": True})

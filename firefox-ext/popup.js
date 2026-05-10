@@ -75,7 +75,9 @@ printBtn.addEventListener("click", async () => {
   setStatus(preview ? "Generating preview…" : "Sending to printer…");
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
+  // Preview is fast (local subprocess); real prints include a Discogs fetch,
+  // optional BPM lookup, and physical printing — allow up to 2 minutes.
+  const timer = setTimeout(() => controller.abort(), preview ? 30_000 : 120_000);
   try {
     const resp = await fetch(`http://localhost:${port}/print`, {
       method: "POST",

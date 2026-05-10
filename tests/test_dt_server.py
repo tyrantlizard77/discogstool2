@@ -157,23 +157,22 @@ class TestPrintEndpoint:
         assert data["ok"] is False
         assert "message" in data
 
-    def test_valid_release_id_queues_job(self, client):
-        """A valid release ID should enqueue a print job (not block on subprocess)."""
-        with patch.object(dt_server._print_queue, "put") as mock_put:
+    def test_valid_release_id_runs_dt_label(self, client):
+        """A valid release ID should invoke dt_label synchronously and return ok."""
+        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
             response = client.post("/print",
                                    data=json.dumps({"release_id": "12345"}),
                                    content_type="application/json")
-        mock_put.assert_called_once()
+        mock_run.assert_called_once()
         assert response.status_code == 200
 
-    def test_successful_print_returns_ok_queued(self, client):
-        with patch.object(dt_server._print_queue, "put"):
+    def test_successful_print_returns_ok(self, client):
+        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")):
             response = client.post("/print",
                                    data=json.dumps({"release_id": "12345"}),
                                    content_type="application/json")
         data = json.loads(response.data)
         assert data["ok"] is True
-        assert data.get("queued") is True
 
     def test_dt_label_failure_returns_500(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(1, "error output")):
@@ -211,23 +210,22 @@ class TestPrintEndpoint:
         args_used = mock_run.call_args[0][0]
         assert "--no-bpm" in args_used
 
-    def test_hide_bpm_queued_with_job(self, client):
-        """hide_bpm=true in the POST payload should be forwarded into the print queue."""
-        with patch.object(dt_server._print_queue, "put") as mock_put:
+    def test_hide_bpm_passed_to_dt_label(self, client):
+        """hide_bpm=true in the POST payload should add --no-bpm to the dt_label call."""
+        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
             client.post("/print",
                         data=json.dumps({"release_id": "12345", "hide_bpm": True}),
                         content_type="application/json")
-        queued_args = mock_put.call_args[0][0]
-        # Tuple is (release_id, profile, split, discs, no_bpm)
-        assert queued_args[-1] is True  # no_bpm
+        args_used = mock_run.call_args[0][0]
+        assert "--no-bpm" in args_used
 
-    def test_hide_bpm_false_by_default_in_queue(self, client):
-        with patch.object(dt_server._print_queue, "put") as mock_put:
+    def test_hide_bpm_false_by_default(self, client):
+        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
             client.post("/print",
                         data=json.dumps({"release_id": "12345"}),
                         content_type="application/json")
-        queued_args = mock_put.call_args[0][0]
-        assert queued_args[-1] is False  # no_bpm defaults to False
+        args_used = mock_run.call_args[0][0]
+        assert "--no-bpm" not in args_used
 
 
 # ─── /print preview mode ──────────────────────────────────────────────────────
