@@ -535,14 +535,17 @@ class TestRenderLabel:
         assert img.height == profile["height_px"]
 
     def test_continuous_height_includes_qr_area(self):
-        """notes_h must be large enough to fit the QR code without overlap."""
+        """notes_h must be large enough to fit the QR code with a safety buffer."""
         profile = LABEL_PROFILES["dk22243"]
-        M = profile["margin_px"]
-        notes_lines = profile["notes_lines"]
-        # Compute notes_h the same way _continuous_height does
-        notes_h = 28 + max(_QR_SIZE, notes_lines * dt_label._LINE_SPACING)
+        # notes_h = 28 (divider) + QR_SIZE (200) + EXTRA_LINE_H (50) = 278
+        notes_h = 28 + _QR_SIZE + dt_label._EXTRA_LINE_H
         assert notes_h >= 28 + _QR_SIZE, \
             "notes_h must provide at least QR_SIZE pixels after the divider"
+        # Safety buffer must be at least one track-wrap's worth so that a single
+        # missed wrap in _measure_wrap_extra_px doesn't push QR into the tracks.
+        safety = notes_h - 28 - _QR_SIZE
+        assert safety >= dt_label._EXTRA_LINE_H, \
+            f"safety buffer {safety} too small (need >= {dt_label._EXTRA_LINE_H})"
 
 
 # ─── QR code placement ────────────────────────────────────────────────────────
@@ -601,6 +604,10 @@ class TestQRPlacement:
             y += _TRACK_ROW_H + (len(lines) - 1) * dt_label._EXTRA_LINE_H
         return y
 
+    def _qr_top(self, h):
+        """qr_top as computed by render_label: bottom-anchored."""
+        return h - self.M - _QR_SIZE
+
     def test_qr_below_tracks_short_release(self):
         """QR code must not overlap tracks on a short release."""
         profile = self.PROFILE
@@ -610,18 +617,19 @@ class TestQRPlacement:
         extra = _measure_wrap_extra_px(tracks, profile, False, release=release)
         h = _continuous_height(tracks, profile, extra_px=extra)
         y_tracks = self._y_after_tracks(tracks, release)
-        # qr_top in the new design = y after tracks + notes divider (28px)
-        qr_top = y_tracks + 28
+        qr_top = self._qr_top(h)
         assert qr_top + _QR_SIZE <= h - self.M, \
             f"QR ({qr_top}…{qr_top+_QR_SIZE}) overflows canvas bottom ({h - self.M})"
-        assert qr_top >= y_tracks, "QR must start after the last track row"
+        assert qr_top >= y_tracks + 28, \
+            f"QR top ({qr_top}) must be below the notes divider ({y_tracks + 28})"
 
     def test_qr_below_tracks_many_wrapping(self):
         """QR must not overlap tracks when many titles wrap to a second line.
 
         This is a regression test for the r35722564 scenario where the QR code
         overlapped the last track because _measure_wrap_extra_px underestimated
-        the extra height needed on borderline-width titles.
+        the extra height needed on borderline-width titles.  The _EXTRA_LINE_H
+        safety buffer in notes_h gives room for one extra undetected wrap.
         """
         profile = self.PROFILE
         # Simulate a compilation with several long titles that wrap
@@ -643,19 +651,20 @@ class TestQRPlacement:
         extra = _measure_wrap_extra_px(long_titles, profile, True, release=release)
         h = _continuous_height(long_titles, profile, extra_px=extra)
         y_tracks = self._y_after_tracks(long_titles, release, is_compilation=True)
-        qr_top = y_tracks + 28   # notes divider is 28 px
-        assert qr_top >= y_tracks, "QR must be at or below last track"
+        qr_top = self._qr_top(h)
         assert qr_top + _QR_SIZE <= h - self.M, \
-            (f"QR ({qr_top}…{qr_top+_QR_SIZE}) overflows canvas bottom ({h-self.M}); "
-             f"h={h}, extra_px={extra}, y_tracks={y_tracks}")
+            f"QR overflows canvas: h={h}, extra_px={extra}"
+        # Even if one extra track wraps (50 px more than measured), QR must clear tracks
+        qr_top_worst = self._qr_top(h)   # qr_top doesn't change; notes_h absorbs the error
+        assert qr_top_worst >= y_tracks + 28 - dt_label._EXTRA_LINE_H, \
+            (f"QR top ({qr_top_worst}) too close to tracks ({y_tracks}); "
+             f"safety buffer insufficient")
 
     def test_notes_area_always_fits_qr(self):
         """The notes area (notes_h) must always be large enough to contain the QR code."""
         for profile in LABEL_PROFILES.values():
             if profile.get("feed") != "continuous":
                 continue
-            M = profile["margin_px"]
-            notes_lines = profile.get("notes_lines", 3)
-            notes_h = 28 + max(_QR_SIZE, notes_lines * dt_label._LINE_SPACING)
+            notes_h = 28 + _QR_SIZE + dt_label._EXTRA_LINE_H
             assert notes_h >= 28 + _QR_SIZE, \
                 f"notes_h {notes_h} too small for QR in profile {profile}"

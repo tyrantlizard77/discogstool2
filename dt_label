@@ -382,10 +382,11 @@ def _continuous_height(tracks_with_sides, profile, continuation=False,
             sides_seen.append(side)
     tracks_h = len(sides_seen) * _SIDE_HDR_H + len(tracks_with_sides) * _TRACK_ROW_H
 
-    # notes divider (28) + content area: the larger of the QR code or N ruled lines.
-    # QR code is placed flush at the start of the notes content, so we need at least
-    # _QR_SIZE px.  (The phantom "NOTES:" header that used to pad this out is gone.)
-    notes_h = 28 + max(_QR_SIZE, notes_lines * _LINE_SPACING)
+    # notes divider (28) + QR code (_QR_SIZE = 200) + safety buffer (_EXTRA_LINE_H = 50).
+    # The safety buffer means qr_top sits 50 px below the divider in the nominal case,
+    # absorbing up to one missed track-wrap in _measure_wrap_extra_px (a borderline
+    # title that measures differently under Arial vs LiberationSans).
+    notes_h = 28 + _QR_SIZE + _EXTRA_LINE_H
 
     height = 2 * M + header_h + tracks_h + notes_h + extra_px
     if height > MAX_CONTINUOUS_PX:
@@ -585,18 +586,15 @@ def render_label(release, tracks_with_sides, profile,
     y += 10
     hl(y); y += 18
 
-    # QR code sits in the bottom-left of the notes area.
-    # Ruled lines that fall within the QR zone start to the right of it.
+    # QR code sits flush in the bottom-left corner of the notes area.
+    # Ruled lines that enter the QR zone start to the right of it.
+    # qr_top is anchored to the canvas bottom so the QR is never clipped.
+    # notes_h is sized with a _EXTRA_LINE_H safety buffer so the QR never
+    # overlaps the track listing even if _measure_wrap_extra_px underestimates
+    # by one wrap (e.g. a borderline title measured differently under Arial
+    # vs LiberationSans).
+    qr_top  = H - M - _QR_SIZE
     qr_left = M
-
-    # Continuous labels: pin QR immediately after the notes divider so that any
-    # measurement error in _continuous_height() cannot push it into the track area.
-    # Die-cut labels: keep the traditional bottom-corner placement but clamp upward
-    # if tracks happen to overflow the fixed canvas.
-    if notes_lines is not None:
-        qr_top = y          # continuous — flush with start of notes content
-    else:
-        qr_top = max(H - M - _QR_SIZE, y)   # die-cut — bottom-aligned, no overlap
 
     def _hl_notes(line_y):
         x_left = qr_left + _QR_SIZE + 8 if line_y >= qr_top else M
