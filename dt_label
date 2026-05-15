@@ -60,6 +60,10 @@ _EXTRA_LINE_H = 50
 # (58 px between title lines; original 70 px spacing applies to the last line.)
 _TITLE_WRAP_LINE_H = 58
 
+# QR code size (px).  Used in both render_label() and _continuous_height() so the
+# two stay in sync.  ~17 mm at 300 DPI — scan-able from across a record shelf.
+_QR_SIZE = 200
+
 # Maximum label height for continuous stock — must fit on a 12" record sleeve.
 MAX_CONTINUOUS_PX = 12 * 300   # 3600 px at 300 DPI
 
@@ -378,8 +382,10 @@ def _continuous_height(tracks_with_sides, profile, continuation=False,
             sides_seen.append(side)
     tracks_h = len(sides_seen) * _SIDE_HDR_H + len(tracks_with_sides) * _TRACK_ROW_H
 
-    # notes divider(28) + "NOTES:" text(44) + N ruled lines + bottom margin(M)
-    notes_h = 28 + 44 + notes_lines * _LINE_SPACING
+    # notes divider (28) + content area: the larger of the QR code or N ruled lines.
+    # QR code is placed flush at the start of the notes content, so we need at least
+    # _QR_SIZE px.  (The phantom "NOTES:" header that used to pad this out is gone.)
+    notes_h = 28 + max(_QR_SIZE, notes_lines * _LINE_SPACING)
 
     height = 2 * M + header_h + tracks_h + notes_h + extra_px
     if height > MAX_CONTINUOUS_PX:
@@ -427,6 +433,11 @@ def render_label(release, tracks_with_sides, profile,
     BPM_ZONE_W  = 110                         # right-side blank area for handwritten BPM
     POS_W       = 90                          # position column width
     TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
+
+    # Continuous labels auto-size their canvas; die-cut labels have a fixed canvas.
+    # Wrapping is only enabled for continuous labels — die-cut labels truncate instead,
+    # because their canvas cannot grow to accommodate extra line height.
+    is_continuous = profile.get("feed") == "continuous"
 
     x0 = M
     x1 = W - M
@@ -535,9 +546,13 @@ def render_label(release, tracks_with_sides, profile,
                 dur = f"{_s // 60}:{_s % 60:02d}"
         dur_suffix = f" ({dur})" if dur else ""
 
-        # Wrap the track title (+ duration) to at most 2 lines.
+        # Continuous labels: wrap to at most 2 lines (canvas grows to fit).
+        # Die-cut labels: truncate only — canvas height is fixed and cannot grow.
         full_track_str = track_str + dur_suffix
-        title_lines    = wrap_text(draw, full_track_str, f_track_r, TITLE_MAX_W)
+        if is_continuous:
+            title_lines = wrap_text(draw, full_track_str, f_track_r, TITLE_MAX_W)
+        else:
+            title_lines = [truncate_text(draw, full_track_str, f_track_r, TITLE_MAX_W)]
 
         row_h      = _TRACK_ROW_H + (len(title_lines) - 1) * _EXTRA_LINE_H
         bpm_line_y = y + row_h - 18
@@ -570,18 +585,25 @@ def render_label(release, tracks_with_sides, profile,
     y += 10
     hl(y); y += 18
 
-    # QR code sits flush in the bottom-left corner of the notes area.
-    # Ruled lines that enter the QR zone start to the right of it.
-    QR_SIZE = 200                      # px — ~17 mm at 300 DPI
-    qr_top  = H - M - QR_SIZE         # y where the QR block starts
-    qr_left = M                        # x where the QR block starts
+    # QR code sits in the bottom-left of the notes area.
+    # Ruled lines that fall within the QR zone start to the right of it.
+    qr_left = M
+
+    # Continuous labels: pin QR immediately after the notes divider so that any
+    # measurement error in _continuous_height() cannot push it into the track area.
+    # Die-cut labels: keep the traditional bottom-corner placement but clamp upward
+    # if tracks happen to overflow the fixed canvas.
+    if notes_lines is not None:
+        qr_top = y          # continuous — flush with start of notes content
+    else:
+        qr_top = max(H - M - _QR_SIZE, y)   # die-cut — bottom-aligned, no overlap
 
     def _hl_notes(line_y):
-        x_left = qr_left + QR_SIZE + 8 if line_y >= qr_top else M
+        x_left = qr_left + _QR_SIZE + 8 if line_y >= qr_top else M
         hline(draw, line_y, x_left, W - M, color="#DDDDDD", weight=1)
 
     if notes_lines is not None:
-        # Continuous labels: fixed number of ruled lines
+        # Continuous labels: fixed number of ruled lines (all within QR zone)
         for _ in range(notes_lines):
             y += _LINE_SPACING
             _hl_notes(y)
@@ -600,7 +622,7 @@ def render_label(release, tracks_with_sides, profile,
     qr.add_data(f"https://discogs.com/release/{release.getId()}")
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    qr_img = qr_img.resize((QR_SIZE, QR_SIZE), Image.NEAREST)
+    qr_img = qr_img.resize((_QR_SIZE, _QR_SIZE), Image.NEAREST)
     img.paste(qr_img, (qr_left, qr_top))
 
     return img

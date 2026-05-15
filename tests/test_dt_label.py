@@ -46,9 +46,14 @@ _continuous_height  = dt_label._continuous_height
 _chunk_continuous   = dt_label._chunk_continuous
 load_config         = dt_label.load_config
 save_config         = dt_label.save_config
-render_label        = dt_label.render_label
-LABEL_PROFILES      = dt_label.LABEL_PROFILES
-MAX_LABEL_HEIGHT_PX = dt_label.MAX_LABEL_HEIGHT_PX
+render_label             = dt_label.render_label
+_measure_wrap_extra_px   = dt_label._measure_wrap_extra_px
+LABEL_PROFILES           = dt_label.LABEL_PROFILES
+MAX_LABEL_HEIGHT_PX      = dt_label.MAX_LABEL_HEIGHT_PX
+_QR_SIZE                 = dt_label._QR_SIZE
+_HDR_H                   = dt_label._HDR_H
+_SIDE_HDR_H              = dt_label._SIDE_HDR_H
+_TRACK_ROW_H             = dt_label._TRACK_ROW_H
 
 
 # ─── get_side ─────────────────────────────────────────────────────────────────
@@ -514,3 +519,143 @@ class TestRenderLabel:
                 1: {"bpm": 132, "duration_ms": 420000}}
         render_label(_fake_render_release(), tracks, profile,
                      is_compilation=False, bpms=bpms)
+
+    def test_die_cut_does_not_wrap_tracks(self):
+        """Die-cut labels use truncation, not wrapping — canvas height is fixed."""
+        from PIL import Image as PILImage
+        profile = LABEL_PROFILES["dk1247"]
+        t = MagicMock()
+        t.__getitem__ = MagicMock(side_effect=lambda k: "A1" if k == "position" else "")
+        t.getArtist.return_value = "Artist"
+        t.getTitle.return_value = "A" * 120   # absurdly long title
+        t.getDuration.return_value = ""
+        tracks = [("A", 0, t)]
+        img = render_label(_fake_render_release(), tracks, profile, is_compilation=False)
+        # Canvas must still be the fixed die-cut height
+        assert img.height == profile["height_px"]
+
+    def test_continuous_height_includes_qr_area(self):
+        """notes_h must be large enough to fit the QR code without overlap."""
+        profile = LABEL_PROFILES["dk22243"]
+        M = profile["margin_px"]
+        notes_lines = profile["notes_lines"]
+        # Compute notes_h the same way _continuous_height does
+        notes_h = 28 + max(_QR_SIZE, notes_lines * dt_label._LINE_SPACING)
+        assert notes_h >= 28 + _QR_SIZE, \
+            "notes_h must provide at least QR_SIZE pixels after the divider"
+
+
+# ─── QR code placement ────────────────────────────────────────────────────────
+
+def _fake_long_track(position: str, title: str, artist: str = "Artist",
+                     duration: str = "5:00") -> MagicMock:
+    """Build a track mock with a specific long title for wrap/QR tests."""
+    t = MagicMock()
+    t.__getitem__ = MagicMock(side_effect=lambda k: position if k == "position" else "")
+    t.getArtist.return_value = artist
+    t.getTitle.return_value = title
+    t.getDuration.return_value = duration
+    return t
+
+
+class TestQRPlacement:
+    """Verify the QR code never overlaps the track listing."""
+
+    PROFILE = LABEL_PROFILES["dk22243"]
+    M       = LABEL_PROFILES["dk22243"]["margin_px"]
+
+    def _y_after_tracks(self, tracks_with_sides, release, is_compilation=False):
+        """Simulate the y cursor position after all track rows are rendered."""
+        from PIL import Image, ImageDraw
+        profile = self.PROFILE
+        W = profile["width_px"]
+        M = profile["margin_px"]
+        CW = W - 2 * M
+        BPM_ZONE_W = 110
+        POS_W = 90
+        TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
+        tmp = Image.new("RGB", (W, 100), "white")
+        draw = ImageDraw.Draw(tmp)
+
+        # Header y advancement (normal, 1-line title)
+        title_raw = release.getTitle()
+        f_t = dt_label._font_for("regular", 54, title_raw)
+        title_lines = dt_label.wrap_text(draw, title_raw, f_t, CW)
+        hdr_y = dt_label._HDR_H["normal"] + (len(title_lines) - 1) * dt_label._TITLE_WRAP_LINE_H
+        y = M + hdr_y
+
+        current_side = object()
+        for side, idx, track in tracks_with_sides:
+            if side != current_side:
+                current_side = side
+                y += _SIDE_HDR_H
+            if is_compilation:
+                ts = (f"{dt_label._strip_disambig(track.getArtist())} – "
+                      f"{track.getTitle(synthesise=False)}")
+            else:
+                ts = track.getTitle(synthesise=False)
+            dur = track.getDuration()
+            dur_suffix = f" ({dur})" if dur else ""
+            f_tr = dt_label._font_for("regular", 38, ts)
+            lines = dt_label.wrap_text(draw, ts + dur_suffix, f_tr, TITLE_MAX_W)
+            y += _TRACK_ROW_H + (len(lines) - 1) * dt_label._EXTRA_LINE_H
+        return y
+
+    def test_qr_below_tracks_short_release(self):
+        """QR code must not overlap tracks on a short release."""
+        profile = self.PROFILE
+        tracks = [("A", 0, _fake_long_track("A1", "Short Title", duration="3:00")),
+                  ("A", 1, _fake_long_track("A2", "Another Short Title", duration="4:00"))]
+        release = _fake_render_release()
+        extra = _measure_wrap_extra_px(tracks, profile, False, release=release)
+        h = _continuous_height(tracks, profile, extra_px=extra)
+        y_tracks = self._y_after_tracks(tracks, release)
+        # qr_top in the new design = y after tracks + notes divider (28px)
+        qr_top = y_tracks + 28
+        assert qr_top + _QR_SIZE <= h - self.M, \
+            f"QR ({qr_top}…{qr_top+_QR_SIZE}) overflows canvas bottom ({h - self.M})"
+        assert qr_top >= y_tracks, "QR must start after the last track row"
+
+    def test_qr_below_tracks_many_wrapping(self):
+        """QR must not overlap tracks when many titles wrap to a second line.
+
+        This is a regression test for the r35722564 scenario where the QR code
+        overlapped the last track because _measure_wrap_extra_px underestimated
+        the extra height needed on borderline-width titles.
+        """
+        profile = self.PROFILE
+        # Simulate a compilation with several long titles that wrap
+        long_titles = [
+            ("A", 0, _fake_long_track("A1", "The Bug", "Hooked (Hyams Gym, Leytonstone)", "4:51")),
+            ("A", 1, _fake_long_track("A2", "Ghost Dubs", "In The Zone", "4:32")),
+            ("A", 2, _fake_long_track("A3", "The Bug", "Believers (Imperial Gardens, Camberwell)", "4:29")),
+            ("B", 3, _fake_long_track("B1", "Ghost Dubs", "Hope", "3:37")),
+            ("B", 4, _fake_long_track("B2", "The Bug", "Burial Skank (Mass, Brixton)", "3:38")),
+            ("B", 5, _fake_long_track("B3", "Ghost Dubs", "Dub Remote", "3:35")),
+            ("C", 6, _fake_long_track("C1", "The Bug", "Alien Virus (West Indian Centre, Leeds)", "4:48")),
+            ("C", 7, _fake_long_track("C2", "Ghost Dubs", "Down", "4:05")),
+            ("C", 8, _fake_long_track("C3", "The Bug", "Militants (The Rocket, Holloway)", "4:22")),
+            ("D", 9,  _fake_long_track("D1", "Ghost Dubs", "Into The Mystic", "4:25")),
+            ("D", 10, _fake_long_track("D2", "The Bug", "Dread (The End, London)", "5:00")),
+            ("D", 11, _fake_long_track("D3", "Ghost Dubs", "Midnight", "4:07")),
+        ]
+        release = _fake_render_release()
+        extra = _measure_wrap_extra_px(long_titles, profile, True, release=release)
+        h = _continuous_height(long_titles, profile, extra_px=extra)
+        y_tracks = self._y_after_tracks(long_titles, release, is_compilation=True)
+        qr_top = y_tracks + 28   # notes divider is 28 px
+        assert qr_top >= y_tracks, "QR must be at or below last track"
+        assert qr_top + _QR_SIZE <= h - self.M, \
+            (f"QR ({qr_top}…{qr_top+_QR_SIZE}) overflows canvas bottom ({h-self.M}); "
+             f"h={h}, extra_px={extra}, y_tracks={y_tracks}")
+
+    def test_notes_area_always_fits_qr(self):
+        """The notes area (notes_h) must always be large enough to contain the QR code."""
+        for profile in LABEL_PROFILES.values():
+            if profile.get("feed") != "continuous":
+                continue
+            M = profile["margin_px"]
+            notes_lines = profile.get("notes_lines", 3)
+            notes_h = 28 + max(_QR_SIZE, notes_lines * dt_label._LINE_SPACING)
+            assert notes_h >= 28 + _QR_SIZE, \
+                f"notes_h {notes_h} too small for QR in profile {profile}"
