@@ -58,7 +58,9 @@ Chrome requires MV3, which makes the background script a service worker that Chr
 
 CORS on dt_server echoes back only `moz-extension://` and `chrome-extension://` origins — never a wildcard, and never an `http(s)` origin, since the server binds to localhost where any visited page could otherwise reach it.
 
-The extension popup calls `http://localhost:5679/status` (health) and `POST /print` (release_id, profile, preview, split, discs). The server delegates to `dt_label` as a subprocess, serves preview PNGs from a temp dir, and reports Discogs/Beatport/Anthropic/LLM credential status in the `/status` response. The popup footer displays four connection dots: Discogs, Beatport, Anthropic (used by the Beatport matcher), and Finder (the dt_find LLM backend, labelled "Claude" or "Local LLM" depending on the configured backend).
+The extension popup calls `http://localhost:5679/status` (health) and `POST /print` (release_id, profile, preview, split, discs). The server delegates to `dt_label` as a subprocess, serves preview PNGs from a temp dir, and reports Discogs/Beatport/Anthropic credential status in the `/status` response. The popup footer displays three connection dots: Discogs, Beatport, and Anthropic. There was a fourth ("Finder") for the dt_find backend; once the local LLM option went away its check was byte-identical to the Anthropic one — the same key serves both the Beatport matcher and dt_find — so two dots could never disagree and one was removed. `tests/test_dt_server.py` pins the `/status` service key set.
+
+**Popup settings are split by lifetime.** The port and the label profile persist in `storage.local`; the three option checkboxes (split by disc, hide BPM, preview only) do not. They start cleared each time the popup opens and `clearOptions()` resets them — along with the discs field — once a real print is enqueued. A preview deliberately does *not* clear them, because previews come in runs and re-ticking the same boxes to re-render the same label is worse than the risk it avoids. This also means `background.js`'s context-menu handler has nothing to inherit: it always sends a plain print (`preview: false, split: false, hide_bpm: false`).
 
 ### Job queue and progress reporting
 
@@ -138,7 +140,7 @@ Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf categ
 | `~/.discogstool/beatport.db` | SQLite | Beatport release cache + match/nomatch + bpm_verified |
 | `~/.discogstool/beatport.log` | Rotating text | Debug log for every Beatport matching decision |
 | `~/.discogstool/label_config` | `key=value` | Printer address, model, default profile |
-| `~/.discogstool/find_config` | `key=value` | dt_find LLM backend settings |
+| `~/.discogstool/find_config` | `key=value` | dt_find model override (`find_anthropic_model`) |
 
 ### beatport_auth.json keys
 
@@ -150,9 +152,7 @@ Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf categ
   "refresh_token": "...",
   "expires_at": 1234567890.0,
   "anthropic_api_key": "sk-ant-...",
-  "anthropic_model": "claude-haiku-4-5-20251001",
-  "llm_url": "http://host:11434/api/generate",
-  "llm_model": "llama3"
+  "anthropic_model": "claude-haiku-4-5-20251001"
 }
 ```
 
@@ -248,23 +248,27 @@ The item and the OAuth credentials must be created by hand once; see `docs/chrom
 
 ### dt_find LLM backend
 
-`dt_find` supports two backends for the Discogs search agent, selected via `find_config` or `--backend`:
+`dt_find` runs its Discogs search agent on Claude Haiku via the Anthropic API, using native tool use:
 
-**`backend=local`** (default) — OpenAI-compatible local LLM (MLX, llama.cpp, vLLM, etc.):
 ```bash
-./dt_find --backend local --wintermute http://host:8000/v1 --model my-model
-./dt_find "the blue Miles Davis one"
-```
-Settings saved to `~/.discogstool/find_config`. `check_available` pings `{llm_url}/models`.
-
-**`backend=anthropic`** — Claude Haiku via Anthropic API (recommended; uses native tool use):
-```bash
-./dt_find --backend anthropic
 ./dt_find "the one with the triangle"
+./dt_find --model claude-haiku-4-5-20251001   # saved to find_config
 ```
-Reads `anthropic_api_key` from `~/.discogstool/beatport_auth.json` or `ANTHROPIC_API_KEY` env var. An optional `find_anthropic_model` key in `find_config` overrides the default model (`claude-haiku-4-5-20251001`).
 
-**Architecture**: `LLMBackend` is an abstract base class; `LocalLLMBackend` and `AnthropicBackend` inherit from it. `create_backend(config)` is the factory used by `main()`. `ANTHROPIC_TOOLS` is the Anthropic-format equivalent of `TOOLS` (uses `input_schema` instead of `parameters`). Thinking-tag stripping (`<think>…</think>`) is only applied in `LocalLLMBackend` since it is specific to reasoning-model outputs.
+Reads `anthropic_api_key` from `~/.discogstool/beatport_auth.json` or `ANTHROPIC_API_KEY` env var. An optional `find_anthropic_model` key in `find_config` overrides the default model (`claude-haiku-4-5-20251001`); `--model` writes that key.
+
+**Architecture**: `AnthropicBackend` is the only backend; `create_backend(config)` builds it from `find_config` and is what `main()` calls. `TOOLS` is written directly in Anthropic native format (`input_schema`, not `parameters`).
+
+There used to be a second backend, `LocalLLMBackend`, speaking the OpenAI API to a local server (MLX/llama.cpp/vLLM). It is gone, and with it:
+
+- the `LLMBackend` ABC, which existed only to hold two implementations,
+- `_openai_to_anthropic()` and the OpenAI-shaped `TOOLS`/`ANTHROPIC_TOOLS` pair — with one dialect left there is nothing to convert,
+- `_strip_think()`/`_extract_think()`, specific to reasoning-model `<think>` output,
+- the `backend`, `llm_url` and `llm_model` keys and the `--backend`/`--wintermute` flags. `--model` now means the Anthropic model.
+
+Stale `backend=local` / `llm_url` / `llm_model` lines in an existing `find_config` are simply ignored (pinned by a test) — no migration needed.
+
+Separately, `beatport.py` carried an `LLMMatcher` that posted to an Ollama endpoint (`llm_url` in `beatport_auth.json`). It was never in the default matcher chain — `[CatnoMatcher(), TitleMatcher(), AnthropicMatcher()]` — so it was dead code, and it was removed with the rest. The three JSON-parsing edge cases its tests uniquely covered moved onto `AnthropicMatcher._parse_response`, which shares the extraction logic.
 
 ### Beatport credential setup
 ```bash
@@ -285,7 +289,7 @@ python3 beatport.py --clear-match 12345678      # remove cached result
 
 ## Key Code Conventions
 
-**One tool dispatcher in `dt_find`**: `_dispatch_tool()` executes a tool call for both backends. The OpenAI and Anthropic wire formats differ, but the decision and side effects are identical, and each backend used to carry its own copy of them.
+**One tool dispatcher in `dt_find`**: `_dispatch_tool()` executes every tool call, separate from the wire-format handling in `AnthropicBackend.run_agent`. It was introduced when two backends each carried a copy of the same decisions; with one backend left it still keeps tool semantics out of the transport loop.
 
 **Shared helpers in `util.py`**: `load_kv_config`/`save_kv_config` own the `key=value` dotfile format used by `label_config` and `find_config` — dt_label, dt_find and dt_server previously each carried a byte-identical copy of the parser. Its quirks (last duplicate key wins, `#` only starts a comment at line start, split on first `=` only) are load-bearing for existing files and pinned by `tests/test_config_parsing.py`, which asserts every caller produces identical output. `resolve_anthropic_key()` is the single Anthropic key lookup (auth file, then `ANTHROPIC_API_KEY`); it replaced four copies.
 

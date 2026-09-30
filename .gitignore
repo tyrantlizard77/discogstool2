@@ -16,8 +16,10 @@ htmlcov/
 firefox-ext/
 chrome-ext/
 
-# Chrome for Testing download — not part of this project
-chrome/
+# Chrome for Testing download — not part of this project.
+# Anchored: an unanchored "chrome/" also matched ext/chrome/, which silently
+# kept the Chrome manifest out of the repo entirely.
+/chrome/
 
 # packaged extension zips
 dist/

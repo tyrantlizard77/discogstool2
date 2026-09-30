@@ -203,7 +203,6 @@ def status():
         "discogs":   _check_discogs(),
         "beatport":  _check_beatport(),
         "anthropic": _check_anthropic(),
-        "llm":       _check_llm(),
     })
 
 
@@ -251,47 +250,12 @@ def _check_anthropic():
 
 
 def _do_check_anthropic():
+    """One key covers both consumers — the Beatport matcher and dt_find's
+    record finder — so a single dot reports both."""
     import util
     if util.resolve_anthropic_key():
         return {"status": "ok"}
     return {"status": "error", "message": "no API key configured"}
-
-
-def _check_llm():
-    """Check whether the dt_find LLM backend is configured and reachable.
-
-    Reads ~/.discogstool/find_config to determine the active backend
-    (local or anthropic), then verifies the required credentials/connectivity.
-    Returns a status dict with an extra 'backend' key for UI labelling.
-    """
-    return _check_service(_do_check_llm)
-
-
-def _do_check_llm():
-    import util
-    config = util.load_kv_config(util.userfile("find_config"))
-
-    backend = config.get("backend", "local")
-
-    if backend == "anthropic":
-        if util.resolve_anthropic_key():
-            return {"status": "ok", "backend": "anthropic"}
-        return {"status": "error", "message": "no Anthropic API key configured",
-                "backend": "anthropic"}
-
-    else:  # local OpenAI-compatible server
-        llm_url = config.get("llm_url", "")
-        if not llm_url:
-            return {"status": "error", "message": "no LLM URL configured",
-                    "backend": "local"}
-        try:
-            import requests as _req
-            _req.get(f"{llm_url}/models", timeout=2)
-            return {"status": "ok", "backend": "local"}
-        except Exception as e:
-            return {"status": "error",
-                    "message": f"LLM server unreachable: {e}",
-                    "backend": "local"}
 
 
 @app.route("/preview/<path:filename>", methods=["GET"])

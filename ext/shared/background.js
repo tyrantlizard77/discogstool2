@@ -22,8 +22,10 @@
  * Communication with dt_server:
  *  - All requests go to http://localhost:{port}/ where port defaults to 5679
  *    and is persisted in storage.local under the key "port".
- *  - The context menu handler reads the stored profile/split/preview settings
- *    and sends the same JSON body as the popup's print button.
+ *  - The context menu handler reads the stored profile and sends the same JSON
+ *    body as the popup's print button. The popup's option checkboxes (split,
+ *    hide BPM, preview) are per-print and not persisted, so there is nothing
+ *    here to inherit: a context-menu click is always a plain print.
  */
 
 // Show/enable the browser action only on Discogs release pages.
@@ -44,7 +46,7 @@ const IS_SERVICE_WORKER =
 const RELEASE_URL = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
 const DISCOGS_URL  = /discogs\.com/;
 const DEFAULT_PORT = 5679;
-const STORAGE_KEYS = ["port", "profile", "split", "hide_bpm", "preview"];
+const STORAGE_KEYS = ["port", "profile"];
 
 function updateAction(tabId, url) {
   if (url && DISCOGS_URL.test(url)) {
@@ -94,22 +96,18 @@ menus.onClicked.addListener(async (info) => {
   const stored  = await api.storage.local.get(STORAGE_KEYS);
   const port    = stored.port    || DEFAULT_PORT;
   const profile = stored.profile || "dk1247";
-  const split   = stored.split   || false;
-  const hideBpm = stored.hide_bpm || false;
-  const preview = stored.preview || false;
 
-  // Print jobs are queued server-side and return immediately, so this no
-  // longer needs a two-minute timeout. Preview still runs synchronously
-  // because the response carries the PNG URLs we need to open.
+  // Print jobs are queued server-side and return immediately, so this only
+  // has to wait for the enqueue.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), preview ? 30_000 : 10_000);
+  const timer = setTimeout(() => controller.abort(), 10_000);
   try {
     const resp = await fetch(`http://localhost:${port}/print`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        release_id: releaseId, profile, preview, split, discs: null,
-        hide_bpm: hideBpm,
+        release_id: releaseId, profile, preview: false, split: false,
+        discs: null, hide_bpm: false,
       }),
       signal: controller.signal,
     });
@@ -117,15 +115,9 @@ menus.onClicked.addListener(async (info) => {
     if (!resp.ok || !data.ok) {
       throw new Error(data.message || `Server error ${resp.status}`);
     }
-    if (preview && data.preview_urls?.length) {
-      for (const url of data.preview_urls) {
-        api.tabs.create({ url: `http://localhost:${port}${url}` });
-      }
-    } else if (!preview) {
-      // Don't claim it printed — it's only queued at this point. The badge
-      // and the popup's stage list report what actually happens next.
-      pollUntilIdle();
-    }
+    // Don't claim it printed — it's only queued at this point. The badge
+    // and the popup's stage list report what actually happens next.
+    pollUntilIdle();
   } catch (err) {
     const msg = err.name === "AbortError"
       ? `Request timed out — is dt_server running on port ${port}?`

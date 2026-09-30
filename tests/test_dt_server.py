@@ -140,6 +140,17 @@ class TestStatusEndpoint:
         data = json.loads(client.get("/status").data)
         assert isinstance(data["beatport"], dict)
 
+    def test_status_service_keys(self, client):
+        """One dot per service in the popup footer.
+
+        The 'llm' entry went away with the local dt_find backend: its check had
+        collapsed into _check_anthropic (both just look for an API key), so the
+        popup was drawing two dots that could never disagree.
+        """
+        data = json.loads(client.get("/status").data)
+        services = set(data) - {"ok", "version"}
+        assert services == {"discogs", "beatport", "anthropic"}
+
     def test_status_content_type_json(self, client):
         response = client.get("/status")
         assert "application/json" in response.content_type

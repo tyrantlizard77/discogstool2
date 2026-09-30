@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""dt_find — voice/text vinyl record finder powered by an LLM.
+"""dt_find — voice/text vinyl record finder powered by Claude.
 
-Describe a record in plain English — vague, informal, partial — and the LLM
+Describe a record in plain English — vague, informal, partial — and Claude
 searches Discogs on your behalf, opens the release page for confirmation,
 then optionally prints a sleeve label.
 
@@ -10,17 +10,13 @@ Usage
     ./dt_find                              # voice input (default)
     ./dt_find --text                       # force typed description
     ./dt_find "the blue Miles Davis one"   # description inline
-    ./dt_find --backend anthropic          # use Claude Haiku via API
-    ./dt_find --backend local              # use local OpenAI-compatible LLM
+    ./dt_find --model claude-haiku-4-5-20251001   # pin a model (saved)
 
 Saved settings  (~/.discogstool/find_config)
 --------------------------------------------
-    backend=anthropic                          # or: local  (default: local)
-    llm_url=http://wintermute.local:8000/v1    # for backend=local
-    llm_model=mlx-community/Qwen3.5-122B-A10B-4bit
     find_anthropic_model=claude-haiku-4-5-20251001  # optional model override
 
-For backend=anthropic the API key is read from ~/.discogstool/beatport_auth.json
+The API key is read from ~/.discogstool/beatport_auth.json
 ("anthropic_api_key") or the ANTHROPIC_API_KEY environment variable.
 
 Voice dependencies (installed separately, see requirements.txt):
@@ -32,11 +28,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import webbrowser
-from abc import ABC, abstractmethod
 
 # Allow importing sibling modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,8 +43,6 @@ log = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 CONFIG_FILE = "find_config"
-DEFAULT_LLM_URL   = "http://wintermute.local:8000/v1"
-DEFAULT_LLM_MODEL = "mlx-community/Qwen3.5-122B-A10B-4bit"
 
 # Max LLM tool-calling rounds before giving up
 MAX_SEARCH_TURNS = 8
@@ -146,86 +138,62 @@ def get_description_text(prompt: str = "Describe the record: ") -> str | None:
 
 # ── LLM tool definitions ───────────────────────────────────────────────────────
 
-# OpenAI-compatible format (used by LocalLLMBackend)
-TOOLS = [
+# Anthropic native tool-use format.  These were previously written in the
+# OpenAI schema and converted at import time, because a second backend spoke
+# that dialect; with only Claude left there is nothing to convert.
+TOOLS: list[dict] = [
     {
-        "type": "function",
-        "function": {
-            "name": "search_discogs",
-            "description": (
-                "Search the Discogs database for vinyl releases. "
-                "You may call this multiple times with different parameters. "
-                "Returns up to 8 matching releases with id, artist, title, "
-                "label, catno, year, format, and country."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "q": {
-                        "type": "string",
-                        "description": "Free-text query (e.g. 'Miles Davis Kind of Blue')",
-                    },
-                    "artist": {"type": "string", "description": "Artist name"},
-                    "title": {"type": "string", "description": "Release/album title"},
-                    "label": {"type": "string", "description": "Record label name"},
-                    "year": {"type": "string", "description": "Release year"},
-                    "catno": {"type": "string", "description": "Catalog number"},
-                    "format": {
-                        "type": "string",
-                        "description": "Format filter, e.g. 'Vinyl' or 'LP'",
-                    },
+        "name": "search_discogs",
+        "description": (
+            "Search the Discogs database for vinyl releases. "
+            "You may call this multiple times with different parameters. "
+            "Returns up to 8 matching releases with id, artist, title, "
+            "label, catno, year, format, and country."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "q": {
+                    "type": "string",
+                    "description": "Free-text query (e.g. 'Miles Davis Kind of Blue')",
                 },
-                "required": [],
+                "artist": {"type": "string", "description": "Artist name"},
+                "title": {"type": "string", "description": "Release/album title"},
+                "label": {"type": "string", "description": "Record label name"},
+                "year": {"type": "string", "description": "Release year"},
+                "catno": {"type": "string", "description": "Catalog number"},
+                "format": {
+                    "type": "string",
+                    "description": "Format filter, e.g. 'Vinyl' or 'LP'",
+                },
             },
+            "required": [],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "select_release",
-            "description": (
-                "Call this when you have identified the correct Discogs release. "
-                "Only call it when you are genuinely confident — false positives "
-                "waste label stock. If you cannot find a confident match after "
-                "several searches, say so in text instead."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "release_id": {
-                        "type": "integer",
-                        "description": "The numeric Discogs release ID",
-                    },
-                    "reasoning": {
-                        "type": "string",
-                        "description": "Brief explanation of why this is the right release",
-                    },
+        "name": "select_release",
+        "description": (
+            "Call this when you have identified the correct Discogs release. "
+            "Only call it when you are genuinely confident — false positives "
+            "waste label stock. If you cannot find a confident match after "
+            "several searches, say so in text instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "release_id": {
+                    "type": "integer",
+                    "description": "The numeric Discogs release ID",
                 },
-                "required": ["release_id", "reasoning"],
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation of why this is the right release",
+                },
             },
+            "required": ["release_id", "reasoning"],
         },
     },
 ]
-
-def _openai_to_anthropic(tools: list[dict]) -> list[dict]:
-    """Convert OpenAI-format tool definitions to Anthropic native format.
-
-    OpenAI format: {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
-    Anthropic format: {"name": ..., "description": ..., "input_schema": ...}
-    """
-    result = []
-    for t in tools:
-        fn = t["function"]
-        result.append({
-            "name": fn["name"],
-            "description": fn["description"],
-            "input_schema": fn["parameters"],
-        })
-    return result
-
-
-# Anthropic native tool format (generated from TOOLS above)
-ANTHROPIC_TOOLS: list[dict] = _openai_to_anthropic(TOOLS)
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -327,28 +295,10 @@ def _fmt_search_args(args: dict) -> str:
     return ", ".join(parts) or "(no parameters)"
 
 
-# ── Strip thinking tags (Qwen3 / reasoning models) ────────────────────────────
-
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-
-
-def _strip_think(text: str) -> str:
-    return _THINK_RE.sub("", text).strip()
-
-
-def _extract_think(text: str) -> str | None:
-    m = _THINK_RE.search(text)
-    return m.group(0)[7:-8].strip() if m else None  # strip <think>…</think>
-
-
-# ── Abstract LLM backend ──────────────────────────────────────────────────────
+# ── Tool dispatch ─────────────────────────────────────────────────────────────
 
 def _dispatch_tool(name: str, args: dict) -> tuple[dict, tuple[int, str] | None]:
-    """Execute one tool call from either backend.
-
-    The two backends speak different wire formats (OpenAI `tool_calls` vs
-    Anthropic `tool_use` blocks), but the decision and side effects for a given
-    tool are identical.  That shared part lives here so it cannot drift.
+    """Execute one tool call.
 
     Returns (payload, selection):
       payload   — JSON-serialisable result to hand back to the model
@@ -375,156 +325,9 @@ def _dispatch_tool(name: str, args: dict) -> tuple[dict, tuple[int, str] | None]
     return {"error": f"Unknown tool: {name}"}, None
 
 
-class LLMBackend(ABC):
-    """Abstract base for LLM backends used by dt_find.
-
-    Subclasses implement the model-specific agent loop and availability check.
-    Two concrete backends are provided:
-      - LocalLLMBackend  — OpenAI-compatible API (MLX, llama.cpp, vLLM, …)
-      - AnthropicBackend — Anthropic Claude API (Haiku recommended)
-    """
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Human-readable backend identifier (shown in the UI and on startup)."""
-
-    @abstractmethod
-    def check_available(self) -> tuple[bool, str]:
-        """Return (ok, error_message).
-
-        ok=True means the backend is configured and (best-effort) reachable.
-        error_message is empty when ok=True.
-        """
-
-    @abstractmethod
-    def run_agent(
-        self,
-        description: str,
-        verbose: bool = False,
-    ) -> tuple[int | None, str]:
-        """Run the tool-calling agent loop.
-
-        Returns (release_id, reasoning) where release_id is a Discogs release
-        ID, or (None, '') if the agent could not identify the record.
-        """
-
-
-# ── Local OpenAI-compatible backend ───────────────────────────────────────────
-
-class LocalLLMBackend(LLMBackend):
-    """OpenAI-compatible local LLM backend (MLX, llama.cpp, vLLM, etc.).
-
-    The LLM must support function / tool calling.  Reasoning-model <think>
-    blocks are stripped from responses before display.
-    """
-
-    def __init__(self, llm_url: str, llm_model: str) -> None:
-        self._url   = llm_url
-        self._model = llm_model
-
-    @property
-    def name(self) -> str:
-        return f"Local LLM ({self._model})"
-
-    def check_available(self) -> tuple[bool, str]:
-        if not self._url:
-            return False, "no LLM URL configured"
-        try:
-            import requests as _req
-            _req.get(f"{self._url}/models", timeout=3)
-            return True, ""
-        except Exception as e:
-            return False, f"LLM server unreachable: {e}"
-
-    def run_agent(
-        self,
-        description: str,
-        verbose: bool = False,
-    ) -> tuple[int | None, str]:
-        try:
-            from openai import OpenAI
-        except ImportError:
-            raise SystemExit(
-                "The openai package is required: pip install openai"
-            )
-
-        client = OpenAI(base_url=self._url, api_key="not-required")
-
-        messages: list[dict] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": description},
-        ]
-
-        for _turn in range(MAX_SEARCH_TURNS):
-            try:
-                response = client.chat.completions.create(
-                    model=self._model,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                )
-            except Exception as e:
-                print(f"\nLLM error: {e}", file=sys.stderr)
-                return None, ""
-
-            msg     = response.choices[0].message
-            content = msg.content or ""
-            visible = _strip_think(content)
-
-            if verbose:
-                thinking = _extract_think(content)
-                if thinking:
-                    print("\033[2m[thinking…]\033[0m", end=" ", flush=True)
-
-            # Build the assistant entry for message history.
-            # The openai SDK returns a ChatCompletionMessage; convert to plain
-            # dict so we can append custom fields without type issues.
-            asst_entry: dict = {"role": "assistant", "content": content}
-            if msg.tool_calls:
-                asst_entry["tool_calls"] = [
-                    {
-                        "id":       tc.id,
-                        "type":     "function",
-                        "function": {
-                            "name":      tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ]
-            messages.append(asst_entry)
-
-            # No tool calls → LLM gave a final text response
-            if not msg.tool_calls:
-                if visible:
-                    print(f"\n{visible}")
-                return None, ""
-
-            # Execute each tool call
-            for tc in msg.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-
-                payload, selection = _dispatch_tool(tc.function.name, args)
-                # Always acknowledge, so the model can close gracefully.
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      json.dumps(payload),
-                })
-                if selection is not None:
-                    return selection
-
-        print("\nReached search limit without a confident match.", file=sys.stderr)
-        return None, ""
-
-
 # ── Anthropic Claude API backend ──────────────────────────────────────────────
 
-class AnthropicBackend(LLMBackend):
+class AnthropicBackend:
     """Anthropic Claude API backend using native tool use.
 
     Uses the same Anthropic API key as the Beatport AnthropicMatcher
@@ -553,11 +356,12 @@ class AnthropicBackend(LLMBackend):
             return False, "no Anthropic API key configured"
         return True, ""
 
-    def run_agent(
-        self,
-        description: str,
-        verbose: bool = False,
-    ) -> tuple[int | None, str]:
+    def run_agent(self, description: str) -> tuple[int | None, str]:
+        """Run the tool-calling agent loop.
+
+        Returns (release_id, reasoning), or (None, '') if the record could not
+        be identified.
+        """
         try:
             import requests
         except ImportError:
@@ -584,7 +388,7 @@ class AnthropicBackend(LLMBackend):
                 "model":      self._model,
                 "max_tokens": 1024,
                 "system":     SYSTEM_PROMPT,
-                "tools":      ANTHROPIC_TOOLS,
+                "tools":      TOOLS,
                 "messages":   messages,
             }
             try:
@@ -637,16 +441,9 @@ class AnthropicBackend(LLMBackend):
 
 # ── Backend factory ───────────────────────────────────────────────────────────
 
-def create_backend(config: dict) -> LLMBackend:
-    """Instantiate the appropriate LLMBackend from a find_config dict."""
-    backend_name = config.get("backend", "local")
-    if backend_name == "anthropic":
-        model = config.get("find_anthropic_model") or None
-        return AnthropicBackend(model=model)
-    # Default: local OpenAI-compatible server
-    url   = config.get("llm_url",   DEFAULT_LLM_URL)
-    model = config.get("llm_model", DEFAULT_LLM_MODEL)
-    return LocalLLMBackend(url, model)
+def create_backend(config: dict) -> AnthropicBackend:
+    """Instantiate the LLM backend described by a find_config dict."""
+    return AnthropicBackend(model=config.get("find_anthropic_model") or None)
 
 
 # ── Result display + confirm ───────────────────────────────────────────────────
@@ -722,7 +519,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Voice/text vinyl record finder powered by an LLM.",
+        description="Voice/text vinyl record finder powered by Claude.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -735,7 +532,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
-        help="Show LLM thinking indicators and debug info",
+        help="Show debug output",
     )
     parser.add_argument(
         "--no-browser", action="store_true",
@@ -754,16 +551,8 @@ def main() -> None:
         help="Save label as PNG instead of printing",
     )
     parser.add_argument(
-        "--backend", metavar="BACKEND", choices=["local", "anthropic"],
-        help="LLM backend: 'local' (OpenAI-compatible) or 'anthropic' (Claude API). Saved.",
-    )
-    parser.add_argument(
-        "--wintermute", metavar="URL",
-        help=f"Local LLM server base URL (default: {DEFAULT_LLM_URL}, saved)",
-    )
-    parser.add_argument(
         "--model", metavar="MODEL",
-        help=f"Local LLM model name (default: {DEFAULT_LLM_MODEL}, saved)",
+        help=f"Anthropic model to use (default: {AnthropicBackend.DEFAULT_MODEL}, saved)",
     )
     args = parser.parse_args()
 
@@ -771,15 +560,9 @@ def main() -> None:
         logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
 
     # Load/update saved config
-    config  = load_config()
-    changed = False
-    if args.backend:
-        config["backend"]   = args.backend;  changed = True
-    if args.wintermute:
-        config["llm_url"]   = args.wintermute; changed = True
+    config = load_config()
     if args.model:
-        config["llm_model"] = args.model;      changed = True
-    if changed:
+        config["find_anthropic_model"] = args.model
         save_config(config)
 
     backend = create_backend(config)
@@ -809,10 +592,7 @@ def main() -> None:
 
     # ── Run agent ─────────────────────────────────────────────────────────────
 
-    release_id, reasoning = backend.run_agent(
-        description,
-        verbose=args.verbose,
-    )
+    release_id, reasoning = backend.run_agent(description)
 
     if release_id is None:
         print("\nCould not identify the record. Try being more specific.",

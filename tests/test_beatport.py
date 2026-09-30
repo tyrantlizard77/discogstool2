@@ -4,7 +4,6 @@ Covers:
   - Normalisation helpers (_normalize_title, _normalize_catno,
     _strip_discogs_artist, _similarity, _catno_similarity, _title_similarity)
   - BeatportCache CRUD and TTL expiry (using in-memory SQLite)
-  - LLMMatcher._parse_llm_response edge cases
   - _match_tracks: happy path, coverage gate (title-match vs BPM-match), mix names
   - BeatportMatcher: nomatch caching, confidence threshold, cached-match reuse
   - _BeatportClient.search_releases: response key extraction
@@ -35,7 +34,6 @@ from beatport import (
     BeatportCache,
     BeatportMatcher,
     BPM_VERIFY_MIN_CONFIDENCE,
-    LLMMatcher,
     ReleaseMatcher,
     YEAR_HARD_MAX,
     YEAR_PENALTY_FACTOR,
@@ -444,79 +442,11 @@ class TestBeatportCacheNomatch:
         cache.delete_nomatch("does-not-exist")  # should not raise
 
 
-# ─── LLMMatcher._parse_llm_response ──────────────────────────────────────────
-
-class TestParseLLMResponse:
-    def test_valid_json(self):
-        result = LLMMatcher._parse_llm_response(
-            '{"beatport_id": "12345", "confidence": 0.95}'
-        )
-        assert result == ("12345", 0.95)
-
-    def test_integer_id_is_stringified(self):
-        result = LLMMatcher._parse_llm_response(
-            '{"beatport_id": 12345, "confidence": 0.9}'
-        )
-        assert result is not None
-        bid, conf = result
-        assert isinstance(bid, str)
-        assert bid == "12345"
-
-    def test_json_with_surrounding_text(self):
-        result = LLMMatcher._parse_llm_response(
-            'Here is the match:\n{"beatport_id": "99", "confidence": 0.88}\nDone.'
-        )
-        assert result == ("99", 0.88)
-
-    def test_null_beatport_id(self):
-        result = LLMMatcher._parse_llm_response(
-            '{"beatport_id": null, "confidence": 0.0}'
-        )
-        assert result == (None, 0.0)
-
-    def test_missing_confidence_defaults_to_zero(self):
-        result = LLMMatcher._parse_llm_response('{"beatport_id": "55"}')
-        assert result is not None
-        bid, conf = result
-        assert bid == "55"
-        assert conf == 0.0
-
-    def test_no_json_in_response(self):
-        result = LLMMatcher._parse_llm_response("I could not find a match.")
-        assert result is None
-
-    def test_malformed_json(self):
-        result = LLMMatcher._parse_llm_response("{invalid json here}")
-        assert result is None
-
-    def test_empty_string(self):
-        result = LLMMatcher._parse_llm_response("")
-        assert result is None
-
-    def test_nested_json_does_not_break_parse(self):
-        # The old r'\{[^}]+\}' regex would fail on nested braces; raw_decode handles them.
-        result = LLMMatcher._parse_llm_response(
-            '{"beatport_id": "42", "confidence": 0.9, "meta": {"extra": "value"}}'
-        )
-        assert result is not None
-        assert result[0] == "42"
-        assert result[1] == pytest.approx(0.9)
-
-    def test_confidence_type_coercion(self):
-        # confidence given as string (edge case)
-        result = LLMMatcher._parse_llm_response(
-            '{"beatport_id": "7", "confidence": "0.9"}'
-        )
-        assert result is not None
-        _, conf = result
-        assert isinstance(conf, float)
-        assert conf == pytest.approx(0.9)
-
-
 # ─── AnthropicMatcher._parse_response ────────────────────────────────────────
 
 class TestAnthropicMatcherParseResponse:
-    """_parse_response reuses the same JSON extraction logic as LLMMatcher."""
+    """The only LLM response parser left, after the Ollama-backed LLMMatcher
+    (dead code — never in the default matcher chain) was removed."""
 
     def test_valid_match(self):
         result = AnthropicMatcher._parse_response(
@@ -560,6 +490,26 @@ class TestAnthropicMatcherParseResponse:
         assert result is not None
         assert result[0] == "77"
         assert result[1] == pytest.approx(0.95)
+
+    def test_missing_confidence_defaults_to_zero(self):
+        result = AnthropicMatcher._parse_response('{"beatport_id": "55"}')
+        assert result is not None
+        bid, conf = result
+        assert bid == "55"
+        assert conf == 0.0
+
+    def test_empty_string_returns_none(self):
+        assert AnthropicMatcher._parse_response("") is None
+
+    def test_confidence_type_coercion(self):
+        # confidence given as a string (edge case)
+        result = AnthropicMatcher._parse_response(
+            '{"beatport_id": "7", "confidence": "0.9"}'
+        )
+        assert result is not None
+        _, conf = result
+        assert isinstance(conf, float)
+        assert conf == pytest.approx(0.9)
 
 
 class TestAnthropicMatcherAvailability:

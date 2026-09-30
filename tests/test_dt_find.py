@@ -1,14 +1,13 @@
 """Tests for dt_find — voice/text vinyl record finder.
 
 Covers:
-  - _strip_think / _extract_think: <think> tag removal (Qwen3 reasoning chains)
   - _fmt_search_args: search parameter summary formatting
   - load_config / save_config: file I/O roundtrip
   - SYSTEM_PROMPT: sanity checks (contains key guidance phrases)
+  - TOOLS: Anthropic-native tool schemas
   - _tool_search_discogs: result formatting with a mocked Discogs client
-  - LocalLLMBackend.run_agent: tool-calling loop with a mocked OpenAI client
   - AnthropicBackend: availability check and agent loop with mocked requests
-  - create_backend: factory selects the correct backend class
+  - create_backend: factory builds the backend from find_config
 """
 
 from __future__ import annotations
@@ -35,88 +34,14 @@ sys.modules["dt_find"] = dt_find
 _loader.exec_module(dt_find)
 
 from dt_find import (  # noqa: E402  (after dynamic import)
-    ANTHROPIC_TOOLS,
     SYSTEM_PROMPT,
+    TOOLS,
     AnthropicBackend,
-    LocalLLMBackend,
-    LLMBackend,
-    _extract_think,
     _fmt_search_args,
-    _strip_think,
     create_backend,
     load_config,
     save_config,
 )
-
-
-# ─── _strip_think ─────────────────────────────────────────────────────────────
-
-class TestStripThink:
-    def test_no_tags_unchanged(self):
-        assert _strip_think("hello world") == "hello world"
-
-    def test_strips_inline_block(self):
-        result = _strip_think("<think>internal</think>answer")
-        assert result == "answer"
-        assert "<think>" not in result
-
-    def test_strips_multiline_block(self):
-        text = "<think>\nline1\nline2\n</think>\nResponse text"
-        result = _strip_think(text)
-        assert "line1" not in result
-        assert "line2" not in result
-        assert "Response text" in result
-
-    def test_strips_multiple_blocks(self):
-        text = "<think>first</think>middle<think>second</think>end"
-        result = _strip_think(text)
-        assert "first" not in result
-        assert "second" not in result
-        assert "middle" in result
-        assert "end" in result
-
-    def test_empty_think_block(self):
-        result = _strip_think("<think></think>answer")
-        assert result == "answer"
-
-    def test_empty_string(self):
-        assert _strip_think("") == ""
-
-    def test_no_think_content_preserved(self):
-        text = "Just a normal LLM response."
-        assert _strip_think(text) == text
-
-    def test_strips_leading_and_trailing_whitespace_after_removal(self):
-        # After stripping the block, the result should be stripped of extra space
-        result = _strip_think("<think>reason</think>  answer  ")
-        assert result == "answer"
-
-
-# ─── _extract_think ───────────────────────────────────────────────────────────
-
-class TestExtractThink:
-    def test_no_tags_returns_none(self):
-        assert _extract_think("hello world") is None
-
-    def test_extracts_content(self):
-        result = _extract_think("<think>internal reasoning</think>other")
-        assert result == "internal reasoning"
-
-    def test_extracts_multiline_content(self):
-        result = _extract_think("<think>line1\nline2</think>")
-        assert result == "line1\nline2"
-
-    def test_returns_first_match_only(self):
-        result = _extract_think("<think>first</think>mid<think>second</think>")
-        assert result == "first"
-
-    def test_strips_whitespace_from_content(self):
-        result = _extract_think("<think>  padded  </think>")
-        assert result == "padded"
-
-    def test_empty_think_block_returns_empty_string(self):
-        result = _extract_think("<think></think>")
-        assert result == ""
 
 
 # ─── _fmt_search_args ─────────────────────────────────────────────────────────
@@ -163,6 +88,10 @@ class TestFmtSearchArgs:
 # ─── load_config / save_config ───────────────────────────────────────────────
 
 class TestLoadSaveConfig:
+    """find_config I/O. The parser is generic, so most of these use an
+    arbitrary key; `find_anthropic_model` is the only key dt_find reads today.
+    """
+
     def test_missing_file_returns_empty_dict(self, tmp_path):
         config_path = str(tmp_path / "find_config")
         with patch.object(dt_find.util, "userfile", return_value=config_path):
@@ -172,57 +101,57 @@ class TestLoadSaveConfig:
     def test_roundtrip(self, tmp_path):
         config_path = str(tmp_path / "find_config")
         original = {
-            "llm_url": "http://test.example.com/v1",
-            "llm_model": "test-model-7b",
+            "find_anthropic_model": "claude-test-model",
+            "some_other_key": "kept-verbatim",
         }
         with patch.object(dt_find.util, "userfile", return_value=config_path):
             save_config(original)
             result = load_config()
-        assert result["llm_url"] == "http://test.example.com/v1"
-        assert result["llm_model"] == "test-model-7b"
+        assert result["find_anthropic_model"] == "claude-test-model"
+        assert result["some_other_key"] == "kept-verbatim"
 
     def test_comment_lines_ignored(self, tmp_path):
         config_path = str(tmp_path / "find_config")
         with open(config_path, "w") as f:
             f.write("# This is a comment\n")
-            f.write("llm_url=http://example.com\n")
+            f.write("find_anthropic_model=claude-test-model\n")
         with patch.object(dt_find.util, "userfile", return_value=config_path):
             result = load_config()
-        assert "llm_url" in result
-        assert "#" not in result.get("llm_url", "")
+        assert "find_anthropic_model" in result
+        assert "#" not in result.get("find_anthropic_model", "")
 
     def test_value_with_equals_sign(self, tmp_path):
         """Values containing '=' should be preserved correctly (split on first '=' only)."""
         config_path = str(tmp_path / "find_config")
         with open(config_path, "w") as f:
-            f.write("llm_url=http://host:8000/v1?key=val\n")
+            f.write("some_url=http://host:8000/v1?key=val\n")
         with patch.object(dt_find.util, "userfile", return_value=config_path):
             result = load_config()
-        assert result["llm_url"] == "http://host:8000/v1?key=val"
+        assert result["some_url"] == "http://host:8000/v1?key=val"
 
     def test_saved_file_is_human_readable(self, tmp_path):
         config_path = str(tmp_path / "find_config")
         with patch.object(dt_find.util, "userfile", return_value=config_path):
-            save_config({"llm_url": "http://x.local", "llm_model": "model"})
+            save_config({"find_anthropic_model": "claude-test-model"})
         with open(config_path) as f:
             content = f.read()
-        assert "llm_url=http://x.local" in content
-        assert "llm_model=model" in content
+        assert "find_anthropic_model=claude-test-model" in content
 
     def test_empty_lines_skipped(self, tmp_path):
         config_path = str(tmp_path / "find_config")
         with open(config_path, "w") as f:
-            f.write("\n\nllm_url=http://example.com\n\n")
+            f.write("\n\nfind_anthropic_model=claude-test-model\n\n")
         with patch.object(dt_find.util, "userfile", return_value=config_path):
             result = load_config()
-        assert result == {"llm_url": "http://example.com"}
+        assert result == {"find_anthropic_model": "claude-test-model"}
 
-    def test_backend_key_roundtrips(self, tmp_path):
+    def test_model_key_roundtrips(self, tmp_path):
+        """--model writes this key; create_backend reads it back."""
         config_path = str(tmp_path / "find_config")
         with patch.object(dt_find.util, "userfile", return_value=config_path):
-            save_config({"backend": "anthropic"})
+            save_config({"find_anthropic_model": "claude-opus-4-6"})
             result = load_config()
-        assert result["backend"] == "anthropic"
+        assert result["find_anthropic_model"] == "claude-opus-4-6"
 
 
 # ─── SYSTEM_PROMPT sanity checks ─────────────────────────────────────────────
@@ -248,25 +177,25 @@ class TestSystemPrompt:
         assert "Kind of Blue" in SYSTEM_PROMPT
 
 
-# ─── ANTHROPIC_TOOLS sanity checks ───────────────────────────────────────────
+# ─── TOOLS sanity checks ──────────────────────────────────────────────────────
 
-class TestAnthropicTools:
+class TestTools:
     def test_has_two_tools(self):
-        assert len(ANTHROPIC_TOOLS) == 2
+        assert len(TOOLS) == 2
 
     def test_tool_names(self):
-        names = {t["name"] for t in ANTHROPIC_TOOLS}
+        names = {t["name"] for t in TOOLS}
         assert "search_discogs" in names
         assert "select_release" in names
 
     def test_uses_input_schema_not_parameters(self):
         """Anthropic format uses input_schema, not parameters (OpenAI format)."""
-        for tool in ANTHROPIC_TOOLS:
+        for tool in TOOLS:
             assert "input_schema" in tool
             assert "parameters" not in tool
 
     def test_select_release_requires_fields(self):
-        select = next(t for t in ANTHROPIC_TOOLS if t["name"] == "select_release")
+        select = next(t for t in TOOLS if t["name"] == "select_release")
         required = select["input_schema"].get("required", [])
         assert "release_id" in required
         assert "reasoning" in required
@@ -377,149 +306,6 @@ class TestToolSearchDiscogs:
         assert "count" in result
 
 
-# ─── LocalLLMBackend ─────────────────────────────────────────────────────────
-
-def _make_tool_call(tc_id: str, name: str, arguments: dict):
-    """Build a mock tool call object matching the openai SDK shape."""
-    tc = MagicMock()
-    tc.id = tc_id
-    tc.function.name = name
-    tc.function.arguments = json.dumps(arguments)
-    return tc
-
-
-def _make_response(content: str = "", tool_calls=None):
-    """Build a mock openai ChatCompletion response."""
-    msg = MagicMock()
-    msg.content = content
-    msg.tool_calls = tool_calls or []
-    choice = MagicMock()
-    choice.message = msg
-    resp = MagicMock()
-    resp.choices = [choice]
-    return resp
-
-
-class TestLocalLLMBackend:
-    def _patch_openai(self, responses: list):
-        """Context manager: patch openai.OpenAI so completions return *responses* in order."""
-        client_mock = MagicMock()
-        client_mock.chat.completions.create.side_effect = responses
-
-        openai_mod = MagicMock()
-        openai_mod.OpenAI.return_value = client_mock
-        return patch.dict("sys.modules", {"openai": openai_mod})
-
-    def _make_backend(self, url="http://localhost:8000/v1", model="test-model"):
-        return LocalLLMBackend(url, model)
-
-    def test_is_llm_backend_subclass(self):
-        assert issubclass(LocalLLMBackend, LLMBackend)
-
-    def test_name_includes_model(self):
-        b = self._make_backend(model="my-model")
-        assert "my-model" in b.name
-
-    def test_check_available_no_url(self):
-        b = LocalLLMBackend("", "model")
-        ok, msg = b.check_available()
-        assert not ok
-        assert "url" in msg.lower()
-
-    def test_check_available_unreachable(self):
-        b = LocalLLMBackend("http://192.0.2.1:9999/v1", "model")
-        with patch("requests.get", side_effect=Exception("refused")):
-            ok, msg = b.check_available()
-        assert not ok
-        assert msg != ""
-
-    def test_check_available_reachable(self):
-        b = self._make_backend()
-        with patch("requests.get", return_value=MagicMock(status_code=200)):
-            ok, msg = b.check_available()
-        assert ok
-        assert msg == ""
-
-    def test_select_release_returns_id(self):
-        """Agent should return (release_id, reasoning) when select_release is called."""
-        tc = _make_tool_call("tc1", "select_release",
-                             {"release_id": 123456, "reasoning": "Exact match"})
-        responses = [_make_response(tool_calls=[tc])]
-
-        with self._patch_openai(responses):
-            with patch.object(dt_find, "_tool_search_discogs", return_value={"results": []}):
-                b = self._make_backend()
-                release_id, reasoning = b.run_agent("Miles Davis Kind of Blue")
-        assert release_id == 123456
-        assert reasoning == "Exact match"
-
-    def test_search_then_select(self):
-        """Agent calls search_discogs first, then select_release on the next turn."""
-        search_tc = _make_tool_call(
-            "tc-search", "search_discogs", {"q": "Miles Davis Kind of Blue"}
-        )
-        select_tc = _make_tool_call(
-            "tc-select", "select_release",
-            {"release_id": 999, "reasoning": "Found it"},
-        )
-        responses = [
-            _make_response(tool_calls=[search_tc]),
-            _make_response(tool_calls=[select_tc]),
-        ]
-        search_result = {"count": 1, "results": [{"id": 999, "artist": "Miles Davis",
-                                                   "title": "Kind of Blue"}]}
-
-        with self._patch_openai(responses):
-            with patch.object(dt_find, "_tool_search_discogs", return_value=search_result):
-                b = self._make_backend()
-                release_id, reasoning = b.run_agent("the blue Miles Davis one")
-        assert release_id == 999
-
-    def test_no_tool_calls_returns_none(self):
-        """If the model responds with plain text (no tool calls), return (None, '')."""
-        responses = [_make_response(content="I couldn't find that record.", tool_calls=[])]
-        with self._patch_openai(responses):
-            b = self._make_backend()
-            release_id, reasoning = b.run_agent("something completely obscure")
-        assert release_id is None
-
-    def test_think_tags_stripped_from_content(self):
-        """<think>…</think> blocks in the response should not be shown to the user."""
-        responses = [_make_response(
-            content="<think>I need to search first</think>",
-            tool_calls=[],
-        )]
-        with self._patch_openai(responses):
-            b = self._make_backend()
-            release_id, _ = b.run_agent("test")
-        assert release_id is None
-
-    def test_unknown_tool_gets_error_response(self):
-        """An unknown tool name should receive an error message, not crash."""
-        bad_tc = _make_tool_call("tc-bad", "delete_everything", {})
-        text_response = _make_response(content="Sorry, I can't do that.", tool_calls=[])
-        responses = [
-            _make_response(tool_calls=[bad_tc]),
-            text_response,
-        ]
-        with self._patch_openai(responses):
-            b = self._make_backend()
-            release_id, _ = b.run_agent("test")
-        assert release_id is None
-
-    def test_llm_exception_returns_none(self):
-        """If the OpenAI client raises, run_agent should return (None, '') gracefully."""
-        client_mock = MagicMock()
-        client_mock.chat.completions.create.side_effect = Exception("Connection refused")
-        openai_mod = MagicMock()
-        openai_mod.OpenAI.return_value = client_mock
-
-        with patch.dict("sys.modules", {"openai": openai_mod}):
-            b = self._make_backend()
-            release_id, _ = b.run_agent("test")
-        assert release_id is None
-
-
 # ─── AnthropicBackend ─────────────────────────────────────────────────────────
 
 def _make_anthropic_response(text_blocks=None, tool_uses=None):
@@ -553,9 +339,6 @@ class TestAnthropicBackend:
             r.raise_for_status = MagicMock()
             mock_responses.append(r)
         return patch("requests.post", side_effect=mock_responses)
-
-    def test_is_llm_backend_subclass(self):
-        assert issubclass(AnthropicBackend, LLMBackend)
 
     def test_name_includes_model(self):
         b = AnthropicBackend(model="claude-test-model")
@@ -679,51 +462,35 @@ class TestAnthropicBackend:
 # ─── create_backend factory ───────────────────────────────────────────────────
 
 class TestCreateBackend:
-    def test_default_is_local(self):
+    def test_default_model(self):
         b = create_backend({})
-        assert isinstance(b, LocalLLMBackend)
-
-    def test_backend_local_explicit(self):
-        b = create_backend({"backend": "local"})
-        assert isinstance(b, LocalLLMBackend)
-
-    def test_backend_anthropic(self):
-        b = create_backend({"backend": "anthropic"})
         assert isinstance(b, AnthropicBackend)
-
-    def test_local_uses_llm_url_and_model(self):
-        b = create_backend({
-            "backend": "local",
-            "llm_url": "http://myserver:8080/v1",
-            "llm_model": "my-custom-model",
-        })
-        assert isinstance(b, LocalLLMBackend)
-        assert "my-custom-model" in b.name
-
-    def test_anthropic_uses_find_anthropic_model(self):
-        b = create_backend({
-            "backend": "anthropic",
-            "find_anthropic_model": "claude-opus-4-6",
-        })
-        assert isinstance(b, AnthropicBackend)
-        assert "claude-opus-4-6" in b.name
-
-    def test_anthropic_default_model_when_not_specified(self):
-        b = create_backend({"backend": "anthropic"})
-        assert isinstance(b, AnthropicBackend)
-        # Should use the default Haiku model
         assert AnthropicBackend.DEFAULT_MODEL in b.name
 
-    def test_unknown_backend_falls_back_to_local(self):
-        """Unrecognised backend values should default to local (forward compat)."""
-        b = create_backend({"backend": "future-backend"})
-        assert isinstance(b, LocalLLMBackend)
+    def test_find_anthropic_model_override(self):
+        b = create_backend({"find_anthropic_model": "claude-opus-4-6"})
+        assert "claude-opus-4-6" in b.name
+
+    def test_blank_model_falls_back_to_default(self):
+        b = create_backend({"find_anthropic_model": ""})
+        assert AnthropicBackend.DEFAULT_MODEL in b.name
+
+    def test_stale_local_llm_keys_ignored(self):
+        """find_config files written before the local backend was removed still
+        carry backend/llm_url/llm_model. They must not affect anything."""
+        b = create_backend({
+            "backend":   "local",
+            "llm_url":   "http://wintermute.local:8000/v1",
+            "llm_model": "some-local-model",
+        })
+        assert isinstance(b, AnthropicBackend)
+        assert AnthropicBackend.DEFAULT_MODEL in b.name
 
 
-# ─── _dispatch_tool (shared by both backends) ─────────────────────────────────
+# ─── _dispatch_tool ───────────────────────────────────────────────────────────
 
 class TestDispatchTool:
-    """One tool implementation serves both backends.
+    """The single tool implementation.
 
     The OpenAI and Anthropic backends previously each carried their own copy of
     this dispatch — 38 identical lines — so a change to tool behaviour had to be

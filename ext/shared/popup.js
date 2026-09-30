@@ -4,7 +4,7 @@ const api = globalThis.browser ?? globalThis.chrome;
 
 const RELEASE_RE = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
 const DEFAULT_PORT = 5679;
-const STORAGE_KEYS = ["port", "profile", "split", "hide_bpm", "preview"];
+const STORAGE_KEYS = ["port", "profile"];
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const releaseIdEl  = document.getElementById("release-id");
@@ -21,13 +21,14 @@ const portEl       = document.getElementById("port");
 let releaseId = null;
 
 // ── Restore saved settings ────────────────────────────────────────────────────
+// Only the port and the label profile persist. The three option checkboxes
+// (split, hide BPM, preview) are deliberately per-print: they start cleared
+// every time the popup opens, and clearOptions() resets them once a label has
+// been sent. A forgotten "Preview only" or "Split by disc" silently changing
+// the next print was worse than re-ticking a box.
 api.storage.local.get(STORAGE_KEYS).then(saved => {
-  if (saved.port)     portEl.value       = saved.port;
-  if (saved.profile)  profileEl.value    = saved.profile;
-  if (saved.split)    splitEl.checked    = saved.split;
-  if (saved.hide_bpm) hideBpmEl.checked  = saved.hide_bpm;
-  if (saved.preview)  previewEl.checked  = saved.preview;
-  discsRowEl.classList.toggle("hidden", !splitEl.checked);
+  if (saved.port)     portEl.value    = saved.port;
+  if (saved.profile)  profileEl.value = saved.profile;
   checkConnectionStatus();
 });
 
@@ -39,16 +40,17 @@ profileEl.addEventListener("change", () => {
   api.storage.local.set({ profile: profileEl.value });
 });
 splitEl.addEventListener("change", () => {
-  api.storage.local.set({ split: splitEl.checked });
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
   if (!splitEl.checked) discsEl.value = "";
 });
-hideBpmEl.addEventListener("change", () => {
-  api.storage.local.set({ hide_bpm: hideBpmEl.checked });
-});
-previewEl.addEventListener("change", () => {
-  api.storage.local.set({ preview: previewEl.checked });
-});
+
+function clearOptions() {
+  splitEl.checked   = false;
+  hideBpmEl.checked = false;
+  previewEl.checked = false;
+  discsEl.value     = "";
+  discsRowEl.classList.add("hidden");
+}
 
 // ── Detect release ID from active tab ─────────────────────────────────────────
 api.tabs.query({ active: true, currentWindow: true }).then(tabs => {
@@ -110,6 +112,13 @@ printBtn.addEventListener("click", async () => {
       // stale immediately — that is how the line ended up reading "Queued."
       // while the label was already printing. pollProgress() owns this line.
       api.runtime.sendMessage({ type: "job-queued" }).catch(() => {});
+      // The label is on its way, so the per-print options have served their
+      // purpose. Only a real print clears them — a preview is usually one of
+      // several, and resetting between previews would mean re-ticking the same
+      // boxes to look at the same label again. The guard is on `preview` and
+      // not on this branch: a preview that came back without PNG URLs lands
+      // here too, and that is not a print.
+      if (!preview) clearOptions();
       pollProgress();      // paint real state at once rather than waiting a tick
     }
   } catch (err) {
@@ -283,7 +292,6 @@ function checkConnectionStatus() {
     { key: "discogs",   elId: "conn-discogs",   label: "Discogs"   },
     { key: "beatport",  elId: "conn-beatport",  label: "Beatport"  },
     { key: "anthropic", elId: "conn-anthropic", label: "Anthropic" },
-    { key: "llm",       elId: "conn-llm",       label: "Finder"    },
   ];
 
   fetch(`http://localhost:${port}/status`, { signal: AbortSignal.timeout(5000) })
@@ -293,22 +301,15 @@ function checkConnectionStatus() {
         const el  = document.getElementById(elId);
         const svc = data[key];
 
-        // For the LLM dot, show the configured backend name in the label
-        let displayLabel = label;
-        if (key === "llm" && svc && svc.backend) {
-          displayLabel = svc.backend === "anthropic" ? "Finder (Claude)" : "Finder (Local)";
-          el.textContent = "● " + (svc.backend === "anthropic" ? "Claude" : "Local LLM");
-        }
-
         if (!svc || svc.status === "unavailable") {
           el.className = "conn-dot";
-          el.title     = displayLabel + ": unavailable";
+          el.title     = label + ": unavailable";
         } else if (svc.status === "ok") {
           el.className = "conn-dot ok";
-          el.title     = displayLabel + ": connected";
+          el.title     = label + ": connected";
         } else {
           el.className = "conn-dot error";
-          el.title     = displayLabel + ": " + (svc.message || svc.status);
+          el.title     = label + ": " + (svc.message || svc.status);
         }
       }
     })

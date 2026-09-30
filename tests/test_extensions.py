@@ -67,6 +67,32 @@ class TestSharedSources:
         )
         assert "browser." not in code
 
+    def test_no_local_llm_references(self):
+        """dt_find runs on Claude only; nothing in the UI may offer a local LLM."""
+        for name in _SHARED_FILES:
+            src = open(os.path.join(_SHARED, name), encoding="utf-8").read()
+            assert "conn-llm" not in src, name
+            assert "Local LLM" not in src, name
+
+    def test_every_element_id_popup_js_uses_exists_in_html(self):
+        """popup.js and popup.html have to agree on element IDs.
+
+        getElementById returns null rather than throwing, so a dropped element
+        surfaces later as "cannot read properties of null" in whichever branch
+        happens to touch it — which is how removing a footer dot from one file
+        and not the other would ship unnoticed.
+        """
+        import re
+        js   = open(os.path.join(_SHARED, "popup.js"), encoding="utf-8").read()
+        html = open(os.path.join(_SHARED, "popup.html"), encoding="utf-8").read()
+
+        html_ids = set(re.findall(r'id="([^"]+)"', html))
+        js_ids   = set(re.findall(r'getElementById\(\s*"([^"]+)"\s*\)', js))
+        js_ids  |= set(re.findall(r'elId:\s*"([^"]+)"', js))   # connection dots
+
+        assert js_ids, "found no element IDs in popup.js — regex is stale"
+        assert js_ids <= html_ids, f"missing from popup.html: {sorted(js_ids - html_ids)}"
+
     def test_api_shim_accepts_either_namespace(self):
         for name in ("popup.js", "background.js"):
             src = open(os.path.join(_SHARED, name), encoding="utf-8").read()

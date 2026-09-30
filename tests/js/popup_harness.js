@@ -48,8 +48,9 @@ const ctx = {
 };
 ctx[NAMESPACE] = makeExtApi();
 ctx.globalThis = ctx;
+const POPUP_SRC = fs.readFileSync(POPUP, 'utf8');
 vm.createContext(ctx);
-vm.runInContext(fs.readFileSync(POPUP, 'utf8'), ctx);
+vm.runInContext(POPUP_SRC, ctx);
 
 const status = els['status'];
 const progress = els['progress'];
@@ -75,5 +76,39 @@ expect('printing reported live', { depth:1, queued:[], recent:[], current:{id:1,
 expect('done replaces Queued', { depth:0, queued:[], current:null, recent:[{id:1,release_id:'123',kind:'print',state:'done',finished:now,stages:stages({print:{state:'done'}})}] }, 'Printed.', 'ok', false);
 expect('failure surfaces error', { depth:0, queued:[], current:null, recent:[{id:1,release_id:'123',kind:'print',state:'error',error:'Printer unreachable',finished:now,stages:stages({print:{state:'error'}})}] }, 'Printer unreachable', 'error', false);
 expect('stale job clears panel', { depth:0, queued:[], current:null, recent:[{id:1,release_id:'123',kind:'print',state:'done',finished:now-5000,stages:stages({print:{state:'done'}})}] }, '', '', true);
+
+// ── Per-print options ────────────────────────────────────────────────────────
+// The three option checkboxes are not persisted and reset once a label is on
+// its way, so a "Preview only" left ticked yesterday can't swallow today's
+// print. Only the port and the profile survive.
+
+function check(label, cond) {
+  if (cond) console.log(`ok   [${NAMESPACE}] ${label}`);
+  else { failures++; console.log(`FAIL [${NAMESPACE}] ${label}`); }
+}
+
+// Top-level `const` stays lexical inside a vm script, so STORAGE_KEYS never
+// lands on the context object — read the declaration out of the source.
+const storageKeys = JSON.parse(
+  /const STORAGE_KEYS = (\[[^\]]*\])/.exec(POPUP_SRC)[1].replace(/'/g, '"'));
+
+check('options are not persisted',
+      !['split', 'hide_bpm', 'preview'].some(k => storageKeys.includes(k)));
+check('port and profile still persist',
+      storageKeys.includes('port') && storageKeys.includes('profile'));
+
+els['split'].checked = true;
+els['hide-bpm'].checked = true;
+els['preview-only'].checked = true;
+els['discs'].value = '1 3';
+els['discs-row']._classes.delete('hidden');
+
+ctx.clearOptions();
+
+check('clearOptions unticks split',    els['split'].checked === false);
+check('clearOptions unticks hide BPM', els['hide-bpm'].checked === false);
+check('clearOptions unticks preview',  els['preview-only'].checked === false);
+check('clearOptions empties discs',    els['discs'].value === '');
+check('clearOptions hides discs row',  els['discs-row']._classes.has('hidden'));
 
 process.exit(failures ? 1 : 0);
