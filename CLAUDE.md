@@ -315,10 +315,10 @@ python3 beatport.py --clear-match 12345678      # remove cached result
 
 | Profile | Media | Canvas | Use case |
 |---------|-------|--------|----------|
-| `dk1247` | Brother DK-1247 die-cut | 1200×1822 px | Standard 12" sleeve, ≤12 tracks |
+| `dk1247` | Brother DK-1247 die-cut | 1200×1822 px | Standard 12" sleeve, ≤12 tracks per label |
 | `dk22243` | Brother DK-22243 continuous 102mm | 1164×variable px | Long releases, auto-height, ≤18 tracks |
 
-Continuous labels use binary search to pack tracks into ≤11.5" chunks (≤3600 px height).
+`_chunk_tracks()` packs tracks onto labels by **measured** height for both feeds, using binary search over the probe (below). Continuous labels fill up to 11.5" (≤3600 px hard limit). Die-cut labels fill their fixed canvas with the QR still clearing the last row, capped at `max_tracks`. Die-cut used to be packed by count alone, 12 per label. That assumed one-line rows and two sides, and across a 1000-release collection it already overran the QR on 48 labels (by up to 148 px) before credit lines existed. `--split` chunks each disc the same way, measuring the first chunk with its "Disc N of M" line. An oversized disc gets `disc2_cont1` etc. (`_` sorts after `.`, so previews list it after `disc2.png`), and `_select_discs()` keeps continuations with their disc for `--discs`.
 
 ### QR placement — height is measured, not predicted
 
@@ -331,11 +331,32 @@ There is now one implementation. `render_label(..., probe=True)` runs the real h
 Two invariants make the probe valid, both pinned by tests:
 
 - Content layout never reads `H` — only the bottom-anchored QR and the die-cut ruled-line fill do, and neither runs in probe mode. That is why a probe can use a 1 px scratch canvas: Pillow clips the draws and the arithmetic is unchanged.
-- `_resolve_track_text()` is the single source of truth for a row's text. Anything affecting row content belongs in there, so probe and render can't diverge.
+- `_resolve_track_text()` is the single source of truth for a row's title text, and `_credit_plan()` for its credit lines. Anything affecting row content belongs in one of those, so probe and render can't diverge. (`_credit_plan()` runs inside `render_label`, which *is* the probe, so the two always see the same credits.)
 
 `_position_column_width()` sizes the position column to the widest entry present rather than assuming a fixed 90 px. Most releases use short labels ("A1"), but continuous DJ mixes use timestamps ("14:03", ~97 px) and some sides are double letters ("AA1") — those used to overprint the title (r34333258). It is computed inside `render_label` so probe and render agree: the column feeds `TITLE_MAX_W`, which decides wrapping, which decides height.
 
 `render_label()` still warns via `log.warning` if content crosses `qr_top`. That should now be unreachable; it is a tripwire, not a safety net.
+
+### Header
+
+Artist and release title both **wrap** (up to `_HEADER_MAX_LINES` = 3) rather than truncate with an ellipsis. The artist used to truncate while the title wrapped; across the collection 16 artists and 20 titles need two lines, and none need three. The font is chosen from the whole string *before* wrapping, so breaks are measured in the face that is drawn. The continuation header stays a single truncated line on purpose, since it is meant to be compact.
+
+`_strip_disambig()` removes Discogs " (2)" suffixes before a ` / ` separator as well as at the end. Multi-artist strings come from `compileListData` joined with " / ", so "Caterina Barbieri (2) / … / Lucy (12)" used to keep the inner suffix. Truncation hid that; wrapping would not. Separators are left alone, because "Jonsson/Alter" is one duo's name.
+
+### Credits
+
+Discogs keeps remixers and other credits in `extraartists`, not the title, and in two places: on each track, and on the release with a `tracks` field scoping them (`"A1, B1"`). `DiscogsTrack.getCredits()` merges both. `DiscogsRelease.resolveTrackScope()` turns `tracks` into indices, handling every shape seen in the collection: positions, `&`, `X to Y` ranges, bare sides (`"B"`), sides as range endpoints (`"A to B2"`), `"All …"` and `"All … except …"`. Unresolvable tokens (`"C3 outro"`) are **ignored rather than guessed**, so a credit is never attached to a track it can't be tied to.
+
+What prints is decided in `dt_label`, and every rule came from a tally of roles across the 1000-release cache:
+
+- **Roles** — `_CREDIT_RULES`: Remix, Edit, DJ Mix, Featuring, Vocals, Voice, Producer, Co-producer, Add. Production. Remix is by far the most common track credit. Excluded: pressing and packaging roles (Lacquer Cut By, Mastered By, Artwork — the bulk of release-level credits), songwriting, "Mixed By" (a mix engineer, not a DJ mix), backing vocals, and `Edited By [Digital Editing]` (mastering, not a re-edit). Qualifiers are matched by rule, e.g. `Producer [Additional…]` → "Add. Production".
+- **Placement** — a credit on *every* track prints once under the release title; the rest go under their track title. That one rule covers unscoped release credits, "All" scopes, and a single remixer across an EP. It is decided from the whole release, so continuation and per-disc labels agree.
+- **Already in the title → skipped.** 74% of Remix credits repeat the title ("Peels A Tangerine (Regis Remix)" + "Remix: Regis"). Matching is word-bounded and case-insensitive. Placement is decided *before* this filter, so a release-wide credit doesn't scatter onto rows because one title mentions it.
+- **Own artist → skipped**, except version credits (`_VERSION_LABELS`: Remix, Edit, DJ Mix). "Producer: <the artist>" is noise, but an artist remixing their own track is what tells two versions apart (23 in the collection).
+
+Layout: `_credit_groups()` groups by role in `_CREDIT_ORDER`, and `wrap_credits()` breaks **between** groups, never inside one. The first render split "Add. Production:" from its name. Continuous labels get up to 2 lines, die-cut 1, with an ellipsis when groups are left over. Each line adds `_CREDIT_LINE_H` to the row, and the probe measures that like everything else.
+
+`tests/conftest.py` has r3854655 as a shared fixture (`cheap_and_deep`), captured verbatim from the API: two remixes with identical titles that only their credits tell apart. `make_release(data)` builds a real `DiscogsRelease` without the network, so credit tests exercise the genuine accessors rather than mocks.
 
 ### Font fallback
 

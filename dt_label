@@ -92,6 +92,18 @@ _EXTRA_LINE_H = 50
 # (58 px between title lines; original 70 px spacing applies to the last line.)
 _TITLE_WRAP_LINE_H = 58
 
+# Artist and release title wrap rather than truncate.  Across a 1000-release
+# collection nothing needed more than two lines (16 artists and 20 titles
+# needed exactly two); three leaves headroom before an ellipsis appears.
+_HEADER_MAX_LINES = 3
+
+# Credit lines ("Remix: Norman Nodge · Vocals: Uta Alder") under a track title,
+# and under the release title for credits that cover every track.
+_CREDIT_FONT_PX  = 30
+_CREDIT_LINE_H   = 38
+_HDR_CREDIT_PX   = 32
+_HDR_CREDIT_LINE_H = 42
+
 # Position column sizing.  _POS_W_MIN keeps the usual "A1" case looking the way
 # it always has; wider position strings grow the column instead of colliding
 # with the title.  _POS_W_GAP is the clear space between the two.
@@ -407,11 +419,16 @@ def truncate_text(draw, text, font, max_width):
 
 # Discogs appends " (2)", " (3)" etc. to disambiguate artists with the same name.
 # These are database artefacts and should not appear on printed labels.
-_DISAMBIG_RE = re.compile(r'\s*\(\d+\)\s*$')
+# Multi-artist strings are joined with " / " (compileListData), so a suffix
+# can sit before a separator as well as at the end: "Caterina Barbieri (2) /
+# Donato Dozzy / Lucy (12)".  Matching only at the end left the inner ones on
+# the label; truncation used to hide that, wrapping does not.
+# Separators themselves are left alone: "Jonsson/Alter" is one duo's name.
+_DISAMBIG_RE = re.compile(r'\s*\(\d+\)(?=\s*/|\s*$)')
 
 
 def _strip_disambig(name: str) -> str:
-    """Remove a Discogs disambiguation suffix like ' (2)' from an artist name."""
+    """Remove Discogs disambiguation suffixes like ' (2)' from artist name(s)."""
     return _DISAMBIG_RE.sub("", name).strip()
 
 
@@ -456,6 +473,194 @@ def wrap_text(draw, text, font, max_width, max_lines=2):
 
 def hline(draw, y, x0, x1, color="black", weight=2):
     draw.line([(x0, y), (x1, y)], fill=color, width=weight)
+
+
+# ── Credits ───────────────────────────────────────────────────────────────────
+
+# Which Discogs roles are printed, and as what.  A label has room for the
+# credits that tell you *which version* is on the record and who is on it —
+# not the pressing and packaging credits (Lacquer Cut By, Mastered By, Artwork)
+# that dominate release-level credits on Discogs.  Chosen from a tally of the
+# roles in a 1000-release collection: Remix is by far the most common track
+# credit, then Producer, Featuring and Vocals.
+#
+# Rules are tried in order; the first whose base role matches and whose
+# qualifier pattern matches (None = any qualifier, or none) decides.  A None
+# label excludes the role.
+_CREDIT_RULES = (
+    # base role      qualifier pattern        printed as
+    ("Remix",        None,                    "Remix"),
+    ("Edited By",    r"digital",              None),     # mastering-side editing, not a re-edit
+    ("Edited By",    None,                    "Edit"),
+    ("DJ Mix",       None,                    "DJ Mix"),
+    ("Featuring",    None,                    "Featuring"),
+    ("Vocals",       r"background|backing",   None),
+    ("Vocals",       None,                    "Vocals"),
+    ("Lead Vocals",  None,                    "Vocals"),
+    ("Voice",        None,                    "Voice"),
+    ("Producer",     r"^additional",          "Add. Production"),
+    ("Producer",     None,                    "Producer"),
+    ("Co-producer",  None,                    "Co-producer"),
+)
+
+# Print order within a credit line: version first, then who is on it, then
+# who made it.
+_CREDIT_ORDER = ("Remix", "Edit", "DJ Mix", "Featuring", "Vocals", "Voice",
+                 "Producer", "Co-producer", "Add. Production")
+
+# Credits that identify *which version* of a track this is.  These print even
+# when they name the track's own artist — see _credit_plan().
+_VERSION_LABELS = frozenset({"Remix", "Edit", "DJ Mix"})
+
+_ROLE_QUALIFIER_RE = re.compile(r"^(.*?)\s*(?:\[(.*)\])?\s*$")
+
+
+def _credit_label(role):
+    """Printed label for one Discogs role ("Remix [Reshaped]" → "Remix"), or None."""
+    m = _ROLE_QUALIFIER_RE.match(role or "")
+    base, qualifier = m.group(1).strip(), (m.group(2) or "").strip()
+    for rule_base, qual_pat, label in _CREDIT_RULES:
+        if base.casefold() != rule_base.casefold():
+            continue
+        if qual_pat is None or (qualifier and re.search(qual_pat, qualifier, re.I)):
+            return label
+    return None
+
+
+def _credit_plan(release):
+    """Decide which credits print, and where.
+
+    Returns (header, rows):
+      header — [(label, name), …] for credits that apply to every track
+      rows   — {track_idx: [(label, name), …]} for everything else
+
+    A credit on every track is printed once under the release title rather than
+    repeated on each row.  That one rule covers release-wide Discogs credits
+    (no `tracks` field), ones scoped to "All", and track credits that happen to
+    repeat on every track, e.g. a single remixer across a whole EP.
+
+    Two filters keep the label from saying things twice:
+
+    * A credit whose name is already in the title is dropped.  Discogs titles
+      usually carry the remixer — "Peels A Tangerine (Regis Remix)" with
+      "Remix: Regis" — and across a 1000-release collection 74% of Remix
+      credits were redundant this way.  Header credits are checked against the
+      release title, row credits against their track title.
+    * A credit naming the release's or the track's own artist is dropped —
+      "Producer: <the artist>" is on almost every release and says nothing.
+      Version credits (_VERSION_LABELS) are exempt: an artist remixing their
+      own track is exactly what tells two versions apart.
+
+    Stub releases (the tests use MagicMock) yield no credits.
+    """
+    n = release.getTotalTracks()
+    if not isinstance(n, int) or n <= 0:
+        return [], {}
+
+    raw = {}
+    for i in range(n):
+        track = release.getTrack(i)
+        credits = track.getCredits()
+        if not isinstance(credits, list):
+            return [], {}
+        raw[i] = (track, credits)
+
+    main_ids = set(release.getArtistIds())
+    per_track = {}
+    for i, (track, credits) in raw.items():
+        own_ids = main_ids | set(track.getArtistIds())
+        pairs = []
+        for c in credits:
+            label = _credit_label(c["role"])
+            name  = _strip_disambig(c["name"])
+            if not label or not name:
+                continue
+            if (label not in _VERSION_LABELS
+                    and c["artist_id"] and c["artist_id"] in own_ids):
+                continue
+            if (label, name) not in pairs:
+                pairs.append((label, name))
+        per_track[i] = pairs
+
+    # Placement is decided before the title filter, so a release-wide credit
+    # stays in the header even if one track's title happens to mention it.
+    everywhere = set.intersection(*(set(p) for p in per_track.values()))
+    header = [pair for pair in per_track[0]
+              if pair in everywhere and not _named_in(pair[1], release.getTitle())]
+    rows = {}
+    for i, pairs in per_track.items():
+        title = raw[i][0].getTitle(synthesise=False)
+        rows[i] = [p for p in pairs
+                   if p not in everywhere and not _named_in(p[1], title)]
+    return header, rows
+
+
+def _named_in(name, text):
+    """True if *name* appears in *text* as a whole word or phrase, any case.
+
+    Word-bounded so "Regis" matches "(Regis Remix)" but a short name doesn't
+    match inside an unrelated word.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    return re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text,
+                     re.IGNORECASE) is not None
+
+
+_CREDIT_SEP = " \u00b7 "
+
+
+def _credit_groups(pairs):
+    """[(label, name), …] → ["Remix: A, B", "Vocals: C"] in _CREDIT_ORDER."""
+    names = {}
+    for label, name in pairs:
+        names.setdefault(label, []).append(name)
+    return [f"{label}: {', '.join(names[label])}"
+            for label in _CREDIT_ORDER if label in names]
+
+
+def _format_credits(pairs):
+    """[(label, name), …] → "Remix: A, B · Vocals: C"."""
+    return _CREDIT_SEP.join(_credit_groups(pairs))
+
+
+def wrap_credits(draw, groups, font, max_width, max_lines=2):
+    """Lay out credit groups into at most *max_lines* lines.
+
+    Breaks fall between groups, so a role label is never separated from its
+    names ("Add. Production:" / "Goran Simonoski").  A single group wider than
+    a whole line is word-wrapped on its own.  If groups are left over when the
+    lines run out, the last line ends in an ellipsis so it is clear the list
+    was cut, not complete.
+    """
+    lines = []
+    current = ""
+    placed = 0
+    for group in groups:
+        candidate = f"{current}{_CREDIT_SEP}{group}" if current else group
+        if draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+            placed += 1
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        if len(lines) >= max_lines:
+            break
+        if draw.textlength(group, font=font) <= max_width:
+            current = group
+        else:
+            pieces = wrap_text(draw, group, font, max_width,
+                               max_lines=max_lines - len(lines))
+            lines.extend(pieces[:-1])
+            current = pieces[-1]
+        placed += 1
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    if lines and placed < len(groups):
+        lines[-1] = truncate_text(draw, lines[-1] + " \u2026", font, max_width)
+    return lines
 
 
 # ── Label rendering ───────────────────────────────────────────────────────────
@@ -597,8 +802,6 @@ def render_label(release, tracks_with_sides, profile,
     draw = ImageDraw.Draw(img)
 
     # Fonts (sizes in points; 1pt ≈ 4.17px at 300 DPI)
-    f_artist    = make_font("bold",      54)   # ~225px cap height
-    f_title     = make_font("regular",   54)
     f_meta      = make_font("regular",   32)
     f_side_hdr  = make_font("bold",      28)
     f_pos       = make_font("bold",      38)
@@ -624,6 +827,11 @@ def render_label(release, tracks_with_sides, profile,
     x1 = W - M
     y  = M
 
+    # Which credits print under the release title vs. on each track row.
+    # Decided from the whole release, not this chunk, so a continuation or
+    # per-disc label agrees with the first one about what is release-wide.
+    credit_header, credit_rows = _credit_plan(release)
+
     def hl(y_pos, color="black", weight=2):
         hline(draw, y_pos, x0, x1, color=color, weight=weight)
 
@@ -636,22 +844,30 @@ def render_label(release, tracks_with_sides, profile,
         draw.text((M, y), truncate_text(draw, hdr, f_hdr, CW), font=f_hdr, fill="black")
         y += 46
     else:
-        # Artist (large bold caps) — strip Discogs "(N)" disambiguation suffixes.
-        artist_str = truncate_text(
-            draw, _strip_disambig(release.getArtist()).upper(), f_artist, CW
-        )
-        f_artist_r = _font_for("bold", 54, artist_str)
-        draw.text((M, y), artist_str, font=f_artist_r, fill="black")
-        y += 70
+        # Artist (large bold caps) and release title both wrap rather than
+        # truncate.  The font is chosen from the whole string *before*
+        # wrapping, so the line breaks are measured in the face that is drawn.
+        # Discogs "(N)" disambiguation suffixes are stripped from the artist.
+        for text, style in ((_strip_disambig(release.getArtist()).upper(), "bold"),
+                            (release.getTitle(), "regular")):
+            f_hdr = _font_for(style, 54, text)
+            lines = wrap_text(draw, text, f_hdr, CW, max_lines=_HEADER_MAX_LINES)
+            for i, line in enumerate(lines):
+                draw.text((M, y), line, font=f_hdr, fill="black")
+                # 58 px between wrapped lines; 70 px after the final line.
+                y += _TITLE_WRAP_LINE_H if i < len(lines) - 1 else 70
 
-        # Release title — wrap to a second line if it doesn't fit on one.
-        title_raw   = release.getTitle()
-        f_title_r   = _font_for("regular", 54, title_raw)
-        title_lines = wrap_text(draw, title_raw, f_title_r, CW)
-        for i, line in enumerate(title_lines):
-            draw.text((M, y), line, font=f_title_r, fill="black")
-            # 58 px between wrapped lines; 70 px after the final line (original spacing).
-            y += 58 if i < len(title_lines) - 1 else 70
+        # Credits covering every track ("Remix: X" on a one-remixer EP) —
+        # printed once here instead of repeated on each row.
+        if credit_header:
+            hdr_groups = _credit_groups(credit_header)
+            f_hdr_cred = _font_for("regular", _HDR_CREDIT_PX,
+                                   _CREDIT_SEP.join(hdr_groups))
+            y -= 8   # tuck under the title rather than floating mid-gap
+            for line in wrap_credits(draw, hdr_groups, f_hdr_cred, CW):
+                draw.text((M, y), line, font=f_hdr_cred, fill="#333333")
+                y += _HDR_CREDIT_LINE_H
+            y += 8
 
         # Disc indicator for --split labels (immediately below title)
         if disc_info:
@@ -721,16 +937,37 @@ def render_label(release, tracks_with_sides, profile,
         else:
             title_lines = [truncate_text(draw, full_track_str, f_track_r, TITLE_MAX_W)]
 
-        row_h      = _TRACK_ROW_H + (len(title_lines) - 1) * _EXTRA_LINE_H
+        # Credits for this track in a smaller face under the title.  Same wrap
+        # policy as the title, and the same width, so they stay clear of the
+        # BPM zone.
+        credit_groups = _credit_groups(credit_rows.get(track_idx, []))
+        credit_lines = []
+        if credit_groups:
+            f_credit_r = _font_for("regular", _CREDIT_FONT_PX,
+                                   _CREDIT_SEP.join(credit_groups))
+            credit_lines = wrap_credits(draw, credit_groups, f_credit_r,
+                                        TITLE_MAX_W,
+                                        max_lines=2 if is_continuous else 1)
+        credits_h = len(credit_lines) * _CREDIT_LINE_H
+
+        row_h      = (_TRACK_ROW_H + (len(title_lines) - 1) * _EXTRA_LINE_H
+                      + credits_h)
         bpm_line_y = y + row_h - 18
         # text_y aligns the *first* title line (and the position number) with the
-        # bottom-anchor point, leaving room below for any extra wrapped lines.
-        text_y = bpm_line_y - _track_text_h - (len(title_lines) - 1) * _EXTRA_LINE_H
+        # bottom-anchor point, leaving room below for any extra wrapped lines
+        # and the credit lines.
+        text_y = (bpm_line_y - _track_text_h
+                  - (len(title_lines) - 1) * _EXTRA_LINE_H - credits_h)
 
         draw.text((M, text_y), pos, font=f_pos, fill="black")
         for line_i, line in enumerate(title_lines):
             draw.text((M + POS_W, text_y + line_i * _EXTRA_LINE_H),
                       line, font=f_track_r, fill="black")
+
+        credit_y = text_y + (len(title_lines) - 1) * _EXTRA_LINE_H + _track_text_h + 4
+        for line_i, line in enumerate(credit_lines):
+            draw.text((M + POS_W, credit_y + line_i * _CREDIT_LINE_H),
+                      line, font=f_credit_r, fill="#444444")
 
         # BPM zone: print value if known, otherwise leave a blank write zone.
         _track_info = bpms.get(track_idx) or {}
@@ -808,17 +1045,44 @@ def render_label(release, tracks_with_sides, profile,
     return img
 
 
-def _chunk_continuous(all_tracks, profile, release, is_compilation=False,
-                      bpms=None):
-    """Pack tracks greedily onto continuous labels up to MAX_LABEL_HEIGHT_PX.
+def _chunk_tracks(all_tracks, profile, release, is_compilation=False,
+                  bpms=None, disc_info=None):
+    """Pack tracks greedily onto labels by *measured* height.
+
+    Continuous labels fill up to MAX_LABEL_HEIGHT_PX.  Die-cut labels fill up
+    to their fixed canvas, with the QR still clearing the last row, and never
+    take more than the profile's max_tracks.
+
+    Die-cut used to be packed by count alone — max_tracks per label — which
+    assumed every row was one line and every label had two sides.  Across a
+    1000-release collection that already overran the QR zone on 48 labels
+    (by up to 148 px: four side headers, a two-line title), before credit lines
+    made rows taller still.
 
     Returns a list of track-chunks.  The first chunk uses the normal (tall)
     header; subsequent chunks use the compact continuation header — so their
     heights are calculated accordingly.
 
     `release` is required: heights come from a real layout pass, which renders
-    the header, so there is nothing to measure without it.
+    the header, so there is nothing to measure without it.  `disc_info` is
+    passed for --split labels, whose first chunk carries a "Disc N of M" line.
     """
+    if profile.get("feed") == "continuous":
+        limit, cap = MAX_LABEL_HEIGHT_PX, None
+    else:
+        limit, cap = profile["height_px"], profile["max_tracks"]
+
+    def fits(tracks, continuation):
+        if cap is not None and len(tracks) > cap:
+            return False
+        try:
+            h = _layout_height(release, tracks, profile, is_compilation,
+                               continuation=continuation, bpms=bpms,
+                               disc_info=None if continuation else disc_info)
+        except ValueError:
+            return False   # exceeds the 12" hard limit
+        return h <= limit
+
     chunks    = []
     remaining = list(all_tracks)
 
@@ -826,14 +1090,7 @@ def _chunk_continuous(all_tracks, profile, release, is_compilation=False,
         continuation = bool(chunks)
 
         # Check whether all remaining tracks fit on this label.
-        try:
-            h = _layout_height(release, remaining, profile, is_compilation,
-                               continuation=continuation, bpms=bpms)
-            fits_all = h <= MAX_LABEL_HEIGHT_PX
-        except ValueError:
-            fits_all = False   # exceeds 12" hard limit
-
-        if fits_all:
+        if fits(remaining, continuation):
             chunks.append(remaining)
             break
 
@@ -841,15 +1098,9 @@ def _chunk_continuous(all_tracks, profile, release, is_compilation=False,
         lo, hi = 1, len(remaining) - 1
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            try:
-                h = _layout_height(release, remaining[:mid], profile,
-                                   is_compilation, continuation=continuation,
-                                   bpms=bpms)
-                if h <= MAX_LABEL_HEIGHT_PX:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            except ValueError:
+            if fits(remaining[:mid], continuation):
+                lo = mid
+            else:
                 hi = mid - 1
 
         take = max(lo, 1)   # always advance by at least one track
@@ -882,39 +1133,43 @@ def render_labels_for_release(release, args, profile, bpms=None):
     """
     is_compilation = release.isCompilation()
     discs          = group_tracks_by_disc(release)
-    max_tracks     = profile["max_tracks"]
     labels         = []
     bpms           = bpms or {}
 
     if args.split:
+        # One label per disc — plus a continuation if a disc doesn't fit, which
+        # previously printed the QR over its last rows (six die-cut discs in a
+        # 1000-release collection).  Continuations are "disc2_cont1": "_" sorts
+        # after ".", so disc2_cont1.png lists after disc2.png in previews.
         total_discs = len(discs)
         for disc_num in sorted(discs):
             disc_tracks = []
             for side in sorted(discs[disc_num]):
                 for idx, track in discs[disc_num][side]:
                     disc_tracks.append((side, idx, track))
-            kw = _render_kwargs(disc_tracks, profile,
-                                disc_info=(disc_num, total_discs),
-                                release=release, is_compilation=is_compilation,
-                                bpms=bpms)
-            img = render_label(release, disc_tracks, profile,
-                               is_compilation,
-                               disc_info=(disc_num, total_discs),
-                               bpms=bpms, **kw)
-            labels.append((f"disc{disc_num}", img))
+            disc_info = (disc_num, total_discs)
+            chunks = _chunk_tracks(disc_tracks, profile, release,
+                                   is_compilation=is_compilation, bpms=bpms,
+                                   disc_info=disc_info)
+            for k, chunk in enumerate(chunks):
+                cont = k > 0
+                kw = _render_kwargs(chunk, profile, continuation=cont,
+                                    disc_info=None if cont else disc_info,
+                                    release=release,
+                                    is_compilation=is_compilation, bpms=bpms)
+                img = render_label(release, chunk, profile, is_compilation,
+                                   continuation=cont,
+                                   disc_info=None if cont else disc_info,
+                                   bpms=bpms, **kw)
+                suffix = f"disc{disc_num}" + (f"_cont{k}" if cont else "")
+                labels.append((suffix, img))
 
     else:
-        # Chunk all tracks into primary + continuation labels.
-        # Continuous labels: pack by height up to 11.5".
-        # Die-cut labels: pack by max_tracks (fixed canvas size).
-        all_tracks = flatten_discs(discs)
-        if profile.get("feed") == "continuous":
-            chunks = _chunk_continuous(all_tracks, profile, release,
-                                       is_compilation=is_compilation,
-                                       bpms=bpms)
-        else:
-            chunks = [all_tracks[i:i + max_tracks]
-                      for i in range(0, len(all_tracks), max_tracks)]
+        # Chunk all tracks into primary + continuation labels, packed by
+        # measured height for both feeds (continuous: up to 11.5"; die-cut:
+        # its fixed canvas, capped at max_tracks).
+        chunks = _chunk_tracks(flatten_discs(discs), profile, release,
+                               is_compilation=is_compilation, bpms=bpms)
         for idx, chunk in enumerate(chunks):
             suffix = "label" if idx == 0 else f"cont{idx}"
             kw = _render_kwargs(chunk, profile, continuation=(idx > 0),
@@ -926,6 +1181,16 @@ def render_labels_for_release(release, args, profile, bpms=None):
             labels.append((suffix, img))
 
     return labels
+
+
+def _select_discs(labels, discs):
+    """Keep the --split labels for the requested disc numbers.
+
+    A disc's continuation labels ("disc2_cont1") go with it — matching the
+    suffix exactly would print a disc's first label and silently drop the rest.
+    """
+    want = {f"disc{d}" for d in discs}
+    return [(s, img) for s, img in labels if s.split("_")[0] in want]
 
 
 # ── Printing ──────────────────────────────────────────────────────────────────
@@ -1230,9 +1495,8 @@ def process_release(rid, args, profile, printer_url, model):
         emit("render", "error", message=str(e))
         return False
     if args.split and getattr(args, "discs", None):
-        want = {f"disc{d}" for d in args.discs}
         all_suffixes = [s for s, _ in labels]
-        labels = [(s, img) for s, img in labels if s in want]
+        labels = _select_discs(labels, args.discs)
         if not labels:
             msg = (f"No labels match --discs {args.discs}; "
                    f"available: {all_suffixes}")

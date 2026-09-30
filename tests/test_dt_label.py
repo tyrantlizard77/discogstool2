@@ -8,7 +8,12 @@ Covers:
   - parse_release_id: integer and [rXXXXX] format parsing
   - read_id_file: URL mode and plain-ID mode
   - _layout_height: canvas height measured from a real layout pass
-  - _chunk_continuous: greedy packing of tracks onto labels
+  - _chunk_tracks: greedy packing of tracks onto labels by measured height,
+    for continuous and die-cut stock alike
+  - credits: role policy, header-vs-row placement, group-aware wrapping, and
+    what they do to the rendered layout
+  - header: artist and title wrap instead of truncating
+  - _strip_disambig: Discogs "(N)" suffixes, including inside multi-artist strings
   - load_config / save_config: key=value dotfile I/O
 """
 
@@ -43,7 +48,7 @@ flatten_discs       = dt_label.flatten_discs
 parse_release_id    = dt_label.parse_release_id
 read_id_file        = dt_label.read_id_file
 _layout_height      = dt_label._layout_height
-_chunk_continuous   = dt_label._chunk_continuous
+_chunk_tracks       = dt_label._chunk_tracks
 load_config         = dt_label.load_config
 save_config         = dt_label.save_config
 render_label             = dt_label.render_label
@@ -442,45 +447,45 @@ class TestLayoutHeight:
         assert isinstance(out, int)
 
 
-# ─── _chunk_continuous ────────────────────────────────────────────────────────
+# ─── _chunk_tracks ────────────────────────────────────────────────────────────
 
 class TestChunkContinuous:
     PROFILE = LABEL_PROFILES["dk22243"]
 
     def test_small_release_fits_one_chunk(self):
         tracks = _make_tracks_with_sides([("A", 4)])
-        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
+        chunks = _chunk_tracks(tracks, self.PROFILE, _height_release())
         assert len(chunks) == 1
         assert chunks[0] == tracks
 
     def test_empty_tracks_empty_chunks(self):
-        chunks = _chunk_continuous([], self.PROFILE, _height_release())
+        chunks = _chunk_tracks([], self.PROFILE, _height_release())
         assert chunks == []
 
     def test_overflow_creates_multiple_chunks(self):
         """A very large tracklist must be split across multiple labels."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
+        chunks = _chunk_tracks(tracks, self.PROFILE, _height_release())
         assert len(chunks) > 1
 
     def test_all_tracks_preserved(self):
         """No tracks should be lost when splitting across chunks."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
+        chunks = _chunk_tracks(tracks, self.PROFILE, _height_release())
         total = sum(len(c) for c in chunks)
         assert total == len(tracks)
 
     def test_chunk_order_preserved(self):
         """Tracks within and across chunks must stay in original order."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
+        chunks = _chunk_tracks(tracks, self.PROFILE, _height_release())
         flat = [t for chunk in chunks for t in chunk]
         assert flat == tracks
 
     def test_each_chunk_fits_within_max_height(self):
         """Every produced chunk must fit within MAX_LABEL_HEIGHT_PX."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
+        chunks = _chunk_tracks(tracks, self.PROFILE, _height_release())
         for i, chunk in enumerate(chunks):
             h = _layout_height(_height_release(), chunk, self.PROFILE, False,
                                continuation=(i > 0))
@@ -1329,3 +1334,520 @@ class TestPositionColumnWidth:
                                      is_compilation=False, bpms={})
         img = render_label(release, tracks, self.PROFILE, False, **kw)
         assert img.width == self.PROFILE["width_px"]
+
+
+# ─── Credits ──────────────────────────────────────────────────────────────────
+
+from conftest import _cheap_and_deep_data, make_release  # noqa: E402
+
+_CREDIT_LINE_H     = dt_label._CREDIT_LINE_H
+_HDR_CREDIT_LINE_H = dt_label._HDR_CREDIT_LINE_H
+_TITLE_WRAP_LINE_H = dt_label._TITLE_WRAP_LINE_H
+_HEADER_MAX_LINES  = dt_label._HEADER_MAX_LINES
+_NOTES_GAP         = dt_label._NOTES_GAP
+
+
+def _all_tracks(release):
+    return flatten_discs(group_tracks_by_disc(release))
+
+
+def _plain_release(n_tracks=3, **overrides):
+    """A real DiscogsRelease with no credits, n tracks on side A."""
+    data = _cheap_and_deep_data()
+    data["extraartists"] = []
+    data["tracklist"] = [{"position": f"A{i + 1}", "type_": "track", "duration": "",
+                          "title": f"Track {i + 1}"} for i in range(n_tracks)]
+    data.update(overrides)
+    return data
+
+
+def _probe(release, profile=LABEL_PROFILES["dk22243"], tracks=None):
+    tracks = _all_tracks(release) if tracks is None else tracks
+    return render_label(release, tracks, profile, release.isCompilation(), probe=True)
+
+
+class TestCreditLabel:
+    @pytest.mark.parametrize("role,label", [
+        ("Remix",                             "Remix"),
+        ("Remix [Reshaped]",                  "Remix"),
+        ("remix",                             "Remix"),
+        ("Edited By",                         "Edit"),
+        ("Edited By [Digital Editing]",       None),   # mastering, not a re-edit
+        ("DJ Mix",                            "DJ Mix"),
+        ("Featuring [With]",                  "Featuring"),
+        ("Vocals",                            "Vocals"),
+        ("Vocals [Background]",               None),
+        ("Lead Vocals",                       "Vocals"),
+        ("Voice",                             "Voice"),
+        ("Producer",                          "Producer"),
+        ("Producer [Additional]",             "Add. Production"),
+        ("Producer [Additional Production]",  "Add. Production"),
+        ("Co-producer",                       "Co-producer"),
+        ("Lacquer Cut By",                    None),
+        ("Mastered By",                       None),
+        ("Written-By",                        None),
+        ("Artwork",                           None),
+        ("Mixed By",                          None),   # mix engineer, not a DJ mix
+        ("",                                  None),
+    ])
+    def test_role_policy(self, role, label):
+        assert dt_label._credit_label(role) == label
+
+
+class TestCreditPlan:
+    def test_r3854655(self, cheap_and_deep):
+        """The release that prompted credit support, end to end.
+
+        Both remixes share the title "Words, Breaths & Pauses Remix"; the
+        remixer is the only thing that tells them apart on the label.
+        """
+        header, rows = dt_label._credit_plan(cheap_and_deep)
+        assert header == [("Producer", "Jay Ahern")]
+        assert rows == {
+            0: [("Remix", "Norman Nodge"), ("Add. Production", "Goran Simonoski"),
+                ("Vocals", "Uta Alder")],
+            1: [("Remix", "Jonsson/Alter"), ("Add. Production", "Goran Simonoski"),
+                ("Vocals", "Uta Alder")],
+            2: [("Add. Production", "Morgan Packard"), ("Vocals", "Crissy Liu")],
+        }
+
+    def test_formatted_lines(self, cheap_and_deep):
+        header, rows = dt_label._credit_plan(cheap_and_deep)
+        assert dt_label._format_credits(rows[0]) == (
+            "Remix: Norman Nodge \u00b7 Vocals: Uta Alder "
+            "\u00b7 Add. Production: Goran Simonoski")
+
+    def test_release_artist_credit_is_dropped(self, cheap_and_deep):
+        """"Producer: Cheap And Deep" — the artist producing their own record —
+        is on most releases and says nothing."""
+        header, rows = dt_label._credit_plan(cheap_and_deep)
+        names = {n for _, n in header} | {n for r in rows.values() for _, n in r}
+        assert "Cheap And Deep" not in names
+
+    def test_pressing_and_packaging_roles_not_printed(self, cheap_and_deep):
+        header, rows = dt_label._credit_plan(cheap_and_deep)
+        names = {n for _, n in header} | {n for r in rows.values() for _, n in r}
+        assert "MJR" not in names and "Maike Verloh" not in names
+
+    def test_credit_on_every_track_is_hoisted_to_header(self):
+        """One remixer across a whole EP prints once, not on every row."""
+        data = _plain_release(3)
+        for t in data["tracklist"]:
+            t["extraartists"] = [{"name": "Solo Remixer", "role": "Remix", "id": 5}]
+        header, rows = dt_label._credit_plan(make_release(data))
+        assert header == [("Remix", "Solo Remixer")]
+        assert all(r == [] for r in rows.values())
+
+    def test_credit_on_some_tracks_stays_on_rows(self):
+        data = _plain_release(3)
+        data["tracklist"][0]["extraartists"] = [{"name": "R", "role": "Remix", "id": 5}]
+        header, rows = dt_label._credit_plan(make_release(data))
+        assert header == []
+        assert rows[0] == [("Remix", "R")] and rows[1] == rows[2] == []
+
+    def test_track_artist_credit_is_dropped(self):
+        """On a compilation, "Producer: <that track's artist>" is noise too."""
+        data = _plain_release(2)
+        data["tracklist"][0]["artists"] = [{"name": "Guest", "id": 42}]
+        data["tracklist"][0]["extraartists"] = [
+            {"name": "Guest", "role": "Producer", "id": 42},
+            {"name": "Other", "role": "Remix", "id": 43}]
+        header, rows = dt_label._credit_plan(make_release(data))
+        assert rows[0] == [("Remix", "Other")]
+
+    def test_remixer_already_in_title_is_not_repeated(self):
+        """74% of Remix credits in the collection were already in the title."""
+        data = _plain_release(2)
+        data["tracklist"][0]["title"] = "Phunk (Mark Broom Rmx)"
+        data["tracklist"][0]["extraartists"] = [{"name": "Mark Broom", "role": "Remix", "id": 9}]
+        assert dt_label._credit_plan(make_release(data))[1][0] == []
+
+    def test_title_match_is_whole_word(self):
+        data = _plain_release(2)
+        data["tracklist"][0]["title"] = "Regisland"
+        data["tracklist"][0]["extraartists"] = [{"name": "Regis", "role": "Remix", "id": 9}]
+        assert dt_label._credit_plan(make_release(data))[1][0] == [("Remix", "Regis")]
+
+    def test_self_remix_is_kept(self):
+        """An artist remixing their own track is what tells two versions apart,
+        so version credits survive the own-artist filter (23 such credits in
+        the collection were being dropped)."""
+        data = _plain_release(2)
+        data["tracklist"][0]["extraartists"] = [
+            {"name": "Cheap And Deep Productions", "anv": "Cheap And Deep",
+             "role": "Remix", "id": 1563065}]
+        assert dt_label._credit_plan(make_release(data))[1][0] == [
+            ("Remix", "Cheap And Deep")]
+
+    def test_self_producer_is_still_dropped(self):
+        data = _plain_release(2)
+        data["tracklist"][0]["extraartists"] = [
+            {"name": "Cheap And Deep", "role": "Producer", "id": 1563065}]
+        assert dt_label._credit_plan(make_release(data))[1][0] == []
+
+    def test_header_credit_named_in_release_title_is_dropped(self):
+        data = _plain_release(3, title="Solo Remixer Remixes")
+        data["extraartists"] = [{"name": "Solo Remixer", "role": "Remix", "id": 5}]
+        header, rows = dt_label._credit_plan(make_release(data))
+        assert header == [] and all(r == [] for r in rows.values())
+
+    def test_placement_decided_before_title_filter(self):
+        """A release-wide credit stays in the header even when one track's
+        title mentions it, instead of scattering onto every other row."""
+        data = _plain_release(3)
+        data["tracklist"][1]["title"] = "Track 2 (Solo Remixer Remix)"
+        data["extraartists"] = [{"name": "Solo Remixer", "role": "Remix", "id": 5}]
+        header, rows = dt_label._credit_plan(make_release(data))
+        assert header == [("Remix", "Solo Remixer")]
+        assert all(r == [] for r in rows.values())
+
+    def test_disambiguation_suffix_stripped_from_credit_names(self):
+        data = _plain_release(2)
+        data["tracklist"][0]["extraartists"] = [{"name": "Lucy (12)", "role": "Remix", "id": 9}]
+        assert dt_label._credit_plan(make_release(data))[1][0] == [("Remix", "Lucy")]
+
+    def test_no_credits(self):
+        header, rows = dt_label._credit_plan(make_release(_plain_release(2)))
+        assert header == [] and rows == {0: [], 1: []}
+
+    def test_stub_release_yields_nothing(self):
+        """The suite renders MagicMock releases everywhere; they must not crash."""
+        assert dt_label._credit_plan(_fake_render_release()) == ([], {})
+        assert dt_label._credit_plan(_height_release()) == ([], {})
+
+
+class TestWrapCredits:
+    GROUPS = ["Remix: Norman Nodge", "Vocals: Uta Alder",
+              "Add. Production: Goran Simonoski"]
+
+    def setup_method(self):
+        from PIL import Image, ImageDraw
+        self.draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+        self.font = dt_label._font_for("regular", dt_label._CREDIT_FONT_PX,
+                                       " ".join(self.GROUPS))
+
+    def _w(self, text):
+        return self.draw.textlength(text, font=self.font)
+
+    def test_fits_on_one_line(self):
+        wide = self._w(dt_label._CREDIT_SEP.join(self.GROUPS)) + 10
+        assert dt_label.wrap_credits(self.draw, self.GROUPS, self.font, wide) == [
+            dt_label._CREDIT_SEP.join(self.GROUPS)]
+
+    def test_breaks_between_groups_never_inside_one(self):
+        """The first render split "Add. Production:" from "Goran Simonoski"."""
+        width = self._w(dt_label._CREDIT_SEP.join(self.GROUPS[:2])) + 10
+        lines = dt_label.wrap_credits(self.draw, self.GROUPS, self.font, width)
+        assert lines == [dt_label._CREDIT_SEP.join(self.GROUPS[:2]), self.GROUPS[2]]
+
+    def test_overflow_ends_in_ellipsis(self):
+        width = self._w(dt_label._CREDIT_SEP.join(self.GROUPS[:2])) + 10
+        lines = dt_label.wrap_credits(self.draw, self.GROUPS, self.font, width,
+                                      max_lines=1)
+        assert len(lines) == 1 and lines[0].endswith("\u2026")
+        assert self._w(lines[0]) <= width
+
+    def test_oversized_group_word_wraps_on_its_own(self):
+        group = "Remix: " + ", ".join(f"Remixer Number {i}" for i in range(6))
+        width = self._w("Remixer Number 1, Remixer Number 2") + 10
+        lines = dt_label.wrap_credits(self.draw, [group], self.font, width)
+        assert len(lines) == 2
+        assert all(self._w(l) <= width for l in lines)
+
+    def test_every_line_within_width(self):
+        for width in (200, 350, 500, 800):
+            for line in dt_label.wrap_credits(self.draw, self.GROUPS, self.font, width):
+                assert self._w(line) <= width
+
+    def test_no_groups(self):
+        assert dt_label.wrap_credits(self.draw, [], self.font, 500) == []
+
+
+class TestCreditLayout:
+    """Credits change row and header heights; the probe must see exactly that."""
+
+    CONT  = LABEL_PROFILES["dk22243"]
+    DIE   = LABEL_PROFILES["dk1247"]
+
+    def _with_row_credit(self, credit_names):
+        data = _plain_release(2)
+        data["tracklist"][0]["extraartists"] = [
+            {"name": n, "role": "Remix", "id": 100 + i} for i, n in enumerate(credit_names)]
+        return make_release(data)
+
+    def test_one_credit_line_adds_exactly_one_line_height(self):
+        base = _probe(make_release(_plain_release(2)))
+        assert _probe(self._with_row_credit(["R"])) - base == _CREDIT_LINE_H
+
+    def test_long_credits_wrap_to_two_lines_on_continuous(self):
+        many = [f"Remixer With A Long Name {i}" for i in range(12)]
+        base = _probe(make_release(_plain_release(2)))
+        assert _probe(self._with_row_credit(many)) - base == 2 * _CREDIT_LINE_H
+
+    def test_die_cut_credits_are_one_line(self):
+        """Die-cut has a fixed canvas, so credits truncate like titles do."""
+        many = [f"Remixer With A Long Name {i}" for i in range(12)]
+        base = _probe(make_release(_plain_release(2)), self.DIE)
+        assert _probe(self._with_row_credit(many), self.DIE) - base == _CREDIT_LINE_H
+
+    def test_header_credit_line_height(self):
+        data = _plain_release(2)
+        data["extraartists"] = [{"name": "Whole Release", "role": "Remix", "id": 7}]
+        base = _probe(make_release(_plain_release(2)))
+        assert _probe(make_release(data)) - base == _HDR_CREDIT_LINE_H
+
+    def test_continuation_header_omits_header_credits(self):
+        data = _plain_release(2)
+        data["extraartists"] = [{"name": "Whole Release", "role": "Remix", "id": 7}]
+        rel, plain = make_release(data), make_release(_plain_release(2))
+        cont = lambda r: render_label(r, _all_tracks(r), self.CONT, False,
+                                      continuation=True, probe=True)
+        assert cont(rel) == cont(plain)
+
+    def test_credits_are_drawn(self, cheap_and_deep):
+        """Ink in the title column of the track rows, not just a taller canvas."""
+        bare = make_release(_cheap_and_deep_data())
+        bare.data["extraartists"] = []
+        for t in bare.data["tracklist"]:
+            t["extraartists"] = []
+
+        def track_column_ink(rel):
+            tracks = _all_tracks(rel)
+            h = _layout_height(rel, tracks, self.CONT, False)
+            img = render_label(rel, tracks, self.CONT, False, height_px=h,
+                               notes_lines=self.CONT["notes_lines"])
+            M = self.CONT["margin_px"]
+            top = render_label(rel, tracks[:0], self.CONT, False, probe=True)
+            bottom = render_label(rel, tracks, self.CONT, False, probe=True)
+            return _ink(img.crop((M + 120, top, self.CONT["width_px"] - M - 120, bottom)))
+
+        assert track_column_ink(cheap_and_deep) > track_column_ink(bare) * 1.5
+
+    def test_rendered_credits_break_between_groups(self):
+        """render_label must lay credits out with wrap_credits, not plain word
+        wrap.  Both give two lines here, so only the *content* of the second
+        line tells them apart: word wrap strands the name ("Goran Simonoski"),
+        group wrap keeps "Add. Production: Goran Simonoski" together.  Measure
+        the rendered width of that line.
+        """
+        from PIL import ImageDraw
+        data = _plain_release(2)
+        data["tracklist"][1]["extraartists"] = [
+            {"name": "Norman Nodge", "role": "Remix", "id": 1},
+            {"name": "Uta Alder", "role": "Vocals", "id": 2},
+            {"name": "Goran Simonoski", "role": "Producer [Additional Production]", "id": 3}]
+        rel = make_release(data)
+        tracks = _all_tracks(rel)
+        P = self.CONT
+        M, W = P["margin_px"], P["width_px"]
+
+        # The widths render_label works with.
+        scratch = ImageDraw.Draw(_PILImage.new("RGB", (1, 1)))
+        groups = dt_label._credit_groups(dt_label._credit_plan(rel)[1][1])
+        font = dt_label._font_for("regular", dt_label._CREDIT_FONT_PX,
+                                  dt_label._CREDIT_SEP.join(groups))
+        pos_w = dt_label._position_column_width(
+            scratch, dt_label.make_font("bold", 38), tracks)
+        max_w = W - 2 * M - pos_w - 110 - 16
+        by_group = dt_label.wrap_credits(scratch, groups, font, max_w)
+        by_word  = dt_label.wrap_text(scratch, dt_label._CREDIT_SEP.join(groups), font, max_w)
+        assert len(by_group) == len(by_word) == 2 and by_group[1] != by_word[1], \
+            "fixture no longer distinguishes the two wrapping strategies"
+
+        h = _layout_height(rel, tracks, P, False)
+        img = render_label(rel, tracks, P, False, height_px=h,
+                           notes_lines=P["notes_lines"]).convert("L")
+        bottom = render_label(rel, tracks, P, False, probe=True)
+        rule_y = bottom - 18                                # the row's BPM rule
+        x0, x1 = M + pos_w, W - M - 110 - 8                 # title column only
+        band = img.crop((x0, rule_y - _CREDIT_LINE_H + 4, x1, rule_y - 2))
+        cols = [x for x in range(band.width)
+                if min(band.getpixel((x, y)) for y in range(band.height)) < 128]
+        drawn_w = cols[-1] - cols[0] + 1
+
+        assert abs(drawn_w - scratch.textlength(by_group[1], font=font)) < 8
+        assert abs(drawn_w - scratch.textlength(by_word[1], font=font)) > 40
+
+    def test_qr_clears_credited_rows(self, cheap_and_deep):
+        tracks = _all_tracks(cheap_and_deep)
+        h = _layout_height(cheap_and_deep, tracks, self.CONT, False)
+        bottom = _probe(cheap_and_deep)
+        assert bottom + _NOTES_GAP <= h - self.CONT["margin_px"] - _QR_SIZE
+
+    def test_no_tripwire_on_credited_release(self, cheap_and_deep, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger=dt_label.log.name)
+        args = argparse.Namespace(split=False)
+        for profile in (self.CONT, self.DIE):
+            dt_label.render_labels_for_release(cheap_and_deep, args, profile)
+        assert "overruns the QR zone" not in caplog.text
+
+
+class TestHeaderWrap:
+    """Artist and title wrap rather than being cut off with an ellipsis."""
+
+    PROFILE = LABEL_PROFILES["dk22243"]
+
+    def _probe_header(self, artist="Artist", title="Title"):
+        r = _fake_render_release()
+        r.getArtist.return_value = artist
+        r.getTitle.return_value = title
+        return render_label(r, [], self.PROFILE, False, probe=True)
+
+    def test_long_artist_wraps(self):
+        """Real case (r14739648): the fifth artist used to be cut off."""
+        long_artist = "Caterina Barbieri (2) / Donato Dozzy / Lucy (12) / Klock / Xhin"
+        assert (self._probe_header(artist=long_artist) - self._probe_header()
+                == _TITLE_WRAP_LINE_H)
+
+    def test_long_title_wraps(self):
+        long_title = "A Title Long Enough That It Cannot Possibly Fit On One Line"
+        assert (self._probe_header(title=long_title) - self._probe_header()
+                == _TITLE_WRAP_LINE_H)
+
+    def test_wrap_is_capped(self):
+        absurd = " ".join(["Overlong"] * 60)
+        extra = (_HEADER_MAX_LINES - 1) * _TITLE_WRAP_LINE_H
+        assert self._probe_header(artist=absurd) - self._probe_header() == extra
+        assert self._probe_header(title=absurd) - self._probe_header() == extra
+
+    def test_wrapped_artist_is_drawn(self):
+        """The second artist line carries ink where a short artist has none."""
+        long_artist = "Caterina Barbieri / Donato Dozzy / Lucy / Klock / Xhin"
+
+        def artist_band_ink(artist):
+            r = _fake_render_release()
+            r.getArtist.return_value = artist
+            img = render_label(r, [], LABEL_PROFILES["dk1247"], False)
+            M = self.PROFILE["margin_px"]
+            # Second artist line; with a short artist this is the gap above
+            # the title, which starts 70 px down.
+            y0 = M + _TITLE_WRAP_LINE_H + 8
+            return _ink(img.crop((M, y0, img.width - M, M + 70 + 4)))
+
+        assert artist_band_ink(long_artist) > artist_band_ink("Artist") + 500
+
+
+class TestStripDisambig:
+    @pytest.mark.parametrize("name,expected", [
+        ("Mark Richardson (3)", "Mark Richardson"),
+        ("Caterina Barbieri (2) / Donato Dozzy / Lucy (12) / Klock / Xhin",
+         "Caterina Barbieri / Donato Dozzy / Lucy / Klock / Xhin"),
+        ("Lucy (12)/Klock", "Lucy/Klock"),
+        ("A / B (2)", "A / B"),
+        ("Jonsson/Alter", "Jonsson/Alter"),        # one duo's name — slash kept
+        ("The (2) Sisters", "The (2) Sisters"),    # not a suffix
+        ("808 State", "808 State"),
+        ("Artist", "Artist"),
+    ])
+    def test_cases(self, name, expected):
+        assert dt_label._strip_disambig(name) == expected
+
+
+class TestChunkDieCut:
+    """Die-cut labels are packed by measured height, capped at max_tracks."""
+
+    PROFILE = LABEL_PROFILES["dk1247"]
+
+    def _fits(self, chunks, release):
+        return all(
+            _layout_height(release, c, self.PROFILE, False, continuation=i > 0)
+            <= self.PROFILE["height_px"]
+            for i, c in enumerate(chunks))
+
+    def test_twelve_tracks_on_two_sides_is_still_one_label(self):
+        """Where the old count-based packing was safe, nothing changes."""
+        tracks = _make_tracks_with_sides([("A", 6), ("B", 6)])
+        chunks = _chunk_tracks(tracks, self.PROFILE, _height_release())
+        assert chunks == [tracks]
+
+    def test_four_sides_no_longer_overrun_the_qr(self):
+        """Twelve tracks over four sides: four side headers pushed the last row
+        into the QR under count-based packing (48 labels across a
+        1000-release collection overran like this)."""
+        tracks = _make_tracks_with_sides([("A", 3), ("B", 3), ("C", 3), ("D", 3)])
+        release = _height_release()
+        assert _layout_height(release, tracks, self.PROFILE, False) > self.PROFILE["height_px"]
+        chunks = _chunk_tracks(tracks, self.PROFILE, release)
+        assert len(chunks) == 2
+        assert self._fits(chunks, release)
+
+    def test_max_tracks_cap_still_applies(self):
+        tracks = _make_tracks_with_sides([("A", 30)], title="T")
+        chunks = _chunk_tracks(tracks, self.PROFILE, _height_release())
+        assert all(len(c) <= self.PROFILE["max_tracks"] for c in chunks)
+        assert [t for c in chunks for t in c] == tracks
+
+    def test_credits_can_push_tracks_onto_a_continuation(self):
+        data = _plain_release(12)
+        for i, t in enumerate(data["tracklist"]):
+            t["extraartists"] = [{"name": f"Remixer {i}", "role": "Remix", "id": 500 + i}]
+        rel = make_release(data)
+        tracks = _all_tracks(rel)
+        plain = make_release(_plain_release(12))
+        assert len(_chunk_tracks(_all_tracks(plain), self.PROFILE, plain)) == 1, \
+            "without credits these twelve tracks fit one label"
+        chunks = _chunk_tracks(tracks, self.PROFILE, rel)
+        assert len(chunks) > 1
+        assert self._fits(chunks, rel)
+        assert [t for c in chunks for t in c] == tracks
+
+
+class TestSplitMode:
+    """--split: one label per disc, with a continuation when a disc won't fit."""
+
+    DIE = LABEL_PROFILES["dk1247"]
+
+    def _crowded_disc_release(self):
+        """Disc 1 is twelve credited tracks — too tall for one die-cut label."""
+        data = _plain_release(12)
+        for i, t in enumerate(data["tracklist"]):
+            t["position"] = f"{'AB'[i // 6]}{i % 6 + 1}"
+            t["extraartists"] = [{"name": f"Remixer {i}", "role": "Remix", "id": 500 + i}]
+        data["tracklist"].append({"position": "C1", "type_": "track", "duration": "",
+                                  "title": "Disc Two"})
+        return make_release(data)
+
+    def test_oversized_disc_gets_a_continuation(self, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger=dt_label.log.name)
+        labels = dt_label.render_labels_for_release(
+            self._crowded_disc_release(), argparse.Namespace(split=True), self.DIE)
+        suffixes = [s for s, _ in labels]
+        assert suffixes[0] == "disc1" and "disc1_cont1" in suffixes
+        assert suffixes[-1] == "disc2"
+        assert "overruns the QR zone" not in caplog.text
+
+    def test_first_disc_chunk_is_measured_with_its_disc_line(self):
+        """The "Disc N of M" line is 40 px.  Find a disc that fits without it
+        but not with it: chunking must see the line and split, or the QR lands
+        on the last row of a label that looked like it fit."""
+        H = self.DIE["height_px"]
+        for n in range(1, 13):
+            for c in range(n + 1):
+                data = _plain_release(n)
+                for i in range(c):
+                    data["tracklist"][i]["extraartists"] = [
+                        {"name": f"R{i}", "role": "Remix", "id": 700 + i}]
+                rel = make_release(data)
+                tracks = _all_tracks(rel)
+                if (_layout_height(rel, tracks, self.DIE, False) <= H
+                        < _layout_height(rel, tracks, self.DIE, False, disc_info=(1, 1))):
+                    assert len(_chunk_tracks(tracks, self.DIE, rel)) == 1
+                    chunks = _chunk_tracks(tracks, self.DIE, rel, disc_info=(1, 1))
+                    assert len(chunks) == 2
+                    assert _layout_height(rel, chunks[0], self.DIE, False,
+                                          disc_info=(1, 1)) <= H
+                    return
+        pytest.fail("no layout found where the disc line decides the fit")
+
+    def test_continuation_sorts_after_its_disc(self):
+        """dt_server lists previews in filename order."""
+        names = [f"123_{s}.png" for s in ("disc2", "disc1_cont1", "disc1")]
+        assert sorted(names) == ["123_disc1.png", "123_disc1_cont1.png", "123_disc2.png"]
+
+    def test_select_discs_keeps_continuations(self):
+        labels = [(s, None) for s in ("disc1", "disc1_cont1", "disc2", "disc10")]
+        assert [s for s, _ in dt_label._select_discs(labels, [1])] == ["disc1", "disc1_cont1"]
+        assert [s for s, _ in dt_label._select_discs(labels, [2])] == ["disc2"]
+        assert [s for s, _ in dt_label._select_discs(labels, [10])] == ["disc10"]

@@ -6,6 +6,9 @@ Covers:
   - get_user_auth_tokens / set_user_auth_tokens: auth file I/O
   - DiscogsRelease: metadata accessors tested via duck-typed fake data
   - DiscogsTrack: per-track accessors, artist fallback to release
+  - split_roles / resolveTrackScope / getCredits: where Discogs keeps credits
+    (track extraartists, release extraartists scoped by `tracks`) resolved
+    to the tracks they belong to
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import client_interface
 from client_interface import (
     DiscogsRelease,
     DiscogsTrack,
+    split_roles,
     scrub_data,
     _normalize_artwork,
     get_user_auth_tokens,
@@ -564,3 +568,132 @@ class TestDiscogsTrack:
         t = self._make_track(0)
         assert t["title"] == "Track One"
         assert t["position"] == "A1"
+
+
+# ─── Credits ──────────────────────────────────────────────────────────────────
+
+from conftest import make_release  # noqa: E402
+
+
+class TestSplitRoles:
+    def test_single_role(self):
+        assert split_roles("Remix") == ["Remix"]
+
+    def test_packed_roles_split(self):
+        assert split_roles("Artwork, Design") == ["Artwork", "Design"]
+
+    def test_comma_inside_qualifier_is_not_a_separator(self):
+        assert split_roles("Remix [Remixed, Reshaped], Producer") == [
+            "Remix [Remixed, Reshaped]", "Producer"]
+
+    def test_empty(self):
+        assert split_roles("") == []
+
+    def test_stray_commas_and_whitespace(self):
+        assert split_roles(" Remix ,, Vocals ") == ["Remix", "Vocals"]
+
+
+def _positions(*positions):
+    return make_release(_make_release_data(tracklist=[
+        {"title": f"T{p}", "position": p, "type_": "track", "duration": ""}
+        for p in positions]))
+
+
+class TestResolveTrackScope:
+    """Every `tracks` shape seen across a 1000-release collection."""
+
+    REL = staticmethod(lambda: _positions("A1", "A2", "B1", "B2", "C1", "C2", "C3", "D1"))
+
+    @pytest.mark.parametrize("spec,expected", [
+        ("A1",               {0}),
+        ("A1, B1",           {0, 2}),
+        ("C2 & C3",          {5, 6}),
+        ("A1 to B1",         {0, 1, 2}),
+        ("B",                {2, 3}),              # bare side
+        ("A to B1",          {0, 1, 2}),           # side as range start
+        ("C1 to D",          {4, 5, 6, 7}),        # side as range end
+        ("A to B2, C2, D",   {0, 1, 2, 3, 5, 7}),
+        ("All Music",        set(range(8))),
+        ("All except D1",    set(range(7))),
+        ("All tracks except A1, A2", set(range(2, 8))),
+        ("a1, b2",           {0, 3}),              # case-insensitive
+    ])
+    def test_shapes(self, spec, expected):
+        assert self.REL().resolveTrackScope(spec) == expected
+
+    def test_empty_means_whole_release(self):
+        assert self.REL().resolveTrackScope("") is None
+        assert self.REL().resolveTrackScope("   ") is None
+
+    def test_unresolvable_tokens_ignored_not_guessed(self):
+        """'C3 outro' names no position: it contributes nothing, and a credit
+        is never attached to a track it can't be tied to."""
+        assert self.REL().resolveTrackScope("C2 & C3 outro") == {5}
+        assert self.REL().resolveTrackScope("Z9") == set()
+
+    def test_backwards_range_is_empty(self):
+        assert self.REL().resolveTrackScope("B2 to A1") == set()
+
+
+class TestGetCredits:
+    def test_track_credits_come_first(self, cheap_and_deep):
+        a1 = cheap_and_deep.getTrack(0).getCredits()
+        assert a1[0] == {"role": "Remix", "name": "Norman Nodge", "artist_id": 845344}
+
+    def test_scoped_release_credit_only_on_its_tracks(self, cheap_and_deep):
+        """Uta Alder is credited on "A1, B1" — not on B2."""
+        names = [[c["name"] for c in cheap_and_deep.getTrack(i).getCredits()]
+                 for i in range(3)]
+        assert "Uta Alder" in names[0]
+        assert "Uta Alder" in names[1]
+        assert "Uta Alder" not in names[2]
+
+    def test_unscoped_release_credit_on_every_track(self, cheap_and_deep):
+        for i in range(3):
+            assert any(c["name"] == "Jay Ahern"
+                       for c in cheap_and_deep.getTrack(i).getCredits())
+
+    def test_packed_role_becomes_one_credit_per_role(self, cheap_and_deep):
+        roles = [c["role"] for c in cheap_and_deep.getTrack(0).getCredits()
+                 if c["name"] == "Maike Verloh"]
+        assert roles == ["Artwork", "Design"]
+
+    def test_anv_preferred_over_canonical_name(self, cheap_and_deep):
+        names = [c["name"] for c in cheap_and_deep.getTrack(0).getCredits()]
+        assert "MJR" in names and "Mark Richardson (3)" not in names
+
+    def test_same_credit_recorded_twice_is_deduplicated(self):
+        data = _make_release_data(
+            extraartists=[{"name": "X", "role": "Remix", "tracks": "A1", "id": 7}])
+        data["tracklist"][0]["extraartists"] = [
+            {"name": "X", "role": "Remix", "tracks": "", "id": 7}]
+        credits = make_release(data).getTrack(0).getCredits()
+        assert credits == [{"role": "Remix", "name": "X", "artist_id": 7}]
+
+    def test_nameless_entry_skipped(self):
+        data = _make_release_data(extraartists=[{"name": "", "role": "Remix", "tracks": ""}])
+        assert make_release(data).getTrack(0).getCredits() == []
+
+    def test_no_credits_anywhere(self):
+        assert make_release(_make_release_data()).getTrack(0).getCredits() == []
+
+    def test_unlinked_artist_id_is_zero(self):
+        data = _make_release_data(extraartists=[{"name": "Anon", "role": "Remix", "tracks": ""}])
+        assert make_release(data).getTrack(0).getCredits()[0]["artist_id"] == 0
+
+
+class TestArtistIds:
+    def test_release_artist_ids(self, cheap_and_deep):
+        assert cheap_and_deep.getArtistIds() == {1563065}
+
+    def test_track_inherits_release_artists(self, cheap_and_deep):
+        assert cheap_and_deep.getTrack(0).getArtistIds() == {1563065}
+
+    def test_track_with_own_artists(self):
+        data = _make_release_data()
+        data["tracklist"][0]["artists"] = [{"name": "Guest", "id": 42}]
+        assert make_release(data).getTrack(0).getArtistIds() == {42}
+
+    def test_unlinked_artists_omitted(self):
+        data = _make_release_data(artists=[{"name": "No Id"}])
+        assert make_release(data).getArtistIds() == set()

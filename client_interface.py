@@ -36,6 +36,28 @@ discogs_lock = multiprocessing.Lock()
 class DiscogsArtistRef(TypedDict, total=False):
     name: str
     anv: str
+    id: int
+
+
+class DiscogsExtraArtistRef(TypedDict, total=False):
+    """One entry of an `extraartists` list — a credit rather than a performer.
+
+    `role` may pack several roles ("Artwork, Design") and bracketed qualifiers
+    ("Remix [Reshaped]").  On a release-level entry, `tracks` scopes the credit
+    to particular tracks; empty means the whole release.
+    """
+    name: str
+    anv: str
+    id: int
+    role: str
+    tracks: str
+
+
+class DiscogsCredit(TypedDict):
+    """One role held by one artist on one track, as resolved by getCredits()."""
+    role: str        # a single role, qualifier included: "Producer [Additional]"
+    name: str        # as credited on the release (ANV if set), " (2)" kept
+    artist_id: int   # 0 when Discogs has no linked artist
 
 
 class DiscogsLabelRef(TypedDict, total=False):
@@ -61,6 +83,7 @@ class _DiscogsTrackDataRequired(TypedDict):
 
 class DiscogsTrackData(_DiscogsTrackDataRequired, total=False):
     artists: list[DiscogsArtistRef]
+    extraartists: list[DiscogsExtraArtistRef]
     duration: str
 
 
@@ -78,6 +101,7 @@ class DiscogsReleaseData(_DiscogsReleaseDataRequired, total=False):
     country: str
     styles: list[str]
     genres: list[str]
+    extraartists: list[DiscogsExtraArtistRef]
 
 
 class ClientException(Exception):
@@ -171,6 +195,50 @@ def _normalize_artwork(imgdata: bytes) -> bytes:
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=90)
     return out.getvalue()
+
+
+def split_roles(role: str) -> list[str]:
+    """Split a Discogs role string into its individual roles.
+
+    Discogs packs several roles into one string ("Artwork, Design"), and a
+    role's bracketed qualifier can itself contain commas ("Remix [Remixed,
+    Reshaped]"), so this splits only on commas outside brackets.
+    """
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    for ch in role:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    parts.append(current.strip())
+    return [p for p in parts if p]
+
+
+def _credits_from(entry: DiscogsExtraArtistRef) -> list[DiscogsCredit]:
+    """Expand one extraartists entry into one DiscogsCredit per role."""
+    name = (entry.get("anv") or entry.get("name") or "").strip()
+    if not name:
+        return []
+    artist_id = entry.get("id") or 0
+    return [{"role": role, "name": name, "artist_id": artist_id}
+            for role in split_roles(entry.get("role", ""))]
+
+
+# Separators and range syntax seen in the `tracks` field of release credits:
+# "A1, B1", "C2 & C3", "A1 to A3", "A to B2" (a bare side as an endpoint).
+_SCOPE_SPLIT_RE = re.compile(r"\s*[,&]\s*")
+_SCOPE_RANGE_RE = re.compile(r"^(.+?)\s+to\s+(.+)$", re.IGNORECASE)
+# "All", "All Music", "All except D1", "All tracks except A1, A2".  The
+# exception list may follow other words, so look for "except" anywhere.
+_SCOPE_ALL_RE   = re.compile(r"^all\b(?:.*?\bexcept\b\s*(.*))?", re.IGNORECASE)
+_SIDE_RE        = re.compile(r"^([A-Za-z]+)")
 
 
 class DiscogsRelease:
@@ -335,6 +403,82 @@ class DiscogsRelease:
     def getArtist(self) -> str:
         return self.compileListData("artists", ["anv", "name"])
 
+    def getArtistIds(self) -> set[int]:
+        """Discogs ids of the release's main artists (unlinked ones omitted)."""
+        return {a["id"] for a in self.data.get("artists", []) if a.get("id")}
+
+    def resolveTrackScope(self, spec: str) -> set[int] | None:
+        """Map a release credit's `tracks` field to 0-based track indices.
+
+        Returns None for an empty field: the credit applies to the whole
+        release.  Otherwise returns the set of covered indices, matching
+        getTrack(i).  Understands everything observed across a 1000-release
+        collection:
+
+          "A1", "A1, B1", "C2 & C3"   explicit positions
+          "A1 to A3"                  inclusive range, in tracklist order
+          "A", "B"                    a bare side: every track on it
+          "A to B2"                   a side as a range endpoint
+          "All Music", "All except D1"
+
+        Tokens that match no position are ignored rather than guessed at —
+        "C3 outro" contributes nothing, so a credit is never attached to a
+        track it can't be tied to.
+        """
+        spec = (spec or "").strip()
+        if not spec:
+            return None
+
+        positions = [t.get("position", "").strip().upper()
+                     for t in self.data["tracklist"]]
+        everything = set(range(len(positions)))
+
+        m = _SCOPE_ALL_RE.match(spec)
+        if m:
+            excluded = m.group(1)
+            return everything - self._scopeTokens(excluded, positions) if excluded else everything
+
+        return self._scopeTokens(spec, positions)
+
+    @staticmethod
+    def _scopeTokens(text: str, positions: list[str]) -> set[int]:
+        """Resolve a comma/ampersand separated list of positions, sides and ranges."""
+
+        def side_of(pos: str) -> str:
+            m = _SIDE_RE.match(pos)
+            return m.group(1) if m else ""
+
+        def on_side(side: str) -> list[int]:
+            return [i for i, p in enumerate(positions) if side_of(p) == side]
+
+        def endpoint(tok: str, first: bool) -> int | None:
+            tok = tok.strip().upper()
+            if tok in positions:
+                return positions.index(tok) if first else len(positions) - 1 - positions[::-1].index(tok)
+            if tok.isalpha():                     # a bare side, e.g. "A to B2"
+                hits = on_side(tok)
+                if hits:
+                    return hits[0] if first else hits[-1]
+            return None
+
+        out: set[int] = set()
+        for tok in _SCOPE_SPLIT_RE.split(text.strip()):
+            if not tok:
+                continue
+            rng = _SCOPE_RANGE_RE.match(tok)
+            if rng:
+                lo = endpoint(rng.group(1), first=True)
+                hi = endpoint(rng.group(2), first=False)
+                if lo is not None and hi is not None and lo <= hi:
+                    out.update(range(lo, hi + 1))
+                continue
+            up = tok.strip().upper()
+            if up in positions:
+                out.update(i for i, p in enumerate(positions) if p == up)
+            elif up.isalpha():
+                out.update(on_side(up))
+        return out
+
     def getLabel(self) -> str:
         return self.compileListData("labels", ["name"])
 
@@ -461,6 +605,46 @@ class DiscogsTrack:
 
     def getPosition(self) -> str:
         return self.tdata["position"]
+
+    def getArtistIds(self) -> set[int]:
+        """Discogs ids of this track's performing artists.
+
+        Tracks without their own `artists` inherit the release's, the same
+        fallback getArtist() uses.
+        """
+        artists = self.tdata.get("artists")
+        if not artists:
+            return self.release.getArtistIds()
+        return {a["id"] for a in artists if a.get("id")}
+
+    def getCredits(self) -> list[DiscogsCredit]:
+        """Every credit that applies to this track, one entry per role.
+
+        Discogs records credits in two places: on the track itself, and on the
+        release with a `tracks` field saying which tracks they cover.  Both are
+        merged here.  Release credits with no `tracks` field cover every track,
+        so they are included too — deciding whether to print those once per
+        release or once per track is the caller's business, not this method's.
+
+        Order follows Discogs (track credits first); exact duplicates, which
+        occur when both places record the same credit, are dropped.
+        """
+        found: list[DiscogsCredit] = []
+        for entry in self.tdata.get("extraartists") or []:
+            found.extend(_credits_from(entry))
+        for entry in self.release.data.get("extraartists") or []:
+            scope = self.release.resolveTrackScope(entry.get("tracks", ""))
+            if scope is None or self.index in scope:
+                found.extend(_credits_from(entry))
+
+        seen: set[tuple[str, int | str]] = set()
+        unique: list[DiscogsCredit] = []
+        for c in found:
+            key = (c["role"], c["artist_id"] or c["name"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+        return unique
 
     def getDuration(self) -> str:
         return self.tdata.get("duration", "").strip()
