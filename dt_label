@@ -97,12 +97,9 @@ _TITLE_WRAP_LINE_H = 58
 # needed exactly two); three leaves headroom before an ellipsis appears.
 _HEADER_MAX_LINES = 3
 
-# Credit lines ("Remix: Norman Nodge · Vocals: Uta Alder") under a track title,
-# and under the release title for credits that cover every track.
+# Credit lines ("Remix: Norman Nodge · Vocals: Crissy Liu") under a track title.
 _CREDIT_FONT_PX  = 30
 _CREDIT_LINE_H   = 38
-_HDR_CREDIT_PX   = 32
-_HDR_CREDIT_LINE_H = 42
 
 # Position column sizing.  _POS_W_MIN keeps the usual "A1" case looking the way
 # it always has; wider position strings grow the column instead of colliding
@@ -509,7 +506,7 @@ _CREDIT_ORDER = ("Remix", "Edit", "DJ Mix", "Featuring", "Vocals", "Voice",
                  "Producer", "Co-producer", "Add. Production")
 
 # Credits that identify *which version* of a track this is.  These print even
-# when they name the track's own artist — see _credit_plan().
+# when they name the track's own artist — see _track_credits().
 _VERSION_LABELS = frozenset({"Remix", "Edit", "DJ Mix"})
 
 _ROLE_QUALIFIER_RE = re.compile(r"^(.*?)\s*(?:\[(.*)\])?\s*$")
@@ -527,72 +524,48 @@ def _credit_label(role):
     return None
 
 
-def _credit_plan(release):
-    """Decide which credits print, and where.
+def _track_credits(release, track):
+    """[(label, name), …] to print under one track's row.
 
-    Returns (header, rows):
-      header — [(label, name), …] for credits that apply to every track
-      rows   — {track_idx: [(label, name), …]} for everything else
+    Only the track's own Discogs credits — the ones shown under it in the
+    tracklist.  Release credits are left off entirely, even ones scoped to
+    this track: on the label they were mostly the producer under an alias or
+    real name ("Producer [Uncredited]: Brenton Smith" on Daze, r6628547),
+    which says nothing about the record in your hand.
 
-    A credit on every track is printed once under the release title rather than
-    repeated on each row.  That one rule covers release-wide Discogs credits
-    (no `tracks` field), ones scoped to "All", and track credits that happen to
-    repeat on every track, e.g. a single remixer across a whole EP.
+    Two filters keep a row from saying things twice:
 
-    Two filters keep the label from saying things twice:
-
-    * A credit whose name is already in the title is dropped.  Discogs titles
-      usually carry the remixer — "Peels A Tangerine (Regis Remix)" with
-      "Remix: Regis" — and across a 1000-release collection 74% of Remix
-      credits were redundant this way.  Header credits are checked against the
-      release title, row credits against their track title.
+    * A credit whose name is already in the track title is dropped.  Discogs
+      titles usually carry the remixer — "Peels A Tangerine (Regis Remix)"
+      with "Remix: Regis" — and across a 1000-release collection 74% of Remix
+      credits were redundant this way.
     * A credit naming the release's or the track's own artist is dropped —
-      "Producer: <the artist>" is on almost every release and says nothing.
-      Version credits (_VERSION_LABELS) are exempt: an artist remixing their
-      own track is exactly what tells two versions apart.
+      "Producer: <the artist>" says nothing.  Version credits
+      (_VERSION_LABELS) are exempt: an artist remixing their own track is
+      exactly what tells two versions apart.
 
-    Stub releases (the tests use MagicMock) yield no credits.
+    Stub tracks (the tests use MagicMock) yield no credits.
     """
-    n = release.getTotalTracks()
-    if not isinstance(n, int) or n <= 0:
-        return [], {}
+    credits = track.getTrackCredits()
+    if not isinstance(credits, list) or not credits:
+        return []
 
-    raw = {}
-    for i in range(n):
-        track = release.getTrack(i)
-        credits = track.getCredits()
-        if not isinstance(credits, list):
-            return [], {}
-        raw[i] = (track, credits)
-
-    main_ids = set(release.getArtistIds())
-    per_track = {}
-    for i, (track, credits) in raw.items():
-        own_ids = main_ids | set(track.getArtistIds())
-        pairs = []
-        for c in credits:
-            label = _credit_label(c["role"])
-            name  = _strip_disambig(c["name"])
-            if not label or not name:
-                continue
-            if (label not in _VERSION_LABELS
-                    and c["artist_id"] and c["artist_id"] in own_ids):
-                continue
-            if (label, name) not in pairs:
-                pairs.append((label, name))
-        per_track[i] = pairs
-
-    # Placement is decided before the title filter, so a release-wide credit
-    # stays in the header even if one track's title happens to mention it.
-    everywhere = set.intersection(*(set(p) for p in per_track.values()))
-    header = [pair for pair in per_track[0]
-              if pair in everywhere and not _named_in(pair[1], release.getTitle())]
-    rows = {}
-    for i, pairs in per_track.items():
-        title = raw[i][0].getTitle(synthesise=False)
-        rows[i] = [p for p in pairs
-                   if p not in everywhere and not _named_in(p[1], title)]
-    return header, rows
+    own_ids = set(release.getArtistIds()) | set(track.getArtistIds())
+    title = track.getTitle(synthesise=False)
+    pairs = []
+    for c in credits:
+        label = _credit_label(c["role"])
+        name  = _strip_disambig(c["name"])
+        if not label or not name:
+            continue
+        if (label not in _VERSION_LABELS
+                and c["artist_id"] and c["artist_id"] in own_ids):
+            continue
+        if _named_in(name, title):
+            continue
+        if (label, name) not in pairs:
+            pairs.append((label, name))
+    return pairs
 
 
 def _named_in(name, text):
@@ -827,11 +800,6 @@ def render_label(release, tracks_with_sides, profile,
     x1 = W - M
     y  = M
 
-    # Which credits print under the release title vs. on each track row.
-    # Decided from the whole release, not this chunk, so a continuation or
-    # per-disc label agrees with the first one about what is release-wide.
-    credit_header, credit_rows = _credit_plan(release)
-
     def hl(y_pos, color="black", weight=2):
         hline(draw, y_pos, x0, x1, color=color, weight=weight)
 
@@ -857,18 +825,6 @@ def render_label(release, tracks_with_sides, profile,
                 # 58 px between wrapped lines; 70 px after the final line.
                 y += _TITLE_WRAP_LINE_H if i < len(lines) - 1 else 70
 
-        # Credits covering every track ("Remix: X" on a one-remixer EP) —
-        # printed once here instead of repeated on each row.
-        if credit_header:
-            hdr_groups = _credit_groups(credit_header)
-            f_hdr_cred = _font_for("regular", _HDR_CREDIT_PX,
-                                   _CREDIT_SEP.join(hdr_groups))
-            y -= 8   # tuck under the title rather than floating mid-gap
-            for line in wrap_credits(draw, hdr_groups, f_hdr_cred, CW):
-                draw.text((M, y), line, font=f_hdr_cred, fill="#333333")
-                y += _HDR_CREDIT_LINE_H
-            y += 8
-
         # Disc indicator for --split labels (immediately below title)
         if disc_info:
             disc_num, total_discs = disc_info
@@ -879,7 +835,12 @@ def render_label(release, tracks_with_sides, profile,
         hl(y); y += 18
 
         # Label [catno]                          Year  Country
-        label_meta = f"{release.getLabel()}  [{release.getCatno()}]"
+        # Either can be empty — r3060397 lists no label at all — so join only
+        # what is there rather than printing a bare "  []".
+        catno      = release.getCatno()
+        label_meta = "  ".join(part for part in
+                               (release.getLabel(), f"[{catno}]" if catno else "")
+                               if part)
         year_cc    = f"{release.getLabelYear()}  {release.getCountry()}"
         ycc_w = draw.textlength(year_cc, font=f_meta)
         label_meta = truncate_text(draw, label_meta, f_meta, CW - ycc_w - 24)
@@ -940,7 +901,7 @@ def render_label(release, tracks_with_sides, profile,
         # Credits for this track in a smaller face under the title.  Same wrap
         # policy as the title, and the same width, so they stay clear of the
         # BPM zone.
-        credit_groups = _credit_groups(credit_rows.get(track_idx, []))
+        credit_groups = _credit_groups(_track_credits(release, track))
         credit_lines = []
         if credit_groups:
             f_credit_r = _font_for("regular", _CREDIT_FONT_PX,

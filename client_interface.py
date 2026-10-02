@@ -384,7 +384,11 @@ class DiscogsRelease:
         return ""
 
     def compileListData(self, listname: str, keys: list[str]) -> str:
-        items = cast(list[dict[str, str]], self.data[listname])  # type: ignore[literal-required]
+        # Discogs can return an empty list — r3060397 has no labels at all —
+        # and indexing items[0] used to crash getLabel()/getCatno() outright.
+        items = cast(list[dict[str, str]], self.data.get(listname) or [])  # type: ignore[misc]
+        if not items:
+            return ""
         s: str = ""
         for key in keys:
             s = items[0].get(key, "")
@@ -617,21 +621,33 @@ class DiscogsTrack:
             return self.release.getArtistIds()
         return {a["id"] for a in artists if a.get("id")}
 
-    def getCredits(self) -> list[DiscogsCredit]:
-        """Every credit that applies to this track, one entry per role.
+    def getTrackCredits(self) -> list[DiscogsCredit]:
+        """Credits recorded on this track itself, one entry per role.
 
-        Discogs records credits in two places: on the track itself, and on the
-        release with a `tracks` field saying which tracks they cover.  Both are
-        merged here.  Release credits with no `tracks` field cover every track,
-        so they are included too — deciding whether to print those once per
-        release or once per track is the caller's business, not this method's.
-
-        Order follows Discogs (track credits first); exact duplicates, which
-        occur when both places record the same credit, are dropped.
+        These are the ones Discogs shows under the track in its tracklist —
+        "Remix – Norman Nodge".  Release credits, even ones scoped to this
+        track, are not included; see getCredits() for those.
         """
         found: list[DiscogsCredit] = []
         for entry in self.tdata.get("extraartists") or []:
             found.extend(_credits_from(entry))
+        return found
+
+    def getCredits(self) -> list[DiscogsCredit]:
+        """Every credit that applies to this track, one entry per role.
+
+        Discogs records credits in two places: on the track itself
+        (getTrackCredits), and on the release with a `tracks` field saying
+        which tracks they cover.  Both are merged here.  Release credits with no
+        `tracks` field cover every track, so they are included too.
+
+        Labels print only the track's own credits; this fuller view is kept
+        for callers that want what Discogs lists on the release as well.
+
+        Order follows Discogs (track credits first); exact duplicates, which
+        occur when both places record the same credit, are dropped.
+        """
+        found: list[DiscogsCredit] = list(self.getTrackCredits())
         for entry in self.release.data.get("extraartists") or []:
             scope = self.release.resolveTrackScope(entry.get("tracks", ""))
             if scope is None or self.index in scope:

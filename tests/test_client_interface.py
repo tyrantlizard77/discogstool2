@@ -682,6 +682,51 @@ class TestGetCredits:
         assert make_release(data).getTrack(0).getCredits()[0]["artist_id"] == 0
 
 
+class TestGetTrackCredits:
+    """Only what Discogs lists under the track — what labels print."""
+
+    def test_track_credits_only(self, cheap_and_deep):
+        assert [c["name"] for c in cheap_and_deep.getTrack(0).getTrackCredits()] == [
+            "Norman Nodge"]
+
+    def test_scoped_release_credits_excluded(self, cheap_and_deep):
+        """Uta Alder is a release credit scoped to "A1, B1": getCredits()
+        includes her on A1, getTrackCredits() does not."""
+        a1 = cheap_and_deep.getTrack(0)
+        assert any(c["name"] == "Uta Alder" for c in a1.getCredits())
+        assert not any(c["name"] == "Uta Alder" for c in a1.getTrackCredits())
+
+    def test_getCredits_starts_with_track_credits(self, cheap_and_deep):
+        b2 = cheap_and_deep.getTrack(2)
+        assert b2.getCredits()[:len(b2.getTrackCredits())] == b2.getTrackCredits()
+
+    def test_no_track_credits(self):
+        assert make_release(_make_release_data()).getTrack(0).getTrackCredits() == []
+
+
+class TestEmptyLists:
+    """r3060397 (Far – Water & Solutions) has `labels: []`, and getLabel()
+    used to raise IndexError, which crashed dt_label outright."""
+
+    def test_empty_labels(self):
+        rel = make_release(_make_release_data(labels=[]))
+        assert rel.getLabel() == ""
+        assert rel.getCatno() == ""
+
+    def test_empty_artists(self):
+        assert make_release(_make_release_data(artists=[])).getArtist() == ""
+
+    def test_missing_key(self):
+        data = _make_release_data()
+        del data["labels"]
+        assert make_release(data).getLabel() == ""
+
+    def test_untitled_release_synthesises_from_empty_catno(self):
+        """getTitle() falls back to the catno for "Untitled" releases."""
+        rel = make_release(_make_release_data(labels=[], title="Untitled"))
+        assert rel.getTitle() == ""
+
+
 class TestArtistIds:
     def test_release_artist_ids(self, cheap_and_deep):
         assert cheap_and_deep.getArtistIds() == {1563065}

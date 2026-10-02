@@ -1341,7 +1341,6 @@ class TestPositionColumnWidth:
 from conftest import _cheap_and_deep_data, make_release  # noqa: E402
 
 _CREDIT_LINE_H     = dt_label._CREDIT_LINE_H
-_HDR_CREDIT_LINE_H = dt_label._HDR_CREDIT_LINE_H
 _TITLE_WRAP_LINE_H = dt_label._TITLE_WRAP_LINE_H
 _HEADER_MAX_LINES  = dt_label._HEADER_MAX_LINES
 _NOTES_GAP         = dt_label._NOTES_GAP
@@ -1394,56 +1393,62 @@ class TestCreditLabel:
         assert dt_label._credit_label(role) == label
 
 
-class TestCreditPlan:
+def _row_credits(release):
+    """{track_idx: [(label, name), …]} for every track of *release*."""
+    return {i: dt_label._track_credits(release, release.getTrack(i))
+            for i in range(release.getTotalTracks())}
+
+
+class TestTrackCredits:
     def test_r3854655(self, cheap_and_deep):
         """The release that prompted credit support, end to end.
 
         Both remixes share the title "Words, Breaths & Pauses Remix"; the
         remixer is the only thing that tells them apart on the label.
         """
-        header, rows = dt_label._credit_plan(cheap_and_deep)
-        assert header == [("Producer", "Jay Ahern")]
-        assert rows == {
-            0: [("Remix", "Norman Nodge"), ("Add. Production", "Goran Simonoski"),
-                ("Vocals", "Uta Alder")],
-            1: [("Remix", "Jonsson/Alter"), ("Add. Production", "Goran Simonoski"),
-                ("Vocals", "Uta Alder")],
+        assert _row_credits(cheap_and_deep) == {
+            0: [("Remix", "Norman Nodge")],
+            1: [("Remix", "Jonsson/Alter")],
             2: [("Add. Production", "Morgan Packard"), ("Vocals", "Crissy Liu")],
         }
 
-    def test_formatted_lines(self, cheap_and_deep):
-        header, rows = dt_label._credit_plan(cheap_and_deep)
-        assert dt_label._format_credits(rows[0]) == (
-            "Remix: Norman Nodge \u00b7 Vocals: Uta Alder "
-            "\u00b7 Add. Production: Goran Simonoski")
+    def test_formatted_line(self, cheap_and_deep):
+        assert dt_label._format_credits(_row_credits(cheap_and_deep)[2]) == (
+            "Vocals: Crissy Liu \u00b7 Add. Production: Morgan Packard")
 
-    def test_release_artist_credit_is_dropped(self, cheap_and_deep):
-        """"Producer: Cheap And Deep" — the artist producing their own record —
-        is on most releases and says nothing."""
-        header, rows = dt_label._credit_plan(cheap_and_deep)
-        names = {n for _, n in header} | {n for r in rows.values() for _, n in r}
-        assert "Cheap And Deep" not in names
+    def test_release_credits_never_print(self, cheap_and_deep):
+        """Only what Discogs lists under the track.  r3854655 has release
+        credits both unscoped (Producer: Jay Ahern, Lacquer Cut By) and scoped
+        to "A1, B1" (Vocals: Uta Alder) — none of them belong on a row."""
+        names = {n for row in _row_credits(cheap_and_deep).values() for _, n in row}
+        assert names.isdisjoint({"Jay Ahern", "Uta Alder", "Goran Simonoski", "MJR",
+                                 "Maike Verloh", "Cheap And Deep"})
 
-    def test_pressing_and_packaging_roles_not_printed(self, cheap_and_deep):
-        header, rows = dt_label._credit_plan(cheap_and_deep)
-        names = {n for _, n in header} | {n for r in rows.values() for _, n in r}
-        assert "MJR" not in names and "Maike Verloh" not in names
+    def test_daze_release_credit_does_not_print(self):
+        """r6628547: the only credit is release-level — Daze's real name as
+        "Producer [Uncredited]".  It used to print under the release title."""
+        data = _plain_release(3, title="Neuromance EP",
+                              artists=[{"name": "Daze (20)", "id": 3238367}])
+        data["extraartists"] = [
+            {"name": "Brenton Smith", "role": "Producer [Uncredited], Arranged By [Uncredited]",
+             "tracks": "", "id": 1}]
+        assert all(r == [] for r in _row_credits(make_release(data)).values())
 
-    def test_credit_on_every_track_is_hoisted_to_header(self):
-        """One remixer across a whole EP prints once, not on every row."""
+    def test_same_credit_on_every_track_prints_on_each_row(self):
+        """No hoisting into the header: credits only ever print under tracks."""
         data = _plain_release(3)
         for t in data["tracklist"]:
             t["extraartists"] = [{"name": "Solo Remixer", "role": "Remix", "id": 5}]
-        header, rows = dt_label._credit_plan(make_release(data))
-        assert header == [("Remix", "Solo Remixer")]
-        assert all(r == [] for r in rows.values())
+        assert _row_credits(make_release(data)) == {
+            i: [("Remix", "Solo Remixer")] for i in range(3)}
 
-    def test_credit_on_some_tracks_stays_on_rows(self):
-        data = _plain_release(3)
-        data["tracklist"][0]["extraartists"] = [{"name": "R", "role": "Remix", "id": 5}]
-        header, rows = dt_label._credit_plan(make_release(data))
-        assert header == []
-        assert rows[0] == [("Remix", "R")] and rows[1] == rows[2] == []
+    def test_pressing_and_packaging_roles_not_printed(self):
+        data = _plain_release(1)
+        data["tracklist"][0]["extraartists"] = [
+            {"name": "MJR", "role": "Lacquer Cut By", "id": 1},
+            {"name": "Designer", "role": "Artwork, Design", "id": 2},
+            {"name": "R", "role": "Remix", "id": 3}]
+        assert _row_credits(make_release(data))[0] == [("Remix", "R")]
 
     def test_track_artist_credit_is_dropped(self):
         """On a compilation, "Producer: <that track's artist>" is noise too."""
@@ -1452,68 +1457,48 @@ class TestCreditPlan:
         data["tracklist"][0]["extraartists"] = [
             {"name": "Guest", "role": "Producer", "id": 42},
             {"name": "Other", "role": "Remix", "id": 43}]
-        header, rows = dt_label._credit_plan(make_release(data))
-        assert rows[0] == [("Remix", "Other")]
+        assert _row_credits(make_release(data))[0] == [("Remix", "Other")]
 
     def test_remixer_already_in_title_is_not_repeated(self):
         """74% of Remix credits in the collection were already in the title."""
         data = _plain_release(2)
         data["tracklist"][0]["title"] = "Phunk (Mark Broom Rmx)"
         data["tracklist"][0]["extraartists"] = [{"name": "Mark Broom", "role": "Remix", "id": 9}]
-        assert dt_label._credit_plan(make_release(data))[1][0] == []
+        assert _row_credits(make_release(data))[0] == []
 
     def test_title_match_is_whole_word(self):
         data = _plain_release(2)
         data["tracklist"][0]["title"] = "Regisland"
         data["tracklist"][0]["extraartists"] = [{"name": "Regis", "role": "Remix", "id": 9}]
-        assert dt_label._credit_plan(make_release(data))[1][0] == [("Remix", "Regis")]
+        assert _row_credits(make_release(data))[0] == [("Remix", "Regis")]
 
     def test_self_remix_is_kept(self):
         """An artist remixing their own track is what tells two versions apart,
-        so version credits survive the own-artist filter (23 such credits in
-        the collection were being dropped)."""
+        so version credits survive the own-artist filter."""
         data = _plain_release(2)
         data["tracklist"][0]["extraartists"] = [
             {"name": "Cheap And Deep Productions", "anv": "Cheap And Deep",
              "role": "Remix", "id": 1563065}]
-        assert dt_label._credit_plan(make_release(data))[1][0] == [
-            ("Remix", "Cheap And Deep")]
+        assert _row_credits(make_release(data))[0] == [("Remix", "Cheap And Deep")]
 
     def test_self_producer_is_still_dropped(self):
         data = _plain_release(2)
         data["tracklist"][0]["extraartists"] = [
             {"name": "Cheap And Deep", "role": "Producer", "id": 1563065}]
-        assert dt_label._credit_plan(make_release(data))[1][0] == []
-
-    def test_header_credit_named_in_release_title_is_dropped(self):
-        data = _plain_release(3, title="Solo Remixer Remixes")
-        data["extraartists"] = [{"name": "Solo Remixer", "role": "Remix", "id": 5}]
-        header, rows = dt_label._credit_plan(make_release(data))
-        assert header == [] and all(r == [] for r in rows.values())
-
-    def test_placement_decided_before_title_filter(self):
-        """A release-wide credit stays in the header even when one track's
-        title mentions it, instead of scattering onto every other row."""
-        data = _plain_release(3)
-        data["tracklist"][1]["title"] = "Track 2 (Solo Remixer Remix)"
-        data["extraartists"] = [{"name": "Solo Remixer", "role": "Remix", "id": 5}]
-        header, rows = dt_label._credit_plan(make_release(data))
-        assert header == [("Remix", "Solo Remixer")]
-        assert all(r == [] for r in rows.values())
+        assert _row_credits(make_release(data))[0] == []
 
     def test_disambiguation_suffix_stripped_from_credit_names(self):
         data = _plain_release(2)
         data["tracklist"][0]["extraartists"] = [{"name": "Lucy (12)", "role": "Remix", "id": 9}]
-        assert dt_label._credit_plan(make_release(data))[1][0] == [("Remix", "Lucy")]
+        assert _row_credits(make_release(data))[0] == [("Remix", "Lucy")]
 
     def test_no_credits(self):
-        header, rows = dt_label._credit_plan(make_release(_plain_release(2)))
-        assert header == [] and rows == {0: [], 1: []}
+        assert _row_credits(make_release(_plain_release(2))) == {0: [], 1: []}
 
-    def test_stub_release_yields_nothing(self):
-        """The suite renders MagicMock releases everywhere; they must not crash."""
-        assert dt_label._credit_plan(_fake_render_release()) == ([], {})
-        assert dt_label._credit_plan(_height_release()) == ([], {})
+    def test_stub_tracks_yield_nothing(self):
+        """The suite renders MagicMock tracks everywhere; they must not crash."""
+        for _side, _idx, track in _make_render_tracks([("A", 2)]):
+            assert dt_label._track_credits(_fake_render_release(), track) == []
 
 
 class TestWrapCredits:
@@ -1590,19 +1575,11 @@ class TestCreditLayout:
         base = _probe(make_release(_plain_release(2)), self.DIE)
         assert _probe(self._with_row_credit(many), self.DIE) - base == _CREDIT_LINE_H
 
-    def test_header_credit_line_height(self):
+    def test_release_credits_add_no_height(self):
+        """Release credits used to add a header line; they no longer print."""
         data = _plain_release(2)
         data["extraartists"] = [{"name": "Whole Release", "role": "Remix", "id": 7}]
-        base = _probe(make_release(_plain_release(2)))
-        assert _probe(make_release(data)) - base == _HDR_CREDIT_LINE_H
-
-    def test_continuation_header_omits_header_credits(self):
-        data = _plain_release(2)
-        data["extraartists"] = [{"name": "Whole Release", "role": "Remix", "id": 7}]
-        rel, plain = make_release(data), make_release(_plain_release(2))
-        cont = lambda r: render_label(r, _all_tracks(r), self.CONT, False,
-                                      continuation=True, probe=True)
-        assert cont(rel) == cont(plain)
+        assert _probe(make_release(data)) == _probe(make_release(_plain_release(2)))
 
     def test_credits_are_drawn(self, cheap_and_deep):
         """Ink in the title column of the track rows, not just a taller canvas."""
@@ -1643,7 +1620,7 @@ class TestCreditLayout:
 
         # The widths render_label works with.
         scratch = ImageDraw.Draw(_PILImage.new("RGB", (1, 1)))
-        groups = dt_label._credit_groups(dt_label._credit_plan(rel)[1][1])
+        groups = dt_label._credit_groups(dt_label._track_credits(rel, rel.getTrack(1)))
         font = dt_label._font_for("regular", dt_label._CREDIT_FONT_PX,
                                   dt_label._CREDIT_SEP.join(groups))
         pos_w = dt_label._position_column_width(
@@ -1851,3 +1828,40 @@ class TestSplitMode:
         assert [s for s, _ in dt_label._select_discs(labels, [1])] == ["disc1", "disc1_cont1"]
         assert [s for s, _ in dt_label._select_discs(labels, [2])] == ["disc2"]
         assert [s for s, _ in dt_label._select_discs(labels, [10])] == ["disc10"]
+
+
+class TestEmptyLabelList:
+    """r3060397 lists no label.  It used to crash dt_label; then it would have
+    printed a bare "  []" where the label and catalogue number go."""
+
+    PROFILE = LABEL_PROFILES["dk22243"]
+
+    def _meta_ink(self, labels):
+        data = _plain_release(2, labels=labels)
+        rel = make_release(data)
+        tracks = _all_tracks(rel)
+        img = render_label(rel, tracks, self.PROFILE, False,
+                           height_px=_layout_height(rel, tracks, self.PROFILE, False),
+                           notes_lines=self.PROFILE["notes_lines"])
+        M = self.PROFILE["margin_px"]
+        # Left half of the "Label [catno] .... year country" line: title and
+        # artist are one line each here, so it sits below two 70 px steps and
+        # the divider.
+        y0 = M + 70 + 70 + 10 + 18
+        return _ink(img.crop((M, y0, self.PROFILE["width_px"] // 2, y0 + 40)))
+
+    def test_renders_with_no_label(self):
+        assert self._meta_ink([]) == 0, "something was drawn where the label goes"
+
+    def test_label_line_is_where_the_test_looks(self):
+        """Guard for the test above: with a label present that band has ink."""
+        assert self._meta_ink([{"name": "Some Label", "catno": "SL001"}]) > 500
+
+    def test_catno_without_label(self):
+        assert self._meta_ink([{"name": "", "catno": "SL001"}]) > 100
+
+    def test_full_pipeline_does_not_crash(self):
+        rel = make_release(_plain_release(2, labels=[]))
+        labels = dt_label.render_labels_for_release(
+            rel, argparse.Namespace(split=False), self.PROFILE)
+        assert len(labels) == 1

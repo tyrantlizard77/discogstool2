@@ -331,7 +331,7 @@ There is now one implementation. `render_label(..., probe=True)` runs the real h
 Two invariants make the probe valid, both pinned by tests:
 
 - Content layout never reads `H` — only the bottom-anchored QR and the die-cut ruled-line fill do, and neither runs in probe mode. That is why a probe can use a 1 px scratch canvas: Pillow clips the draws and the arithmetic is unchanged.
-- `_resolve_track_text()` is the single source of truth for a row's title text, and `_credit_plan()` for its credit lines. Anything affecting row content belongs in one of those, so probe and render can't diverge. (`_credit_plan()` runs inside `render_label`, which *is* the probe, so the two always see the same credits.)
+- `_resolve_track_text()` is the single source of truth for a row's title text, and `_track_credits()` for its credit lines. Anything affecting row content belongs in one of those, so probe and render can't diverge. (`_track_credits()` runs inside `render_label`, which *is* the probe, so the two always see the same credits.)
 
 `_position_column_width()` sizes the position column to the widest entry present rather than assuming a fixed 90 px. Most releases use short labels ("A1"), but continuous DJ mixes use timestamps ("14:03", ~97 px) and some sides are double letters ("AA1") — those used to overprint the title (r34333258). It is computed inside `render_label` so probe and render agree: the column feeds `TITLE_MAX_W`, which decides wrapping, which decides height.
 
@@ -345,18 +345,19 @@ Artist and release title both **wrap** (up to `_HEADER_MAX_LINES` = 3) rather th
 
 ### Credits
 
-Discogs keeps remixers and other credits in `extraartists`, not the title, and in two places: on each track, and on the release with a `tracks` field scoping them (`"A1, B1"`). `DiscogsTrack.getCredits()` merges both. `DiscogsRelease.resolveTrackScope()` turns `tracks` into indices, handling every shape seen in the collection: positions, `&`, `X to Y` ranges, bare sides (`"B"`), sides as range endpoints (`"A to B2"`), `"All …"` and `"All … except …"`. Unresolvable tokens (`"C3 outro"`) are **ignored rather than guessed**, so a credit is never attached to a track it can't be tied to.
+Labels print **only the credits Discogs lists under each track** — the track's own `extraartists`, via `DiscogsTrack.getTrackCredits()`. Release credits are never printed, not even ones scoped to particular tracks. An earlier version also printed release credits, with any credit covering every track hoisted into a line under the release title, but on real labels that line was mostly a producer's alias or real name ("Producer [Uncredited]: Brenton Smith" on Daze, r6628547). Credits now only ever appear under a track. A credit shared by every track repeats on each row (3 releases in the collection).
 
-What prints is decided in `dt_label`, and every rule came from a tally of roles across the 1000-release cache:
+The data layer still resolves release credits for any other caller. `DiscogsTrack.getCredits()` merges track credits with release credits whose `tracks` field covers the track, and `DiscogsRelease.resolveTrackScope()` turns `tracks` into indices. It handles positions, `&`, `X to Y` ranges, bare sides (`"B"`), sides as range endpoints (`"A to B2"`), `"All …"` and `"All … except …"`, and ignores unresolvable tokens (`"C3 outro"`) rather than guessing.
 
-- **Roles** — `_CREDIT_RULES`: Remix, Edit, DJ Mix, Featuring, Vocals, Voice, Producer, Co-producer, Add. Production. Remix is by far the most common track credit. Excluded: pressing and packaging roles (Lacquer Cut By, Mastered By, Artwork — the bulk of release-level credits), songwriting, "Mixed By" (a mix engineer, not a DJ mix), backing vocals, and `Edited By [Digital Editing]` (mastering, not a re-edit). Qualifiers are matched by rule, e.g. `Producer [Additional…]` → "Add. Production".
-- **Placement** — a credit on *every* track prints once under the release title; the rest go under their track title. That one rule covers unscoped release credits, "All" scopes, and a single remixer across an EP. It is decided from the whole release, so continuation and per-disc labels agree.
-- **Already in the title → skipped.** 74% of Remix credits repeat the title ("Peels A Tangerine (Regis Remix)" + "Remix: Regis"). Matching is word-bounded and case-insensitive. Placement is decided *before* this filter, so a release-wide credit doesn't scatter onto rows because one title mentions it.
-- **Own artist → skipped**, except version credits (`_VERSION_LABELS`: Remix, Edit, DJ Mix). "Producer: <the artist>" is noise, but an artist remixing their own track is what tells two versions apart (23 in the collection).
+`_track_credits(release, track)` decides what prints, and every rule came from a tally of roles across the 1000-release cache:
+
+- **Roles** — `_CREDIT_RULES`: Remix, Edit, DJ Mix, Featuring, Vocals, Voice, Producer, Co-producer, Add. Production. Remix is by far the most common track credit. Excluded: pressing and packaging roles (Lacquer Cut By, Mastered By, Artwork), songwriting, "Mixed By" (a mix engineer, not a DJ mix), backing vocals, and `Edited By [Digital Editing]` (mastering, not a re-edit). Qualifiers are matched by rule, e.g. `Producer [Additional…]` → "Add. Production".
+- **Already in the title → skipped.** 74% of Remix credits repeat the title ("Peels A Tangerine (Regis Remix)" + "Remix: Regis"). Matching is word-bounded and case-insensitive.
+- **Own artist → skipped**, except version credits (`_VERSION_LABELS`: Remix, Edit, DJ Mix). "Producer: <the artist>" is noise, but an artist remixing their own track is what tells two versions apart.
 
 Layout: `_credit_groups()` groups by role in `_CREDIT_ORDER`, and `wrap_credits()` breaks **between** groups, never inside one. The first render split "Add. Production:" from its name. Continuous labels get up to 2 lines, die-cut 1, with an ellipsis when groups are left over. Each line adds `_CREDIT_LINE_H` to the row, and the probe measures that like everything else.
 
-`tests/conftest.py` has r3854655 as a shared fixture (`cheap_and_deep`), captured verbatim from the API: two remixes with identical titles that only their credits tell apart. `make_release(data)` builds a real `DiscogsRelease` without the network, so credit tests exercise the genuine accessors rather than mocks.
+`tests/conftest.py` has r3854655 as a shared fixture (`cheap_and_deep`), captured verbatim from the API: two remixes with identical titles that only their track credits tell apart, plus release credits (scoped and unscoped) that must not print. `make_release(data)` builds a real `DiscogsRelease` without the network, so credit tests exercise the genuine accessors rather than mocks.
 
 ### Font fallback
 
@@ -398,6 +399,7 @@ subtly wrong rather than obviously broken.
 - **Beatport client ID**: scraped from a docs page JS bundle via regex. If Beatport updates their page structure this will break; run `python3 beatport.py --setup` to force a re-auth which will re-scrape it.
 - **WAV regions**: Reaper writes track boundaries into the WAV `smpl` chunk as loop points. If region count doesn't match the Discogs tracklist, `dt_process` falls back to consecutive cue positions with a dynamic minimum-duration heuristic.
 - **ID3 version**: writes ID3v2.3 (encoding=3, UTF-8), not v2.4.
+- **Empty `labels`/`artists` lists**: Discogs returns `labels: []` for some releases (r3060397, a self-released CD). `compileListData()` returns `""` for an empty or missing list; it used to raise `IndexError` and crash `dt_label`. The label line then shows only what exists. The audio comment tag becomes `" [] Discogs: N"`, which is ugly but still matches `comment_regex`, so it is left alone because that format is load-bearing for re-reads.
 - **Discogs consumer keys**: the OAuth consumer key/secret are hardcoded public demo credentials. They are not secret.
 - **dt_server's worker thread starts in `main()`, not at import**: importing dt_server (as the test suite does) must not spawn a thread that races the caller for queued jobs or launches real dt_label subprocesses. Tests call `_execute_job` directly.
 - **Flask sorts JSON keys**, so `/progress` returns `stages` alphabetically rather than in pipeline order. The popup renders in DOM order and ignores this; the canonical order is also returned as a `stages` array.
