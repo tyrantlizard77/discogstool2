@@ -554,6 +554,9 @@ def _fake_render_release() -> MagicMock:
     r.getLabel.return_value   = "Test Label"
     r.getCatno.return_value   = "TL001"
     r.getYear.return_value    = "2020"
+    # The header draws getLabelYear(); unset, it returned a MagicMock that the
+    # old f-string rendered onto every test label as "<MagicMock ...>" text.
+    r.getLabelYear.return_value = "2020"
     r.getCountry.return_value = "UK"
     r.getId.return_value      = 12345
     r.getGenre.return_value   = "Electronic"
@@ -1865,3 +1868,43 @@ class TestEmptyLabelList:
         labels = dt_label.render_labels_for_release(
             rel, argparse.Namespace(split=False), self.PROFILE)
         assert len(labels) == 1
+
+
+class TestMissingFieldsOnLabel:
+    """A field Discogs has no data for prints as nothing — never "None"."""
+
+    PROFILE = LABEL_PROFILES["dk22243"]
+
+    def _render(self, **overrides):
+        rel = make_release(_plain_release(2, **overrides))
+        tracks = _all_tracks(rel)
+        return render_label(rel, tracks, self.PROFILE, False,
+                            height_px=_layout_height(rel, tracks, self.PROFILE, False),
+                            notes_lines=self.PROFILE["notes_lines"])
+
+    def _year_country_band(self, img):
+        """Right half of the "label [catno] ... year  country" line."""
+        M = self.PROFILE["margin_px"]
+        y0 = M + 70 + 70 + 10 + 18
+        return img.crop((self.PROFILE["width_px"] // 2, y0,
+                         self.PROFILE["width_px"] - M + 2, y0 + 40)).convert("L")
+
+    def test_null_country_draws_the_same_as_no_country(self):
+        """r11188975 and nine others printed "2017  None"."""
+        null  = self._render(country=None).tobytes()
+        empty = self._render(country="").tobytes()
+        assert null == empty
+
+    def test_year_stays_flush_right_without_country(self):
+        """A trailing "  " used to pull the right-aligned year in from the margin."""
+        band = self._year_country_band(self._render(country=None, year=2017))
+        cols = [x for x in range(band.width)
+                if min(band.getpixel((x, y)) for y in range(band.height)) < 128]
+        assert band.width - 1 - cols[-1] <= 6
+
+    def test_unknown_year_and_country_draw_nothing(self):
+        """r35239432: year 0 and null country — the right side stays blank."""
+        assert _ink(self._year_country_band(self._render(country=None, year=0))) == 0
+
+    def test_band_is_where_the_test_looks(self):
+        assert _ink(self._year_country_band(self._render(country="US", year=2017))) > 300

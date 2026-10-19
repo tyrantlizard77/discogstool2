@@ -197,6 +197,16 @@ def _normalize_artwork(imgdata: bytes) -> bytes:
     return out.getvalue()
 
 
+def _text(value: object) -> str:
+    """A Discogs field as display text, with "no information" as "".
+
+    The API sends null for fields it has nothing for — `country` is null on
+    about 1% of releases — and a key holding null defeats `.get(key, "")`,
+    so the old accessors handed None to f-strings and labels read "None".
+    """
+    return "" if value is None else str(value).strip()
+
+
 def split_roles(role: str) -> list[str]:
     """Split a Discogs role string into its individual roles.
 
@@ -223,12 +233,12 @@ def split_roles(role: str) -> list[str]:
 
 def _credits_from(entry: DiscogsExtraArtistRef) -> list[DiscogsCredit]:
     """Expand one extraartists entry into one DiscogsCredit per role."""
-    name = (entry.get("anv") or entry.get("name") or "").strip()
+    name = _text(entry.get("anv")) or _text(entry.get("name"))
     if not name:
         return []
     artist_id = entry.get("id") or 0
     return [{"role": role, "name": name, "artist_id": artist_id}
-            for role in split_roles(entry.get("role", ""))]
+            for role in split_roles(_text(entry.get("role")))]
 
 
 # Separators and range syntax seen in the `tracks` field of release credits:
@@ -361,8 +371,15 @@ class DiscogsRelease:
         return str(year) if year else None
 
     def getYear(self) -> str:
-        """Return the pressing year as a plain string (safe for file tagging)."""
-        return str(self.data.get("year", ""))
+        """Return the pressing year as a plain string (safe for file tagging).
+
+        Blank when Discogs has no year: null, missing, or 0 — its placeholder
+        for "unknown".  "0" used to come back, which tagged files with year
+        0000 and made Beatport's year gate (`if year and bp_year`) reject
+        every candidate, since "0" is truthy and ~2000 years off.
+        """
+        year = self.data.get("year")
+        return _text(year) if year else ""
 
     def getLabelYear(self) -> str:
         """Return the year string formatted for sleeve labels.
@@ -387,22 +404,17 @@ class DiscogsRelease:
         # Discogs can return an empty list — r3060397 has no labels at all —
         # and indexing items[0] used to crash getLabel()/getCatno() outright.
         items = cast(list[dict[str, str]], self.data.get(listname) or [])  # type: ignore[misc]
-        if not items:
-            return ""
-        s: str = ""
-        for key in keys:
-            s = items[0].get(key, "")
-            if s:
-                break
-
-        for i in items[1:]:
-            x: str = ""
+        # Each item contributes its first non-blank key; items with nothing
+        # (null or empty, e.g. a second label with no catno) are skipped
+        # rather than joined as "None" or a dangling " / ".
+        values = []
+        for item in items:
             for key in keys:
-                x = i.get(key, "")
-                if x:
+                value = _text(item.get(key))
+                if value:
+                    values.append(value)
                     break
-            s = "%s / %s" % (s, x)
-        return s.strip()
+        return " / ".join(values)
 
     def getArtist(self) -> str:
         return self.compileListData("artists", ["anv", "name"])
@@ -433,7 +445,7 @@ class DiscogsRelease:
         if not spec:
             return None
 
-        positions = [t.get("position", "").strip().upper()
+        positions = [_text(t.get("position")).upper()
                      for t in self.data["tracklist"]]
         everything = set(range(len(positions)))
 
@@ -490,16 +502,16 @@ class DiscogsRelease:
         return self.compileListData("labels", ["catno"])
 
     def getCountry(self) -> str:
-        return self.data.get("country", "")
+        return _text(self.data.get("country"))
 
     def getGenre(self) -> str:
-        genres: list[str] = self.data.get("styles", [])
-        if not genres:
-            genres = self.data.get("genres", [])
-        return ", ".join(genres)
+        genres = [_text(g) for g in self.data.get("styles") or []]
+        if not any(genres):
+            genres = [_text(g) for g in self.data.get("genres") or []]
+        return ", ".join(g for g in genres if g)
 
     def getTitle(self, synthesise: bool = True) -> str:
-        rt = self.data["title"]
+        rt = _text(self.data.get("title"))
         if not rt.startswith("Untitled") or not synthesise:
             return rt
 
@@ -595,20 +607,17 @@ class DiscogsTrack:
         if not artists:
             return self.release.getArtist()
 
-        artiststr = artists[0].get("name", "")
-        for artist in artists[1:]:
-            artiststr = "%s / %s" % (artiststr, artist.get("name", ""))
-        return artiststr.strip()
+        return " / ".join(n for n in (_text(a.get("name")) for a in artists) if n)
 
     def getTitle(self, synthesise: bool = True) -> str:
-        t = self.tdata["title"]
+        t = _text(self.tdata.get("title"))
         if not t.startswith("Untitled") or not synthesise:
             return t
 
-        return "%s %s" % (self.release.getTitle(), self.tdata["position"])
+        return "%s %s" % (self.release.getTitle(), self.getPosition())
 
     def getPosition(self) -> str:
-        return self.tdata["position"]
+        return _text(self.tdata.get("position"))
 
     def getArtistIds(self) -> set[int]:
         """Discogs ids of this track's performing artists.
@@ -663,7 +672,7 @@ class DiscogsTrack:
         return unique
 
     def getDuration(self) -> str:
-        return self.tdata.get("duration", "").strip()
+        return _text(self.tdata.get("duration"))
 
     def getRelease(self) -> DiscogsRelease:
         return self.release

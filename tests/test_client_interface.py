@@ -727,6 +727,88 @@ class TestEmptyLists:
         assert rel.getTitle() == ""
 
 
+class TestMissingFields:
+    """Discogs sends null for fields it has nothing for; they must read as "".
+
+    `country` is null on ~1% of releases and used to print as "None" on the
+    label.  `year` uses 0 for "unknown" and used to come back as "0".
+    """
+
+    def test_null_country(self):
+        assert make_release(_make_release_data(country=None)).getCountry() == ""
+
+    def test_missing_country(self):
+        data = _make_release_data(); del data["country"]
+        assert make_release(data).getCountry() == ""
+
+    @pytest.mark.parametrize("year", [0, None, "0"[:0]])
+    def test_unknown_year_is_blank(self, year):
+        assert make_release(_make_release_data(year=year)).getYear() == ""
+
+    def test_missing_year(self):
+        data = _make_release_data(); del data["year"]
+        assert make_release(data).getYear() == ""
+
+    def test_real_year_unchanged(self):
+        assert make_release(_make_release_data(year=1998)).getYear() == "1998"
+
+    def test_null_genre_lists(self):
+        rel = make_release(_make_release_data(styles=None, genres=None))
+        assert rel.getGenre() == ""
+
+    def test_null_entries_inside_genre_list(self):
+        rel = make_release(_make_release_data(styles=["Techno", None, ""]))
+        assert rel.getGenre() == "Techno"
+
+    def test_styles_all_blank_falls_back_to_genres(self):
+        rel = make_release(_make_release_data(styles=[None], genres=["Electronic"]))
+        assert rel.getGenre() == "Electronic"
+
+    def test_null_title(self):
+        assert make_release(_make_release_data(title=None)).getTitle() == ""
+
+    def test_null_catno_skipped_not_printed(self):
+        rel = make_release(_make_release_data(labels=[
+            {"name": "A", "catno": None}, {"name": "B", "catno": "X1"}]))
+        assert rel.getCatno() == "X1"
+        assert rel.getLabel() == "A / B"
+
+    def test_blank_entry_leaves_no_dangling_separator(self):
+        """Characterization: this used to give "A /"."""
+        rel = make_release(_make_release_data(labels=[
+            {"name": "A", "catno": "X1"}, {"name": "B", "catno": ""}]))
+        assert rel.getCatno() == "X1"
+
+    def test_null_anv_falls_back_to_name(self):
+        rel = make_release(_make_release_data(artists=[{"name": "Real", "anv": None}]))
+        assert rel.getArtist() == "Real"
+
+    def test_null_track_fields(self):
+        data = _make_release_data(tracklist=[
+            {"title": None, "position": None, "type_": "track", "duration": None,
+             "artists": [{"name": None}, {"name": "B"}]}])
+        t = make_release(data).getTrack(0)
+        assert (t.getTitle(), t.getPosition(), t.getDuration(), t.getArtist()) == ("", "", "", "B")
+
+    def test_null_role_and_position_in_credits(self):
+        data = _make_release_data(extraartists=[{"name": "X", "role": None, "tracks": "A1"}])
+        data["tracklist"][0]["extraartists"] = [{"name": "Y", "role": None}]
+        data["tracklist"][1]["position"] = None
+        rel = make_release(data)
+        assert rel.getTrack(0).getCredits() == []      # no role → no credit, no crash
+        assert rel.resolveTrackScope("A1") == {0}
+
+    def test_none_never_appears_as_text(self):
+        """Every accessor, on a release that is null wherever Discogs allows."""
+        data = _make_release_data(country=None, year=None, styles=None, genres=None,
+                                  labels=[{"name": None, "catno": None}],
+                                  artists=[{"name": "A", "anv": None}])
+        rel = make_release(data)
+        for value in (rel.getCountry(), rel.getYear(), rel.getGenre(), rel.getLabel(),
+                      rel.getCatno(), rel.getArtist(), rel.getLabelYear(), rel.getTitle()):
+            assert "None" not in value
+
+
 class TestArtistIds:
     def test_release_artist_ids(self, cheap_and_deep):
         assert cheap_and_deep.getArtistIds() == {1563065}

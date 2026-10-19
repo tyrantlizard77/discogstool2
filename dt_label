@@ -841,7 +841,12 @@ def render_label(release, tracks_with_sides, profile,
         label_meta = "  ".join(part for part in
                                (release.getLabel(), f"[{catno}]" if catno else "")
                                if part)
-        year_cc    = f"{release.getLabelYear()}  {release.getCountry()}"
+        # Same for year and country: Discogs leaves country null on ~1% of
+        # releases, and a trailing "  " would pull the right-aligned year in
+        # from the margin.
+        year_cc    = "  ".join(part for part in
+                               (release.getLabelYear(), release.getCountry())
+                               if part)
         ycc_w = draw.textlength(year_cc, font=f_meta)
         label_meta = truncate_text(draw, label_meta, f_meta, CW - ycc_w - 24)
         draw.text((M, y), label_meta, font=f_meta, fill="black")
@@ -880,7 +885,7 @@ def render_label(release, tracks_with_sides, profile,
             hl(y, color="#AAAAAA", weight=1)
             y += 10
 
-        pos = track["position"]
+        pos = track["position"] or ""
 
         # Row text, including any duration suffix.  Shared with the height
         # calculation via _resolve_track_text so the two can never disagree

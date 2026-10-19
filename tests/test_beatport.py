@@ -943,6 +943,29 @@ class TestCatnoMatcherYearPenalty:
         bid, score = self._run_catno_matcher("2022", hard_skip_year)
         assert bid is None
 
+    def test_unknown_discogs_year_skips_the_gate(self):
+        """Discogs year 0 means "unknown".  getYear() used to return "0",
+        which is truthy, so the gate compared year 0 against ~2022 and
+        hard-rejected every candidate — no BPMs for any such release.
+        Uses a real DiscogsRelease so the accessor and the gate are tested
+        together."""
+        from beatport import CatnoMatcher
+        from conftest import make_release
+        rel = make_release({
+            "title": "Test EP", "year": 0, "country": None,
+            "artists": [{"name": "Artist", "id": 1}],
+            "labels": [{"name": "Label", "catno": "TEST001"}],
+            "tracklist": [{"position": "A1", "type_": "track", "title": "Test Track",
+                           "duration": ""}],
+        })
+        client = MagicMock()
+        client.search_releases.return_value = [{
+            "id": 42, "catalog_number": "TEST001", "name": "Test EP",
+            "publish_date": "2022-01-01"}]
+        bid, score = CatnoMatcher().find_release(rel, client)
+        assert bid == "42"
+        assert score > 0.95      # no year, so no year penalty either
+
     def test_exact_hard_max_still_matches(self):
         # A difference of exactly YEAR_HARD_MAX should apply penalty but not skip
         boundary_year = str(2022 + YEAR_HARD_MAX)
