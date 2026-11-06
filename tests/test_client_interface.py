@@ -809,6 +809,19 @@ class TestMissingFields:
             assert "None" not in value
 
 
+class TestGetFormats:
+    def test_names_in_order(self):
+        rel = make_release(_make_release_data(formats=[
+            {"name": "Box Set", "qty": "1"}, {"name": "Vinyl", "qty": "3"},
+            {"name": "CD", "qty": "1"}]))
+        assert rel.getFormats() == ["Box Set", "Vinyl", "CD"]
+
+    def test_missing_or_null(self):
+        assert make_release(_make_release_data()).getFormats() == []
+        assert make_release(_make_release_data(formats=None)).getFormats() == []
+        assert make_release(_make_release_data(formats=[{"name": None}])).getFormats() == []
+
+
 class TestArtistIds:
     def test_release_artist_ids(self, cheap_and_deep):
         assert cheap_and_deep.getArtistIds() == {1563065}

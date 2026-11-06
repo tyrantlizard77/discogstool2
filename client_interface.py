@@ -504,6 +504,15 @@ class DiscogsRelease:
     def getCountry(self) -> str:
         return _text(self.data.get("country"))
 
+    def getFormats(self) -> list[str]:
+        """The release's format names in Discogs order, e.g. ["Box Set", "Vinyl", "CD"].
+
+        One entry per format line, not per item: 3×12" plus a CD is
+        ["Vinyl", "CD"], with the counts in each format's `qty`.
+        """
+        names = (_text(f.get("name")) for f in self.data.get("formats") or [])
+        return [n for n in names if n]
+
     def getGenre(self) -> str:
         genres = [_text(g) for g in self.data.get("styles") or []]
         if not any(genres):

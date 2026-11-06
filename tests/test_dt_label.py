@@ -1908,3 +1908,121 @@ class TestMissingFieldsOnLabel:
 
     def test_band_is_where_the_test_looks(self):
         assert _ink(self._year_country_band(self._render(country="US", year=2017))) > 300
+
+
+def _vinyl_cd_release(vinyl, cd, formats=("Vinyl", "CD")):
+    """A real release with vinyl positions then CD positions (CD listed last,
+    as on every vinyl+CD release in the collection)."""
+    data = _plain_release(0)
+    data["formats"] = [{"name": f, "qty": "1"} for f in formats]
+    data["tracklist"] = (
+        [{"position": p, "type_": "track", "duration": "", "title": f"Vinyl {p}"} for p in vinyl]
+        + [{"position": p, "type_": "track", "duration": "", "title": f"CD {p}"} for p in cd])
+    return make_release(data)
+
+
+def _kept_positions(release):
+    return [t["position"] for _, _, t in flatten_discs(group_tracks_by_disc(release))]
+
+
+class TestCdTracksLeftOff:
+    """Labels never show the CD in a vinyl+CD set.
+
+    Discogs doesn't say which medium a track is on.  These are the three
+    position styles the collection's five vinyl+CD releases use.
+    """
+
+    VINYL = ["A1", "A2", "B1", "B2", "C1", "C2"]
+
+    @pytest.mark.parametrize("cd", [
+        ["1", "2", "3"],                 # r38807421, r4846306
+        ["CD1", "CD2", "CD3"],           # r11216635
+        ["CD-1"],                        # r3761316
+        ["CD1-1", "CD1-2", "CD1-10"],    # r4678285
+    ])
+    def test_cd_position_styles_are_left_off(self, cd):
+        assert _kept_positions(_vinyl_cd_release(self.VINYL, cd)) == self.VINYL
+
+    def test_cd_prefix_used_to_land_on_disc_2(self):
+        """"CD1" read as side "CD", which side_to_disc() put with sides C/D."""
+        discs = group_tracks_by_disc(_vinyl_cd_release(self.VINYL, ["CD1", "CD2"]))
+        assert "CD" not in discs.get(2, {})
+
+    def test_global_indices_unchanged(self):
+        """Kept tracks keep their release index: find_bpms() keys on it."""
+        rel = _vinyl_cd_release(["A1", "B1"], ["1", "2"])
+        assert [i for _, i, _ in flatten_discs(group_tracks_by_disc(rel))] == [0, 1]
+
+    def test_cd_tracks_listed_first_are_still_left_off(self):
+        data = _plain_release(0)
+        data["formats"] = [{"name": "CD"}, {"name": "Vinyl"}]
+        data["tracklist"] = [{"position": p, "type_": "track", "duration": "", "title": p}
+                             for p in ("1", "2", "A1", "B1")]
+        rel = make_release(data)
+        assert [(i, t["position"]) for _, i, t in flatten_discs(group_tracks_by_disc(rel))] == [
+            (2, "A1"), (3, "B1")]
+
+    def test_vinyl_only_release_with_numeric_positions_untouched(self):
+        """Some vinyl entries number their tracks; with no CD format, nothing drops."""
+        rel = _vinyl_cd_release(["1", "2", "3"], [], formats=("Vinyl",))
+        assert _kept_positions(rel) == ["1", "2", "3"]
+
+    @pytest.mark.parametrize("formats", [("Vinyl",), ("CD",), ("Vinyl", "Cassette")])
+    def test_needs_both_vinyl_and_cd_formats(self, formats):
+        """A side-less track among lettered ones is only a CD track when the
+        release has a CD.  (The all-numeric cases above can't show this: the
+        no-vinyl-left guard would keep their tracks regardless.)"""
+        rel = _vinyl_cd_release(["A1", "B1"], ["1"], formats=formats)
+        assert set(_kept_positions(rel)) == {"A1", "B1", "1"}
+
+    def test_cd_only_release_untouched(self):
+        rel = _vinyl_cd_release([], ["1", "2", "3"], formats=("CD",))
+        assert _kept_positions(rel) == ["1", "2", "3"]
+
+    def test_vinyl_and_cd_with_no_cd_tracks_listed(self):
+        """r13593859: 2×12" + CD, but only the vinyl tracks are on Discogs."""
+        assert _kept_positions(_vinyl_cd_release(self.VINYL, [])) == self.VINYL
+
+    def test_nothing_dropped_if_no_vinyl_would_remain(self):
+        """Every position side-less: the rule can't tell vinyl from CD, so it
+        keeps everything rather than print an empty label."""
+        rel = _vinyl_cd_release(["1", "2"], ["3", "4"])
+        assert _kept_positions(rel) == ["1", "2", "3", "4"]
+
+    def test_stub_release_untouched(self):
+        assert dt_label._cd_track_indices(_fake_release(["1", "A1"])) == set()
+
+    def test_split_counts_vinyl_discs_only(self):
+        """3×12" + CD (r38807421): three labels, not a fourth for the CD."""
+        rel = _vinyl_cd_release(["A1", "B1", "C1", "D1", "E1", "F1"], ["1", "2", "3"])
+        labels = dt_label.render_labels_for_release(
+            rel, argparse.Namespace(split=True), LABEL_PROFILES["dk22243"])
+        assert [s for s, _ in labels] == ["disc1", "disc2", "disc3"]
+
+    def test_rendered_label_matches_the_vinyl_alone(self):
+        """Output check: the label is pixel-identical to one for a release
+        that never listed the CD."""
+        P = LABEL_PROFILES["dk22243"]
+        args = argparse.Namespace(split=False)
+        with_cd = dt_label.render_labels_for_release(
+            _vinyl_cd_release(self.VINYL, ["1", "2", "3", "4"]), args, P)
+        vinyl   = dt_label.render_labels_for_release(
+            _vinyl_cd_release(self.VINYL, []), args, P)
+        assert [img.tobytes() for _, img in with_cd] == [img.tobytes() for _, img in vinyl]
+
+    def test_dropping_is_announced(self, tmp_path, capsys):
+        rel = _vinyl_cd_release(self.VINYL, ["1", "2", "3"])
+        args = argparse.Namespace(split=False, preview=True, output=str(tmp_path),
+                                  no_bpm=True, discs=None, delay=0)
+        with patch.object(dt_label.client_interface, "DiscogsRelease", return_value=rel):
+            assert dt_label.process_release(rel.rid, args, LABEL_PROFILES["dk22243"],
+                                            None, None)
+        assert "Leaving off 3 CD track(s)" in capsys.readouterr().out
+
+    def test_no_announcement_when_nothing_dropped(self, tmp_path, capsys):
+        rel = _vinyl_cd_release(self.VINYL, [])
+        args = argparse.Namespace(split=False, preview=True, output=str(tmp_path),
+                                  no_bpm=True, discs=None, delay=0)
+        with patch.object(dt_label.client_interface, "DiscogsRelease", return_value=rel):
+            dt_label.process_release(rel.rid, args, LABEL_PROFILES["dk22243"], None, None)
+        assert "CD track" not in capsys.readouterr().out

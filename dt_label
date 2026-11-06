@@ -375,14 +375,48 @@ def side_to_disc(side):
     return (idx // 2) + 1
 
 
+def _cd_track_indices(release):
+    """Indices of the CD tracks on a vinyl+CD release, which labels leave off.
+
+    Discogs doesn't say which medium a track is on, so this goes by position.
+    On a release whose formats include both Vinyl and CD, a track is on the CD
+    if its position has no side letter ("1", "12") or starts with "CD"
+    ("CD1", "CD-1", "CD1-1").  That covers all five vinyl+CD releases with
+    listed CD tracks in a ~1,170-release collection.  Before this, numeric CD tracks joined disc 1
+    with A/B, and "CD1" read as side "CD", which side_to_disc() put on
+    disc 2 between sides C and D.
+
+    Nothing is dropped unless the release has both formats, so vinyl-only and
+    CD-only releases are untouched.  If the rule would leave no vinyl tracks,
+    nothing is dropped either: an empty label helps no one, and that would
+    mean the rule has misread the tracklist.  CD tracks written with vinyl
+    letters ("E1") can't be told apart and stay.
+    """
+    formats = release.getFormats()
+    if not isinstance(formats, list) or not {"Vinyl", "CD"} <= set(formats):
+        return set()
+    n = release.getTotalTracks()
+    cd = set()
+    for i in range(n):
+        side = get_side(release.getTrack(i)["position"])
+        if side == "" or side == "CD":
+            cd.add(i)
+    return cd if len(cd) < n else set()
+
+
 def group_tracks_by_disc(release):
     """Return {disc_num: {side_letter: [(global_idx, DiscogsTrack), …]}} preserving order.
 
     global_idx is the 0-based index into release.getTrack(i), which matches
-    the keys returned by BeatportMatcher.find_bpms().
+    the keys returned by BeatportMatcher.find_bpms().  CD tracks on a vinyl+CD
+    release are left out (see _cd_track_indices), so neither a normal label nor
+    a --split one prints them, and --split counts only the vinyl discs.
     """
     discs = {}
+    skip  = _cd_track_indices(release)
     for i in range(release.getTotalTracks()):
+        if i in skip:
+            continue
         track = release.getTrack(i)
         side  = get_side(track["position"])
         disc  = side_to_disc(side) if side else 1
@@ -1445,6 +1479,9 @@ def process_release(rid, args, profile, printer_url, model):
         emit("lookup", "error", message=str(e))
         return False
     print(f"  {release}")
+    cd_tracks = _cd_track_indices(release)
+    if cd_tracks:
+        print(f"  Leaving off {len(cd_tracks)} CD track(s); labels show the vinyl only")
     try:
         emit("lookup", "done",
              title=f"{release.getArtist()} \u2013 {release.getTitle()}")
