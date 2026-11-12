@@ -331,3 +331,24 @@ class TestDataDirIsLazy:
         env = dict(_os.environ, HOME=str(tmp_path), PYTHONPATH=root)
         subprocess.run([_sys.executable, "-c", "import util"], env=env, check=True)
         assert not (tmp_path / ".discogstool").exists()
+
+
+class TestSuiteIsolation:
+    """The suite must never touch the real ~/.discogstool (see conftest.py)."""
+
+    def test_datadir_is_not_the_real_home(self):
+        from conftest import REAL_HOME, TEST_HOME
+        path = util.datadir()
+        assert path.startswith(TEST_HOME)
+        assert not path.startswith(os.path.join(REAL_HOME, ".discogstool"))
+
+    def test_beatport_log_handler_writes_to_the_test_home(self):
+        """The leak that prompted this: BeatportMatcher() attached a handler to
+        the real beatport.log on first use."""
+        import logging.handlers
+        import beatport
+        from conftest import TEST_HOME
+        beatport.BeatportMatcher(matchers=[], cache=beatport.BeatportCache(":memory:"))
+        files = [h.baseFilename for h in beatport.log.handlers
+                 if isinstance(h, logging.handlers.RotatingFileHandler)]
+        assert files and all(f.startswith(TEST_HOME) for f in files)

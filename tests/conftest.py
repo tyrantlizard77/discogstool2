@@ -2,12 +2,31 @@
 
 Adds the parent directory (discogstool2) to sys.path so that ``import beatport``,
 ``import util``, etc. all resolve correctly regardless of where pytest is invoked.
+
+Also points HOME at a throwaway directory for the whole session, so nothing the
+suite does can reach the real ~/.discogstool.
 """
 
+import atexit
 import os
+import pwd
+import shutil
 import sys
+import tempfile
 
 import pytest
+
+# ── Isolate the whole session from the real ~/.discogstool ────────────────────
+# Done at import, before any test module loads.  util.datadir() resolves "~"
+# per call, so this redirects every config, cache and log path the code uses.
+# Without it, the first BeatportMatcher() a test built attached a file handler
+# to the real ~/.discogstool/beatport.log, and every run appended lines like
+# "No Beatport match found for Discogs release 12345 (Test Artist - Test EP)"
+# to the log you read to debug real matches.
+REAL_HOME = pwd.getpwuid(os.getuid()).pw_dir
+TEST_HOME = tempfile.mkdtemp(prefix="discogstool-test-home-")
+os.environ["HOME"] = TEST_HOME
+atexit.register(shutil.rmtree, TEST_HOME, ignore_errors=True)
 
 # Ensure the package root is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

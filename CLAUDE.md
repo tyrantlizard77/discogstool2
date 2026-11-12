@@ -198,6 +198,8 @@ Tests must be run from a directory _above_ the project root (or with the project
 
 All external APIs (Discogs, Beatport, Anthropic, ffmpeg, printer) are mocked. Tests use in-memory SQLite (`:memory:`) for cache tests. No network calls in the test suite.
 
+`conftest.py` points `HOME` at a throwaway directory for the whole session, before any test module loads, so nothing in the suite can reach the real `~/.discogstool`. Without it, the first `BeatportMatcher()` a test built attached a file handler to the real `beatport.log`, and every run appended test-fixture lines ("Discogs release 12345 (Test Artist - Test EP)") to the log used for debugging real matches. `TestSuiteIsolation` in `test_util.py` guards it.
+
 ---
 
 ## Development
