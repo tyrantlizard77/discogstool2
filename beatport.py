@@ -146,6 +146,18 @@ BPM_VERIFY_MIN_CONFIDENCE: float = 2.5
 BPM_VERIFY_MIN: float = 40.0
 BPM_VERIFY_MAX: float = 250.0
 
+# When Essentia isn't confident, Beatport's declared BPM is used — but only if
+# Essentia's own reading agrees with it, either at the same tempo or at one of
+# the metrical errors beat trackers make (half/double time, 2/3 and 3/2 time,
+# e.g. 80 or 106.6 for a 160 BPM drum & bass track).  Beatport alone is never
+# trusted: the May 2026 policy change dropped it because its figures were wrong
+# often enough.  Two independent sources agreeing is a different matter.
+BPM_AGREE_RATIOS: tuple[tuple[float, str], ...] = (
+    (1.0, "agrees with"), (0.5, "is half-time of"), (2.0, "is double-time of"),
+    (2 / 3, "is 2/3-time of"), (1.5, "is 3/2-time of"),
+)
+BPM_AGREE_TOLERANCE: float = 0.03   # relative, per ratio
+
 # ── Auth config path ───────────────────────────────────────────────────────────
 
 # Paths are resolved per call rather than at import.  As module constants they
@@ -1464,30 +1476,90 @@ def _match_tracks(
 def _accept_detected_bpm(detected: float, confidence: float) -> int | None:
     """Return the Essentia-detected BPM as an integer if it passes quality gates.
 
-    Beatport's declared BPM is not consulted.  A detection is accepted only
-    when both conditions hold:
+    The Essentia-only gate: Beatport's declared BPM is not consulted.  A
+    detection is accepted only when it is within ``[BPM_VERIFY_MIN,
+    BPM_VERIFY_MAX]`` and its confidence is >= ``BPM_VERIFY_MIN_CONFIDENCE``.
+    This is ``_choose_bpm`` with no Beatport figure, so the thresholds live in
+    one place; _verify_bpms itself calls ``_choose_bpm``, which adds the
+    Beatport-agreement fallback when this gate says no.
 
-    - BPM is within the sane range ``[BPM_VERIFY_MIN, BPM_VERIFY_MAX]``
-    - Essentia confidence >= ``BPM_VERIFY_MIN_CONFIDENCE``
-
-    Returns ``None`` if either check fails — callers should treat a ``None``
-    result as "BPM unknown" and leave the write zone blank on the label.
+    Returns ``None`` if either check fails.
     """
-    if detected < BPM_VERIFY_MIN or detected > BPM_VERIFY_MAX:
-        log.debug(
-            "BPM detect: %.1f out of range [%.0f–%.0f] — rejected",
-            detected, BPM_VERIFY_MIN, BPM_VERIFY_MAX,
-        )
+    bpm, why = _choose_bpm(detected, confidence, None)
+    log.debug("BPM detect: %.1f BPM: %s", detected, why)
+    return bpm
+
+
+def _bpm_relation(detected: float, declared: int | None) -> str | None:
+    """Name the tempo relation between a detection and Beatport's BPM, if any.
+
+    Returns e.g. "is half-time of" when detected ≈ declared × 0.5 within
+    ``BPM_AGREE_TOLERANCE``, or None when they don't agree at any of
+    ``BPM_AGREE_RATIOS`` (or there is nothing to compare).
+    """
+    if not declared or declared <= 0 or not detected or detected <= 0:
         return None
-    if confidence < BPM_VERIFY_MIN_CONFIDENCE:
-        log.debug(
-            "BPM detect: %.1f BPM, conf=%.2f below threshold %.2f — rejected",
-            detected, confidence, BPM_VERIFY_MIN_CONFIDENCE,
-        )
-        return None
-    accepted = round(detected)
-    log.info("BPM detect: %.1f BPM, conf=%.2f — accepted as %d", detected, confidence, accepted)
-    return accepted
+    ratio = detected / declared
+    for k, name in BPM_AGREE_RATIOS:
+        if abs(ratio - k) <= BPM_AGREE_TOLERANCE * k:
+            return name
+    return None
+
+
+def _choose_bpm(
+    detected: float | None,
+    confidence: float | None,
+    declared: int | None,
+) -> tuple[int | None, str]:
+    """Decide the BPM to print for one track, and say why.
+
+    The single place this decision is made: _verify_bpms calls it for fresh
+    analyses, ``_cached_bpm`` for blank cache hits, and dt_bpm uses both to
+    explain its report.
+
+    1. A confident, in-range Essentia detection wins (``_accept_detected_bpm``).
+       Beatport is not consulted: in practice these are rarely wrong.
+    2. Otherwise, if the detection agrees with Beatport's declared BPM at the
+       same tempo or a simple metrical ratio (``BPM_AGREE_RATIOS``), Beatport's
+       figure is used — the two independent sources agree on the tempo, and
+       Beatport resolves which octave.
+    3. Otherwise there is no BPM: a blank write zone beats a wrong number.
+
+    Returns (bpm or None, human-readable reason).
+    """
+    if detected is None or confidence is None or (detected == 0.0 and confidence == 0.0):
+        return None, "analysis failed → no BPM"
+
+    in_range = BPM_VERIFY_MIN <= detected <= BPM_VERIFY_MAX
+    if in_range and confidence >= BPM_VERIFY_MIN_CONFIDENCE:
+        return round(detected), (
+            f"confidence {confidence:.2f} ≥ {BPM_VERIFY_MIN_CONFIDENCE:.1f} → accepted")
+
+    why = (f"out of range [{BPM_VERIFY_MIN:.0f}–{BPM_VERIFY_MAX:.0f}]" if not in_range
+           else f"confidence {confidence:.2f} < {BPM_VERIFY_MIN_CONFIDENCE:.1f}")
+    relation = _bpm_relation(detected, declared)
+    if relation:
+        return int(declared), f"{why}, but {relation} Beatport's {declared} → {declared}"  # type: ignore[arg-type]
+    return None, f"{why} → rejected"
+
+
+def _cached_bpm(detail: dict, declared: int | None) -> tuple[int | None, str]:
+    """The BPM to print for an already-analysed track, and why.
+
+    A cached result that prints a BPM is kept as stored.  Only blanks are
+    re-decided from the cached measurement with ``_choose_bpm``, which is how
+    the Beatport-agreement fallback reaches tracks analysed before it existed
+    without re-downloading anything.
+
+    Re-deciding everything would also rewrite the 152 rows analysed before the
+    May 2026 Essentia-only change, whose stored BPM is Beatport's figure:
+    34 would go blank and 19 shift by ~1 BPM.  That changes BPMs that already
+    print, so it isn't done implicitly; ``--reverify`` re-analyses on request.
+    """
+    if detail["chosen_bpm"] is not None:
+        return detail["chosen_bpm"], f"{detail['chosen_bpm']} (stored)"
+    return _choose_bpm(detail["detected_bpm"], detail["confidence"],
+                       declared or detail["declared_bpm"])
 
 
 def _verify_bpms(
@@ -1499,12 +1571,12 @@ def _verify_bpms(
     """Determine BPMs from local Essentia analysis of Beatport preview audio.
 
     Downloads each matched track's preview MP3 from Beatport's CDN and runs
-    Essentia's RhythmExtractor2013.  A BPM is recorded only when the detection
-    confidence meets ``BPM_VERIFY_MIN_CONFIDENCE``; otherwise the track's BPM
-    is set to ``None`` (blank write zone on the label).
+    Essentia's RhythmExtractor2013.  What gets printed is decided by
+    ``_choose_bpm``: a confident detection, else Beatport's declared BPM when
+    the detection agrees with it, else ``None`` (blank write zone).
 
-    Beatport's declared BPM is stored in the cache for diagnostic reference but
-    is not used in the acceptance decision.
+    Cache hits keep a stored BPM; stored blanks are re-decided by
+    ``_cached_bpm``, so the agreement fallback reaches old analyses too.
 
     The transient ``sample_url`` and ``beatport_track_id`` keys are consumed
     here and stripped from the returned dict.
@@ -1531,11 +1603,11 @@ def _verify_bpms(
     pending: list[tuple[int, str, str, int | None]] = []
 
     for idx, entry in track_data.items():
-        declared_bpm = entry.get("bpm")   # stored for diagnostics; not used in decision
+        declared_bpm = entry.get("bpm")   # Beatport's figure, for the agreement check
         sample_url   = entry.pop("sample_url", None)
         bp_track_id  = entry.pop("beatport_track_id", None)
 
-        # Default: no BPM.  Only overwritten if Essentia accepts the detection.
+        # Default: no BPM.  Only overwritten by _choose_bpm.
         entry["bpm"] = None
 
         if sample_url is None or bp_track_id is None:
@@ -1547,11 +1619,9 @@ def _verify_bpms(
         if not force:
             detail = cache.get_verified_bpm_detail(bp_track_id)
             if detail is not None:
-                log.debug(
-                    "BPM detect: track [%d] cached bpm=%s",
-                    idx, detail["chosen_bpm"],
-                )
-                entry["bpm"] = detail["chosen_bpm"]  # int or None
+                bpm, why = _cached_bpm(detail, declared_bpm)
+                log.debug("BPM detect: track [%d] cached: %s", idx, why)
+                entry["bpm"] = bpm
                 continue
 
         pending.append((idx, sample_url, bp_track_id, declared_bpm))
@@ -1600,7 +1670,8 @@ def _verify_bpms(
             _report("bpm", n)
             continue
 
-        chosen_bpm = _accept_detected_bpm(detected_bpm, confidence)
+        chosen_bpm, why = _choose_bpm(detected_bpm, confidence, declared_bpm)
+        log.info("BPM detect: track [%d] %.1f BPM: %s", idx, detected_bpm, why)
         entry["bpm"] = chosen_bpm
         cache.put_verified_bpm(
             bp_track_id, sample_url, declared_bpm or 0, detected_bpm, confidence, chosen_bpm,

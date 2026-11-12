@@ -122,7 +122,15 @@ Year handling: beyond 3-year difference → hard reject. Within 3 years → mult
 
 Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf category), spaces, hyphens, and trailing format suffixes after a digit (`D`, `LP`, `EP`, `CD`). So `BLKRTZ050D`, `BLKRTZ050LP`, and `BLKRTZ050` all normalise to `BLKRTZ050`.
 
-**BPM verification**: After track matching, `_verify_bpms()` downloads each matched track's Beatport preview MP3 (`sample_url`) and runs Essentia's `RhythmExtractor2013(method='multifeature')` locally. If the detected BPM diverges from Beatport's declared value by more than 5% (and confidence is ≥ 2.5), the local detection overrides. Octave errors (detected ≈ 2× or 0.5× declared) are detected and the declared value is kept. Results are cached permanently in the `bpm_verified` table in `beatport.db`, keyed by Beatport track ID. CLI flags: `--no-verify` skips verification, `--reverify` ignores cached results and re-analyzes.
+**BPM decision**: After track matching, `_verify_bpms()` downloads each matched track's Beatport preview MP3 (`sample_url`) and runs Essentia's `RhythmExtractor2013(method='multifeature')` locally. `_choose_bpm(detected, confidence, declared)` is the one place the printed BPM is decided, and returns it with a human-readable reason. `_verify_bpms` and `dt_bpm`'s report both use it, so they can't disagree.
+
+1. **A confident Essentia detection wins** (in range 40–250 and confidence ≥ `BPM_VERIFY_MIN_CONFIDENCE` = 2.5; `_accept_detected_bpm` is this gate alone). Beatport is not consulted, even when Essentia's figure is a multiple of it. These have proved accurate in practice.
+2. **Otherwise Beatport's declared BPM is used, but only if Essentia agrees with it**: the same tempo, or one of the metrical errors beat trackers make (½, 2×, ⅔, 3⁄2; `BPM_AGREE_RATIOS`, within 3%). Two independent sources agreeing is the evidence. Beatport alone is never trusted, because commit `3f6eca2` (May 2026) dropped it for being wrong too often.
+3. **Otherwise no BPM.** A blank write zone beats a wrong number.
+
+Why step 2 exists: Essentia is poor at breakbeats. On r38807421 (drum & bass, Beatport ~160) it heard 80 or 106.6 at low confidence, and 11 of 12 tracks printed nothing. Lowering the threshold instead would have printed mostly wrong numbers: the only two detections near 160 had the *lowest* confidence. Across the cache, step 2 fills 574 of 803 blanks. It also helps techno, where about a third of tracks were blank.
+
+Results are cached permanently in `bpm_verified`, keyed by Beatport track ID. On a cache hit, `_cached_bpm()` **keeps a stored BPM** and re-decides only stored blanks from the cached measurement. That is how step 2 reaches tracks analysed before it existed, without re-downloading. Re-deciding everything would also rewrite the 152 rows analysed before the May change, whose stored BPM is Beatport's figure (34 would go blank, 19 shift by ~1 BPM), so that only happens on request with `--reverify`. CLI flags: `--no-verify` skips verification, `--reverify` ignores cached results and re-analyses.
 
 ### DiscogsRelease / DiscogsTrack
 
@@ -163,7 +171,7 @@ Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf categ
 - `release_cache` — Beatport release JSON, 90-day TTL, keyed by Beatport release ID
 - `matches` — confirmed Discogs→Beatport ID mappings, permanent
 - `nomatches` — releases with no Beatport match, retried after 30 days
-- `bpm_verified` — Essentia-verified BPMs, keyed by Beatport track ID, permanent (use `--reverify` to re-analyze)
+- `bpm_verified` — Essentia measurements (detected BPM, confidence, Beatport's declared BPM) and the decision taken, keyed by Beatport track ID, permanent (use `--reverify` to re-analyze)
 
 ---
 

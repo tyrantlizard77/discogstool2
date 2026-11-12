@@ -1209,11 +1209,15 @@ class TestVerifyBpms:
 
     @patch("beatport.requests.get")
     def test_above_range_returns_none(self, mock_get):
-        """Detected BPM above BPM_VERIFY_MAX → rejected, BPM is None."""
+        """Detected BPM above BPM_VERIFY_MAX → rejected, BPM is None.
+
+        Beatport's 140 doesn't agree with 256 at any metrical ratio, so the
+        agreement fallback can't rescue it.  (At 128 it would: 256 is exactly
+        double-time — see test_out_of_range_double_time_uses_beatport.)"""
         mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
         es_mods = _mock_essentia(256.0, 5.0)  # 256 > BPM_VERIFY_MAX (250)
 
-        data = _make_track_data(declared_bpm=128)
+        data = _make_track_data(declared_bpm=140)
         with patch.dict("sys.modules", es_mods):
             result = _verify_bpms(data, self._cache())
 
@@ -1313,4 +1317,134 @@ class TestStripTransientKeys:
     def test_handles_missing_keys(self):
         data = {0: {"bpm": 128, "duration_ms": 360000}}
         result = _strip_transient_keys(data)
+        assert result[0]["bpm"] == 128
+
+
+# ─── _choose_bpm: Essentia first, Beatport only when the two agree ────────────
+
+from beatport import _choose_bpm, _bpm_relation  # noqa: E402
+
+
+class TestChooseBpm:
+    """Real numbers from r38807421 (drum & bass, Beatport says ~160 throughout).
+
+    Essentia mostly heard half-time (80) or 2/3-time (106.6), always with low
+    confidence, so 11 of 12 tracks printed no BPM.  Confident detections are
+    trusted as before; Beatport fills the gap only when Essentia's own reading
+    agrees with it.
+    """
+
+    @pytest.mark.parametrize("detected,conf,declared,expected", [
+        (80.2,  1.77, 160, 160),    # half-time
+        (106.6, 1.38, 160, 160),    # 2/3-time
+        (161.7, 1.04, 160, 160),    # same tempo, just unconfident
+        (161.5, 0.25, 160, 160),
+        (64.0,  1.20, 128, 128),    # half-time, house
+        (256.0, 1.20, 128, 128),    # double-time (and out of range)
+        (192.0, 1.20, 128, 128),    # 3/2-time
+    ])
+    def test_unconfident_but_agreeing_uses_beatport(self, detected, conf, declared, expected):
+        bpm, why = _choose_bpm(detected, conf, declared)
+        assert bpm == expected
+        assert f"Beatport's {declared}" in why
+
+    def test_confident_detection_wins_even_against_beatport(self):
+        """r38807421 B?: Essentia 79.9 at confidence 3.28 vs Beatport 160.
+        Confident results are trusted and left alone, metrical multiple or not."""
+        assert _choose_bpm(79.9, 3.28, 160)[0] == 80
+        assert _choose_bpm(130.0, 4.0, 128)[0] == 130
+
+    @pytest.mark.parametrize("detected,declared", [
+        (95.0, 128),     # no simple relation
+        (140.0, 128),    # 9% off — outside tolerance
+        (124.0, 128),    # 3.1% off — just outside
+    ])
+    def test_unconfident_and_disagreeing_stays_blank(self, detected, declared):
+        bpm, why = _choose_bpm(detected, 1.5, declared)
+        assert bpm is None and "rejected" in why
+
+    def test_tolerance_boundary(self):
+        assert _choose_bpm(128 * 1.029, 1.5, 128)[0] == 128
+        assert _choose_bpm(128 * 1.031, 1.5, 128)[0] is None
+
+    @pytest.mark.parametrize("declared", [None, 0, -5])
+    def test_no_beatport_figure_means_no_fallback(self, declared):
+        assert _choose_bpm(128.0, 1.5, declared)[0] is None
+
+    def test_failed_analysis_never_uses_beatport(self):
+        """A failed download is cached as 0.0 / 0.0 — nothing to agree with."""
+        assert _choose_bpm(0.0, 0.0, 128) == (None, "analysis failed → no BPM")
+        assert _choose_bpm(None, None, 128)[0] is None
+
+    def test_relation_names(self):
+        assert _bpm_relation(80.0, 160) == "is half-time of"
+        assert _bpm_relation(160.0, 160) == "agrees with"
+        assert _bpm_relation(95.0, 128) is None
+
+    def test_accept_detected_bpm_is_the_essentia_only_gate(self):
+        """The old gate keeps its meaning: no Beatport, no fallback."""
+        assert _accept_detected_bpm(80.2, 1.77) is None
+        assert _accept_detected_bpm(128.0, 4.5) == 128
+
+
+class TestVerifyBpmsAgreement:
+    """End to end through _verify_bpms, fresh and cached."""
+
+    def _cache(self) -> BeatportCache:
+        return BeatportCache(":memory:")
+
+    @patch("beatport.requests.get")
+    def test_fresh_unconfident_agreeing_prints_beatport(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        cache = self._cache()
+        with patch.dict("sys.modules", _mock_essentia(80.2, 1.77)):
+            result = _verify_bpms(_make_track_data(declared_bpm=160), cache)
+        assert result[0]["bpm"] == 160
+        # The measurement and the decision are both recorded.
+        detail = cache.get_verified_bpm_detail("99001")
+        assert (detail["detected_bpm"], detail["chosen_bpm"]) == (pytest.approx(80.2), 160)
+
+    def test_cached_blank_is_re_decided(self):
+        """Every track analysed before the fallback existed was stored with
+        chosen_bpm NULL.  The fallback must reach them without re-downloading
+        anything, so a cached blank is re-decided from its measurement."""
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://x/test.mp3", 160, 80.2, 1.77, None)
+        result = _verify_bpms(_make_track_data(declared_bpm=160), cache)
+        assert result[0]["bpm"] == 160
+
+    def test_cache_hit_still_blank_when_disagreeing(self):
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://x/test.mp3", 128, 95.0, 1.2, None)
+        assert _verify_bpms(_make_track_data(declared_bpm=128), cache)[0]["bpm"] is None
+
+    def test_cached_confident_result_unchanged(self):
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://x/test.mp3", 160, 79.9, 3.28, 80)
+        assert _verify_bpms(_make_track_data(declared_bpm=160), cache)[0]["bpm"] == 80
+
+    def test_cached_bpm_is_kept_even_where_policy_would_differ(self):
+        """152 rows predate the May 2026 Essentia-only policy; their stored
+        BPM is Beatport's.  Re-deciding them would blank 34 tracks that print
+        today, so a stored BPM is kept as-is: only blanks are filled."""
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://x/test.mp3", 90, 78.7, 2.21, 90)
+        assert _verify_bpms(_make_track_data(declared_bpm=90), cache)[0]["bpm"] == 90
+
+    def test_cache_hit_uses_current_beatport_figure(self):
+        """A failed fetch cached declared_bpm as 0; today's Beatport data has it."""
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://x/test.mp3", 0, 80.0, 1.5, None)
+        assert _verify_bpms(_make_track_data(declared_bpm=160), cache)[0]["bpm"] == 160
+
+    def test_cached_failed_analysis_stays_blank(self):
+        cache = self._cache()
+        cache.put_verified_bpm("99001", "https://x/test.mp3", 160, 0.0, 0.0, None)
+        assert _verify_bpms(_make_track_data(declared_bpm=160), cache)[0]["bpm"] is None
+
+    @patch("beatport.requests.get")
+    def test_out_of_range_double_time_uses_beatport(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200, content=b"fake-mp3")
+        with patch.dict("sys.modules", _mock_essentia(256.0, 5.0)):
+            result = _verify_bpms(_make_track_data(declared_bpm=128), self._cache())
         assert result[0]["bpm"] == 128

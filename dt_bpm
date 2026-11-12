@@ -4,6 +4,7 @@
 For each track reports:
   • Beatport declared BPM and track duration
   • Local Essentia analysis: detected BPM, confidence, and the decision taken
+    (beatport._choose_bpm — the same decision the label makes)
   • Final (chosen) BPM
 
 Requires the ``essentia`` Python package.
@@ -39,24 +40,14 @@ log = logging.getLogger(__name__)
 
 # ── Decision explanation ───────────────────────────────────────────────────────
 
-def _explain_decision(detected: float | None, confidence: float | None) -> str:
-    """Return a human-readable string explaining why a BPM was accepted or rejected."""
-    if detected is None or confidence is None or (detected == 0.0 and confidence == 0.0):
-        return "analysis failed → no BPM"
+def _explain_decision(detected: float | None, confidence: float | None,
+                      declared: int | None = None) -> str:
+    """Return a human-readable string explaining why a BPM was accepted or rejected.
 
-    if detected < bp.BPM_VERIFY_MIN or detected > bp.BPM_VERIFY_MAX:
-        return (
-            f"out of range [{bp.BPM_VERIFY_MIN:.0f}–{bp.BPM_VERIFY_MAX:.0f}]"
-            f" → rejected"
-        )
-
-    if confidence < bp.BPM_VERIFY_MIN_CONFIDENCE:
-        return (
-            f"confidence {confidence:.2f} < {bp.BPM_VERIFY_MIN_CONFIDENCE:.1f}"
-            f" → rejected"
-        )
-
-    return f"confidence {confidence:.2f} ≥ {bp.BPM_VERIFY_MIN_CONFIDENCE:.1f} → accepted"
+    Delegates to beatport._choose_bpm, the one place the decision is made, so
+    this report can never disagree with what the label prints.
+    """
+    return bp._choose_bpm(detected, confidence, declared)[1]
 
 
 # ── Duration formatting ────────────────────────────────────────────────────────
@@ -99,22 +90,23 @@ def _run_essentia_for_track(
     if not reverify:
         detail = cache.get_verified_bpm_detail(bp_track_id)
         if detail is not None:
-            decision = _explain_decision(detail["detected_bpm"], detail["confidence"])
+            # Decided exactly as the label decides it (beatport._cached_bpm).
+            declared = declared_bpm or detail["declared_bpm"]
+            chosen, decision = bp._cached_bpm(detail, declared)
             return {
-                "declared_bpm": detail["declared_bpm"],
+                "declared_bpm": declared,
                 "detected_bpm": detail["detected_bpm"],
                 "confidence":   detail["confidence"],
-                "chosen_bpm":   detail["chosen_bpm"],
+                "chosen_bpm":   chosen,
                 "decision":     decision + "  (cached)",
             }
 
     # Fresh analysis — raises on download or Essentia failure
     detected_bpm, confidence = bp._analyze_preview(sample_url, es)
-    chosen_bpm = bp._accept_detected_bpm(detected_bpm, confidence)
+    chosen_bpm, decision = bp._choose_bpm(detected_bpm, confidence, declared_bpm)
     cache.put_verified_bpm(
         bp_track_id, sample_url, declared_bpm, detected_bpm, confidence, chosen_bpm,
     )
-    decision = _explain_decision(detected_bpm, confidence)
     return {
         "declared_bpm": declared_bpm,
         "detected_bpm": detected_bpm,
@@ -144,7 +136,11 @@ def _print_track(
     declared_bpm = bp_entry.get("bpm")
     dur_str      = _fmt_duration(bp_entry.get("duration_ms"))
     bpm_str      = str(declared_bpm) if declared_bpm is not None else "—"
-    print(f"         Beatport:  {bpm_str:>5} BPM (declared, not used)   duration {dur_str}")
+    # Beatport's figure prints only via _choose_bpm's agreement fallback, whose
+    # reason always names it ("…of Beatport's 160 → 160").
+    used = "Beatport's" in (analysis.get("decision") or "")
+    note = "used: Essentia agrees" if used else "reference only"
+    print(f"         Beatport:  {bpm_str:>5} BPM ({note})   duration {dur_str}")
 
     det  = analysis["detected_bpm"]
     conf = analysis["confidence"]

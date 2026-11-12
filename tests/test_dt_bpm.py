@@ -238,12 +238,29 @@ class TestRunEssentiaForTrack:
         assert "accepted" in result["decision"]
 
     def test_low_confidence_returns_none_bpm(self):
-        """Low-confidence detection → chosen_bpm is None regardless of declared BPM."""
+        """Low-confidence detection that disagrees with Beatport → no BPM."""
         cache = _make_cache()
-        with patch("beatport._analyze_preview", return_value=(128.5, 1.0)):
+        with patch("beatport._analyze_preview", return_value=(95.0, 1.0)):
             result = dt_bpm._run_essentia_for_track(0, _entry(bpm=128), cache, reverify=False)
         assert result["chosen_bpm"] is None
         assert "rejected" in result["decision"]
+
+    def test_low_confidence_agreeing_uses_beatport(self):
+        """Unconfident, but half-time of Beatport's 160 → 160, and says why."""
+        cache = _make_cache()
+        with patch("beatport._analyze_preview", return_value=(80.2, 1.0)):
+            result = dt_bpm._run_essentia_for_track(0, _entry(bpm=160), cache, reverify=False)
+        assert result["chosen_bpm"] == 160
+        assert "half-time of Beatport's 160" in result["decision"]
+
+    def test_cached_result_is_re_decided(self):
+        """The report must match what the label prints for old cache rows."""
+        cache = _make_cache()
+        e = _entry(bpm=160)
+        cache.put_verified_bpm(e["beatport_track_id"], e["sample_url"], 160, 80.2, 1.0, None)
+        result = dt_bpm._run_essentia_for_track(0, e, cache, reverify=False)
+        assert result["chosen_bpm"] == 160
+        assert result["decision"].endswith("(cached)")
 
 
 # ─── main() ───────────────────────────────────────────────────────────────────
